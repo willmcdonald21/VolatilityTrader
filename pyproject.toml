@@ -15,5 +15,8 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest"]
 
+[tool.setuptools.packages.find]
+include = ["warrior_bot*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

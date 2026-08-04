@@ -3,6 +3,8 @@ __pycache__/
 *.pyc
 .env
 data/*.sqlite3
+data/*.log
 data/KILL_SWITCH
 config/float_list.csv
 .pytest_cache/
+*.egg-info/
