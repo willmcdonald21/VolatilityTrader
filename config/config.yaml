@@ -1,0 +1,70 @@
+# All strategy/risk tunables live here. Nothing thresholded should be hard-coded in Python.
+
+trading:
+  mode: paper                    # "paper" or "live". "live" also requires i_understand_live_trading: true
+  host: 127.0.0.1
+  port: 4002                     # IB Gateway paper=4002, TWS paper=7497 (live=4001/7496, refused unless mode=live)
+  client_id: 7
+  i_understand_live_trading: false
+  use_rth: false                 # false = include pre-market/after-hours bars (needed for gap scanning)
+
+risk:
+  risk_per_trade_pct: 0.005      # fraction of NetLiquidation risked per trade
+  daily_loss_limit_pct: 0.02     # halt new entries once daily realized loss exceeds this fraction of start-of-day equity
+  flatten_on_daily_loss_limit: false  # if true, force-close open positions when the daily halt triggers
+  max_concurrent_positions: 3
+  max_position_notional_usd: 5000
+  max_shares_per_trade: 2000
+
+strategies:
+  gap_and_go:
+    enabled: true
+    min_gap_pct: 10.0
+    min_price: 1.0
+    max_price: 20.0
+    min_rel_volume: 5.0
+    breakout_lookback_bars: 30    # bars used to compute pre-market/opening-range high
+    stop_buffer_pct: 1.0          # stop placed this % below the breakout level
+    target_r_multiple: 2.0        # profit target expressed as multiple of risk (R)
+    enable_float_filter: false
+    max_float_shares: 50000000
+  bull_flag:
+    enabled: true
+    min_spike_pct: 5.0            # minimum initial move (over lookback) to qualify as a spike
+    max_pullback_pct: 50.0        # flag pullback must retrace no more than this % of the spike
+    min_consolidation_bars: 3
+    max_consolidation_bars: 15
+    stop_buffer_pct: 0.5
+    target_r_multiple: 2.0
+  abcd:
+    enabled: true
+    min_ab_move_pct: 5.0          # minimum A->B spike size
+    min_bc_pullback_pct: 20.0     # minimum pullback size from A before it counts as B
+    max_bc_pullback_pct: 60.0
+    stop_buffer_pct: 0.5
+    target_r_multiple: 2.0
+  vwap_reversion:
+    enabled: true
+    max_vwap_distance_pct: 1.5    # price must be within this % of VWAP to qualify for a reversion entry
+    red_to_green_volume_multiple: 2.0  # today's volume vs. average must exceed this for a red-to-green signal
+    stop_buffer_pct: 0.5
+    target_r_multiple: 1.5
+
+scanner:
+  scan_code: TOP_PERC_GAIN
+  location_code: STK.US.MAJOR
+  above_price: 1.0
+  below_price: 20.0
+  above_volume: 100000
+  refresh_seconds: 60
+  max_candidates: 25
+
+journal:
+  db_path: data/journal.sqlite3
+
+kill_switch:
+  flag_file: data/KILL_SWITCH
+
+logging:
+  level: INFO
+  file: data/warrior_bot.log

@@ -1,0 +1,19 @@
+[project]
+name = "warrior-bot"
+version = "0.1.0"
+description = "Automated IBKR day-trading bot modeled on Warrior Trading momentum setups"
+requires-python = ">=3.11"
+dependencies = [
+    "ib_async>=2.0",
+    "pandas",
+    "numpy",
+    "pydantic>=2",
+    "pyyaml",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

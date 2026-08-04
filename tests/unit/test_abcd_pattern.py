@@ -1,0 +1,88 @@
+from __future__ import annotations
+
+from datetime import datetime
+
+from tests.unit.fixtures import make_bars
+from warrior_bot.config import AbcdConfig
+from warrior_bot.strategies.abcd_pattern import AbcdStrategy
+from warrior_bot.strategies.base_strategy import SymbolContext
+from warrior_bot.utils.time_utils import EASTERN
+
+NOW = datetime(2026, 1, 5, 10, 0, tzinfo=EASTERN)
+
+PASSING_BARS = [
+    (10.0, 10.0, 9.9, 10.0, 1000),    # A baseline
+    (10.0, 11.0, 10.0, 10.9, 2000),   # B spike high
+    (10.9, 10.85, 10.6, 10.7, 500),   # C pullback
+    (10.7, 10.75, 10.65, 10.7, 500),  # continuing pullback
+    (10.7, 11.2, 10.7, 11.2, 1000),   # D breakout above B
+]
+
+
+def make_ctx(bar_specs, symbol="ABCD"):
+    ctx = SymbolContext(symbol=symbol)
+    ctx.bars = make_bars(bar_specs)
+    return ctx
+
+
+def test_abcd_breakout_triggers_signal():
+    ctx = make_ctx(PASSING_BARS)
+    strategy = AbcdStrategy(AbcdConfig())
+    signal = strategy.evaluate(ctx, NOW)
+    assert signal is not None
+    assert signal.strategy == "abcd"
+    assert signal.entry_price == 11.2
+    assert signal.stop_price < signal.entry_price
+
+
+def test_no_signal_without_d_breakout():
+    bars = PASSING_BARS[:-1] + [(10.7, 10.95, 10.7, 10.8, 1000)]  # doesn't clear B's high of 11.0
+    ctx = make_ctx(bars)
+    strategy = AbcdStrategy(AbcdConfig())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_no_signal_when_ab_move_too_small():
+    bars = [
+        (10.9, 10.95, 10.85, 10.95, 1000),
+        (10.95, 11.0, 10.95, 10.98, 2000),
+        (10.98, 10.95, 10.9, 10.93, 500),
+        (10.93, 10.94, 10.9, 10.92, 500),
+        (10.92, 11.05, 10.92, 11.05, 1000),
+    ]
+    ctx = make_ctx(bars)
+    strategy = AbcdStrategy(AbcdConfig())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_no_signal_when_pullback_too_shallow():
+    bars = [
+        (10.0, 10.0, 9.9, 10.0, 1000),
+        (10.0, 11.0, 10.0, 10.9, 2000),
+        (10.9, 10.95, 10.95, 10.95, 500),  # barely pulls back at all
+        (10.95, 10.96, 10.94, 10.95, 500),
+        (10.95, 11.2, 10.95, 11.2, 1000),
+    ]
+    ctx = make_ctx(bars)
+    strategy = AbcdStrategy(AbcdConfig())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_no_signal_when_pullback_too_deep():
+    bars = [
+        (10.0, 10.0, 9.9, 10.0, 1000),
+        (10.0, 11.0, 10.0, 10.9, 2000),
+        (10.9, 10.2, 9.6, 9.7, 500),
+        (9.7, 9.8, 9.5, 9.6, 500),
+        (9.6, 11.2, 9.6, 11.2, 1000),
+    ]
+    ctx = make_ctx(bars)
+    strategy = AbcdStrategy(AbcdConfig())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_does_not_retrigger_same_symbol_same_day():
+    ctx = make_ctx(PASSING_BARS)
+    strategy = AbcdStrategy(AbcdConfig())
+    assert strategy.evaluate(ctx, NOW) is not None
+    assert strategy.evaluate(ctx, NOW) is None
