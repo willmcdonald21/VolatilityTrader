@@ -70,3 +70,10 @@ def test_actions_and_prices_match_signal():
 def test_no_naked_entry_all_three_orders_present():
     bracket = build_bracket(FakeIB(), make_signal(), quantity=100)
     assert len(bracket.orders) == 3
+
+
+def test_orders_allowed_outside_regular_trading_hours():
+    bracket = build_bracket(FakeIB(), make_signal(), quantity=100)
+    assert bracket.parent.outsideRth is True
+    assert bracket.take_profit.outsideRth is True
+    assert bracket.stop_loss.outsideRth is True
