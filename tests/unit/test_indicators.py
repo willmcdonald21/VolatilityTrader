@@ -3,6 +3,7 @@ from __future__ import annotations
 from tests.unit.fixtures import make_bars
 from warrior_bot.strategies.indicators import (
     average_true_range,
+    ema,
     gap_pct,
     is_red_to_green,
     opening_range,
@@ -75,3 +76,21 @@ def test_average_true_range_flat_bars_is_zero():
 def test_average_true_range_none_with_insufficient_bars():
     bars = make_bars([(10, 10, 10, 10, 100)])
     assert average_true_range(bars) is None
+
+
+def test_ema_flat_price_equals_price():
+    bars = make_bars([(10, 10, 10, 10, 100)] * 5)
+    assert ema(bars, period=3) == 10.0
+
+
+def test_ema_known_value():
+    closes = [1, 2, 3, 4, 5]
+    bars = make_bars([(c, c, c, c, 100) for c in closes])
+    # seed = mean(1,2,3) = 2; multiplier = 2/(3+1) = 0.5
+    # step 4: (4-2)*0.5+2 = 3; step 5: (5-3)*0.5+3 = 4
+    assert ema(bars, period=3) == 4.0
+
+
+def test_ema_none_with_insufficient_bars():
+    bars = make_bars([(10, 10, 10, 10, 100)] * 2)
+    assert ema(bars, period=3) is None

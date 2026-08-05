@@ -90,6 +90,19 @@ def swing_points(bars: list[Bar], window: int = 2) -> list[tuple[int, str, float
     return points
 
 
+def ema(bars: list[Bar], period: int) -> float | None:
+    """Exponential moving average of closes, seeded with a simple average
+    over the first `period` closes (standard EMA warm-up)."""
+    closes = [b.close for b in bars]
+    if len(closes) < period:
+        return None
+    multiplier = 2.0 / (period + 1)
+    value = sum(closes[:period]) / period
+    for close in closes[period:]:
+        value = (close - value) * multiplier + value
+    return value
+
+
 def average_true_range(bars: list[Bar], period: int = 14) -> float | None:
     if len(bars) < 2:
         return None

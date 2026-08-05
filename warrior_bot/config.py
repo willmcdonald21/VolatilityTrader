@@ -40,6 +40,9 @@ class RiskConfig(BaseModel):
     max_concurrent_positions: int = Field(gt=0)
     max_position_notional_usd: float = Field(gt=0)
     max_shares_per_trade: int = Field(gt=0)
+    daily_profit_goal_usd: float | None = None
+    cushion_profit_fraction: float = Field(default=0.25, gt=0, le=1)
+    cushion_size_fraction: float = Field(default=0.25, gt=0, le=1)
 
 
 class GapAndGoConfig(BaseModel):
@@ -51,8 +54,8 @@ class GapAndGoConfig(BaseModel):
     breakout_lookback_bars: int = 30
     stop_buffer_pct: float = 1.0
     target_r_multiple: float = 2.0
-    enable_float_filter: bool = False
-    max_float_shares: float = 50_000_000
+    enable_float_filter: bool = True
+    max_float_shares: float = 10_000_000
 
 
 class BullFlagConfig(BaseModel):

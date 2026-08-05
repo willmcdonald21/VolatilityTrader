@@ -35,6 +35,9 @@ def make_risk_manager(tmp_path, snapshot, **risk_overrides) -> RiskManager:
         max_concurrent_positions=risk_overrides.get("max_concurrent_positions", 3),
         max_position_notional_usd=risk_overrides.get("max_position_notional_usd", 5000),
         max_shares_per_trade=risk_overrides.get("max_shares_per_trade", 2000),
+        daily_profit_goal_usd=risk_overrides.get("daily_profit_goal_usd"),
+        cushion_profit_fraction=risk_overrides.get("cushion_profit_fraction", 0.25),
+        cushion_size_fraction=risk_overrides.get("cushion_size_fraction", 0.25),
     )
     account_state = FakeAccountState(snapshot)
     return RiskManager(config, account_state, kill_switch_path=tmp_path / "KILL_SWITCH")
@@ -125,3 +128,41 @@ def test_sizing_capped_by_buying_power(tmp_path):
 
     assert decision.accepted
     assert decision.sized_qty == 10  # buying_power(100) / entry(10)
+
+
+def test_profit_cushion_reduces_size_before_goal_progress(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=0.0)
+    rm = make_risk_manager(
+        tmp_path, snapshot, risk_per_trade_pct=0.01, daily_profit_goal_usd=1000, cushion_profit_fraction=0.25, cushion_size_fraction=0.25
+    )
+    signal = make_signal(entry=10.0, stop=9.0)
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    # full size would be 500 (capped by max_position_notional_usd); cushion not yet met -> 25%
+    assert decision.sized_qty == 125
+
+
+def test_profit_cushion_lifts_once_goal_fraction_realized(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=300.0)  # >= 25% of 1000
+    rm = make_risk_manager(
+        tmp_path, snapshot, risk_per_trade_pct=0.01, daily_profit_goal_usd=1000, cushion_profit_fraction=0.25, cushion_size_fraction=0.25
+    )
+    signal = make_signal(entry=10.0, stop=9.0)
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 500
+
+
+def test_profit_cushion_disabled_when_no_daily_goal_set(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=0.0)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, daily_profit_goal_usd=None)
+    signal = make_signal(entry=10.0, stop=9.0)
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 500

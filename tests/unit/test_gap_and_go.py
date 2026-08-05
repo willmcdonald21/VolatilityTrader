@@ -4,6 +4,7 @@ from datetime import datetime
 
 from tests.unit.fixtures import make_bars
 from warrior_bot.config import GapAndGoConfig
+from warrior_bot.scanner.float_provider import FloatProvider
 from warrior_bot.strategies.base_strategy import SymbolContext
 from warrior_bot.strategies.gap_and_go import GapAndGoStrategy
 from warrior_bot.utils.time_utils import EASTERN
@@ -117,6 +118,64 @@ def test_does_not_retrigger_same_symbol_same_day():
     assert first is not None
     second = strategy.evaluate(ctx, NOW)
     assert second is None
+
+
+BREAKOUT_BARS = [
+    (5.5, 5.7, 5.4, 5.6, 1000),
+    (5.6, 5.8, 5.5, 5.7, 1000),
+    (5.7, 5.9, 5.6, 5.75, 1000),
+    (5.75, 5.85, 5.7, 5.8, 1000),
+    (5.8, 6.5, 5.8, 6.5, 1000),  # breakout bar
+]
+
+
+def write_float_list(tmp_path, rows):
+    path = tmp_path / "float_list.csv"
+    lines = ["symbol,float_shares,updated_at"]
+    for symbol, float_shares, updated_at in rows:
+        lines.append(f"{symbol},{float_shares},{updated_at}")
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def test_float_filter_rejects_symbol_over_max(tmp_path):
+    csv_path = write_float_list(tmp_path, [("GOGO", 30_000_000, datetime.now().date().isoformat())])
+    ctx = make_ctx(BREAKOUT_BARS)
+    strategy = GapAndGoStrategy(
+        default_config(enable_float_filter=True, max_float_shares=10_000_000),
+        float_provider=FloatProvider(csv_path),
+    )
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_float_filter_accepts_symbol_under_max(tmp_path):
+    csv_path = write_float_list(tmp_path, [("GOGO", 8_000_000, datetime.now().date().isoformat())])
+    ctx = make_ctx(BREAKOUT_BARS)
+    strategy = GapAndGoStrategy(
+        default_config(enable_float_filter=True, max_float_shares=10_000_000),
+        float_provider=FloatProvider(csv_path),
+    )
+    assert strategy.evaluate(ctx, NOW) is not None
+
+
+def test_float_filter_skips_symbol_missing_from_csv(tmp_path):
+    csv_path = write_float_list(tmp_path, [("OTHER", 30_000_000, "2026-01-01")])
+    ctx = make_ctx(BREAKOUT_BARS)
+    strategy = GapAndGoStrategy(
+        default_config(enable_float_filter=True, max_float_shares=10_000_000),
+        float_provider=FloatProvider(csv_path),
+    )
+    assert strategy.evaluate(ctx, NOW) is not None
+
+
+def test_float_filter_disabled_ignores_large_float(tmp_path):
+    csv_path = write_float_list(tmp_path, [("GOGO", 30_000_000, datetime.now().date().isoformat())])
+    ctx = make_ctx(BREAKOUT_BARS)
+    strategy = GapAndGoStrategy(
+        default_config(enable_float_filter=False, max_float_shares=10_000_000),
+        float_provider=FloatProvider(csv_path),
+    )
+    assert strategy.evaluate(ctx, NOW) is not None
 
 
 def test_reset_daily_allows_retrigger():

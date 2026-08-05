@@ -16,6 +16,7 @@ from warrior_bot.persistence.db import get_connection
 from warrior_bot.persistence.journal import Journal
 from warrior_bot.risk.account_state import AccountState
 from warrior_bot.risk.risk_manager import RiskManager
+from warrior_bot.scanner.float_provider import FloatProvider
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.abcd_pattern import AbcdStrategy
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
@@ -51,9 +52,11 @@ class WarriorBot:
         )
         self.order_manager = OrderManager(self.ib, self.journal)
 
+        float_provider = FloatProvider(config.resolve_path("config/float_list.csv"))
+
         self.strategies: list[BaseStrategy] = []
         if config.strategies.gap_and_go.enabled:
-            self.strategies.append(GapAndGoStrategy(config.strategies.gap_and_go))
+            self.strategies.append(GapAndGoStrategy(config.strategies.gap_and_go, float_provider=float_provider))
         if config.strategies.bull_flag.enabled:
             self.strategies.append(BullFlagStrategy(config.strategies.bull_flag))
         if config.strategies.abcd.enabled:

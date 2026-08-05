@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from warrior_bot.config import GapAndGoConfig
+from warrior_bot.scanner.float_provider import FloatProvider
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
 from warrior_bot.strategies.indicators import opening_range
@@ -17,6 +18,10 @@ class GapAndGoStrategy(BaseStrategy):
     name = "gap_and_go"
     config: GapAndGoConfig
 
+    def __init__(self, config: GapAndGoConfig, float_provider: FloatProvider | None = None):
+        super().__init__(config)
+        self.float_provider = float_provider
+
     def evaluate(self, ctx: SymbolContext, now: datetime) -> Signal | None:
         cfg = self.config
         if len(ctx.bars) < 2:
@@ -29,6 +34,10 @@ class GapAndGoStrategy(BaseStrategy):
         price = ctx.last_price
         if price is None or not (cfg.min_price <= price <= cfg.max_price):
             return None
+
+        if cfg.enable_float_filter and self.float_provider is not None:
+            if not self.float_provider.passes_filter(ctx.symbol, cfg.max_float_shares):
+                return None
 
         gap = ctx.gap_pct
         if gap is None or gap < cfg.min_gap_pct:

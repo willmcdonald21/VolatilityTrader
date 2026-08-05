@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from warrior_bot.strategies.indicators import Bar, gap_pct, opening_range, relative_volume, vwap
+from warrior_bot.strategies.indicators import Bar, ema, gap_pct, opening_range, relative_volume, vwap
 from warrior_bot.signals.signal import Signal
 
 
@@ -34,6 +34,14 @@ class SymbolContext:
     @property
     def vwap(self) -> float | None:
         return vwap(self.bars)
+
+    @property
+    def ema_9(self) -> float | None:
+        return ema(self.bars, 9)
+
+    @property
+    def ema_20(self) -> float | None:
+        return ema(self.bars, 20)
 
     @property
     def gap_pct(self) -> float | None:

@@ -90,4 +90,17 @@ class RiskManager:
         cap_by_buying_power = math.floor(snapshot.buying_power / signal.entry_price)
         cap_by_abs_shares = self.config.max_shares_per_trade
 
-        return max(0, min(raw_shares, cap_by_notional, cap_by_buying_power, cap_by_abs_shares))
+        sized_qty = max(0, min(raw_shares, cap_by_notional, cap_by_buying_power, cap_by_abs_shares))
+
+        if self.config.daily_profit_goal_usd and not self._cushion_met(snapshot):
+            sized_qty = math.floor(sized_qty * self.config.cushion_size_fraction)
+
+        return sized_qty
+
+    def _cushion_met(self, snapshot: AccountSnapshot) -> bool:
+        """Warrior Trading's 'profit cushion' rule: trade at reduced size
+        until a fraction of the daily profit goal is already banked, then
+        size back up to full. Re-evaluated on every signal (not a one-way
+        ratchet), so size drops back down again if the cushion erodes."""
+        cushion_target = self.config.daily_profit_goal_usd * self.config.cushion_profit_fraction
+        return snapshot.daily_realized_pnl >= cushion_target

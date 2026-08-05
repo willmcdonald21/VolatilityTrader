@@ -15,6 +15,9 @@ risk:
   max_concurrent_positions: 3
   max_position_notional_usd: 5000
   max_shares_per_trade: 2000
+  daily_profit_goal_usd: null      # set to enable "profit cushion" sizing; null = feature off, always full size
+  cushion_profit_fraction: 0.25    # trade at reduced size until this fraction of the daily goal is realized
+  cushion_size_fraction: 0.25      # size multiplier applied while under the cushion threshold
 
 strategies:
   gap_and_go:
@@ -26,8 +29,8 @@ strategies:
     breakout_lookback_bars: 30    # bars used to compute pre-market/opening-range high
     stop_buffer_pct: 1.0          # stop placed this % below the breakout level
     target_r_multiple: 2.0        # profit target expressed as multiple of risk (R)
-    enable_float_filter: false
-    max_float_shares: 50000000
+    enable_float_filter: true      # skips symbols missing from config/float_list.csv (graceful no-op until that file exists)
+    max_float_shares: 10000000     # matches Ross Cameron's "5 Pillars" filter (<=10M, aggressive traders use 5M)
   bull_flag:
     enabled: true
     min_spike_pct: 5.0            # minimum initial move (over lookback) to qualify as a spike
