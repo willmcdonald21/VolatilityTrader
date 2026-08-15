@@ -36,6 +36,7 @@ def build_bracket(ib: IB, signal: Signal, quantity: int) -> Bracket:
         orderId=ib.client.getReqId(),
         transmit=False,
         outsideRth=True,
+        tif="DAY",
     )
     take_profit = LimitOrder(
         reverse_action,
@@ -45,6 +46,7 @@ def build_bracket(ib: IB, signal: Signal, quantity: int) -> Bracket:
         parentId=parent.orderId,
         transmit=False,
         outsideRth=True,
+        tif="DAY",
     )
     stop_loss = StopOrder(
         reverse_action,
@@ -54,6 +56,7 @@ def build_bracket(ib: IB, signal: Signal, quantity: int) -> Bracket:
         parentId=parent.orderId,
         transmit=True,
         outsideRth=True,
+        tif="DAY",
     )
 
     oca_group = f"{signal.symbol}-{parent.orderId}-OCA"

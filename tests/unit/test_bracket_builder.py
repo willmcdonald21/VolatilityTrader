@@ -77,3 +77,10 @@ def test_orders_allowed_outside_regular_trading_hours():
     assert bracket.parent.outsideRth is True
     assert bracket.take_profit.outsideRth is True
     assert bracket.stop_loss.outsideRth is True
+
+
+def test_orders_have_explicit_day_tif():
+    bracket = build_bracket(FakeIB(), make_signal(), quantity=100)
+    assert bracket.parent.tif == "DAY"
+    assert bracket.take_profit.tif == "DAY"
+    assert bracket.stop_loss.tif == "DAY"
