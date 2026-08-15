@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from datetime import time
 from pathlib import Path
+from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -92,6 +94,32 @@ class StrategiesConfig(BaseModel):
     vwap_reversion: VwapReversionConfig = VwapReversionConfig()
 
 
+class ScaleOutConfig(BaseModel):
+    enabled: bool = False
+    pct: float = Field(default=0.5, gt=0, lt=1)  # fraction of the position closed at the scale-out price
+    r_multiple: float = Field(default=1.0, gt=0)  # R-multiple at which the scale-out limit order sits
+
+
+class BreakevenConfig(BaseModel):
+    enabled: bool = False
+    trigger_r_multiple: float = Field(default=1.0, gt=0)
+
+
+class TrailingConfig(BaseModel):
+    enabled: bool = False
+    method: Literal["ema", "atr"] = "atr"
+    atr_period: int = Field(default=14, gt=1)
+    atr_multiple: float = Field(default=1.5, gt=0)
+
+
+class ExitsConfig(BaseModel):
+    scale_out: ScaleOutConfig = ScaleOutConfig()
+    breakeven: BreakevenConfig = BreakevenConfig()
+    trailing: TrailingConfig = TrailingConfig()
+    eod_flatten_time: time = time(15, 55)  # 5 min before RTH_CLOSE; force-flatten at/after this ET time
+    risk_loop_interval_seconds: int = Field(default=15, gt=0)
+
+
 class ScannerConfig(BaseModel):
     scan_code: str = "TOP_PERC_GAIN"
     location_code: str = "STK.US.MAJOR"
@@ -119,6 +147,7 @@ class AppConfig(BaseModel):
     trading: TradingConfig
     risk: RiskConfig
     strategies: StrategiesConfig
+    exits: ExitsConfig = ExitsConfig()
     scanner: ScannerConfig
     journal: JournalConfig
     kill_switch: KillSwitchConfig

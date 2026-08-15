@@ -103,6 +103,23 @@ def ema(bars: list[Bar], period: int) -> float | None:
     return value
 
 
+def trailing_candidate(
+    last_price: float | None,
+    ema_9: float | None,
+    atr: float | None,
+    method: str,
+    atr_multiple: float,
+) -> float | None:
+    """Candidate long-side trailing-stop price for the given method. Caller
+    is responsible for ratcheting (never loosening an existing stop) — this
+    only computes where the stop *could* move to on this bar."""
+    if method == "ema":
+        return ema_9
+    if last_price is None or atr is None:
+        return None
+    return last_price - atr * atr_multiple
+
+
 def average_true_range(bars: list[Bar], period: int = 14) -> float | None:
     if len(bars) < 2:
         return None

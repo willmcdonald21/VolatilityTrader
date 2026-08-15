@@ -166,3 +166,55 @@ def test_profit_cushion_disabled_when_no_daily_goal_set(tmp_path):
 
     assert decision.accepted
     assert decision.sized_qty == 500
+
+
+def _make_risk_manager_with_flag(tmp_path, snapshot, flatten_flag: bool, daily_loss_limit_pct=0.02) -> RiskManager:
+    config = RiskConfig(
+        risk_per_trade_pct=0.01,
+        daily_loss_limit_pct=daily_loss_limit_pct,
+        flatten_on_daily_loss_limit=flatten_flag,
+        max_concurrent_positions=3,
+        max_position_notional_usd=5000,
+        max_shares_per_trade=2000,
+    )
+    return RiskManager(config, FakeAccountState(snapshot), kill_switch_path=tmp_path / "KILL_SWITCH")
+
+
+def test_should_flatten_for_loss_limit_false_when_flag_disabled(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=-2500)
+    rm = _make_risk_manager_with_flag(tmp_path, snapshot, flatten_flag=False)
+    rm.mark_start_of_day(100_000)
+
+    assert rm.should_flatten_for_loss_limit(snapshot) is False
+
+
+def test_should_flatten_for_loss_limit_false_when_under_threshold(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=-500)
+    rm = _make_risk_manager_with_flag(tmp_path, snapshot, flatten_flag=True, daily_loss_limit_pct=0.02)
+    rm.mark_start_of_day(100_000)
+
+    assert rm.should_flatten_for_loss_limit(snapshot) is False
+
+
+def test_should_flatten_for_loss_limit_true_when_flag_enabled_and_breached(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=-2500)
+    rm = _make_risk_manager_with_flag(tmp_path, snapshot, flatten_flag=True, daily_loss_limit_pct=0.02)
+    rm.mark_start_of_day(100_000)
+
+    assert rm.should_flatten_for_loss_limit(snapshot) is True
+
+
+def test_should_flatten_for_loss_limit_false_before_start_of_day_marked(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=-2500)
+    rm = _make_risk_manager_with_flag(tmp_path, snapshot, flatten_flag=True)
+
+    assert rm.should_flatten_for_loss_limit(snapshot) is False
+
+
+def test_start_of_day_equity_property(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000)
+    rm = make_risk_manager(tmp_path, snapshot)
+
+    assert rm.start_of_day_equity is None
+    rm.mark_start_of_day(100_000)
+    assert rm.start_of_day_equity == 100_000

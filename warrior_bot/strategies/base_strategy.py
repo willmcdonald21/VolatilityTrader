@@ -5,7 +5,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from warrior_bot.strategies.indicators import Bar, ema, gap_pct, opening_range, relative_volume, vwap
+from warrior_bot.strategies.indicators import (
+    Bar,
+    average_true_range,
+    ema,
+    gap_pct,
+    opening_range,
+    relative_volume,
+    vwap,
+)
 from warrior_bot.signals.signal import Signal
 
 
@@ -56,6 +64,9 @@ class SymbolContext:
 
     def opening_range(self, lookback_bars: int) -> tuple[float, float] | None:
         return opening_range(self.bars, lookback_bars)
+
+    def atr(self, period: int = 14) -> float | None:
+        return average_true_range(self.bars, period)
 
 
 class BaseStrategy(ABC):

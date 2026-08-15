@@ -45,6 +45,19 @@ class RiskManager:
     def mark_start_of_day(self, equity: float) -> None:
         self._start_of_day_equity = equity
 
+    @property
+    def start_of_day_equity(self) -> float | None:
+        return self._start_of_day_equity
+
+    def _loss_limit_breached(self, snapshot: AccountSnapshot) -> bool:
+        if self._start_of_day_equity is None:
+            return False
+        loss_limit = self._start_of_day_equity * self.config.daily_loss_limit_pct
+        return snapshot.daily_realized_pnl <= -loss_limit
+
+    def should_flatten_for_loss_limit(self, snapshot: AccountSnapshot) -> bool:
+        return self.config.flatten_on_daily_loss_limit and self._loss_limit_breached(snapshot)
+
     def evaluate(self, signal: Signal) -> RiskDecision:
         snapshot = self.account_state.snapshot()
 
@@ -56,8 +69,8 @@ class RiskManager:
             alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")
             return RiskDecision(False, 0, reason, snapshot)
 
-        loss_limit = self._start_of_day_equity * self.config.daily_loss_limit_pct
-        if snapshot.daily_realized_pnl <= -loss_limit:
+        if self._loss_limit_breached(snapshot):
+            loss_limit = self._start_of_day_equity * self.config.daily_loss_limit_pct
             reason = (
                 f"daily loss limit breached: realized {snapshot.daily_realized_pnl:.2f} "
                 f"<= -{loss_limit:.2f}"

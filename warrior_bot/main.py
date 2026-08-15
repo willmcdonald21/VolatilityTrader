@@ -11,6 +11,7 @@ from warrior_bot.broker.ib_client import IBClient
 from warrior_bot.broker.market_data import scan_candidates
 from warrior_bot.config import AppConfig, load_config
 from warrior_bot.execution.order_manager import OrderManager
+from warrior_bot.execution.position_manager import PositionManager
 from warrior_bot.logging_setup import setup_logging
 from warrior_bot.persistence.db import get_connection
 from warrior_bot.persistence.journal import Journal
@@ -24,6 +25,8 @@ from warrior_bot.strategies.bull_flag import BullFlagStrategy
 from warrior_bot.strategies.gap_and_go import GapAndGoStrategy
 from warrior_bot.strategies.indicators import Bar
 from warrior_bot.strategies.vwap_reversion import VwapReversionStrategy
+from warrior_bot.utils.panic import panic_stop
+from warrior_bot.utils.time_utils import to_eastern
 
 logger = logging.getLogger("warrior_bot.main")
 
@@ -50,7 +53,8 @@ class WarriorBot:
         self.risk_manager = RiskManager(
             config.risk, self.account_state, config.resolve_path(config.kill_switch.flag_file)
         )
-        self.order_manager = OrderManager(self.ib, self.journal)
+        self.position_manager = PositionManager(self.ib, self.journal, config.exits)
+        self.order_manager = OrderManager(self.ib, self.journal, config.exits, self.position_manager)
 
         float_provider = FloatProvider(config.resolve_path("config/float_list.csv"))
 
@@ -65,6 +69,8 @@ class WarriorBot:
             self.strategies.append(VwapReversionStrategy(config.strategies.vwap_reversion))
 
         self._scan_task: asyncio.Task | None = None
+        self._risk_task: asyncio.Task | None = None
+        self._flattened_today = False
 
     async def start(self) -> None:
         await self.ib_client.connect()
@@ -72,6 +78,7 @@ class WarriorBot:
         self.risk_manager.mark_start_of_day(snapshot.net_liquidation)
         self.journal.record_account_snapshot(snapshot)
         self._scan_task = asyncio.ensure_future(self._scan_loop())
+        self._risk_task = asyncio.ensure_future(self._risk_loop())
         self.logger.info(
             "WarriorBot started: mode=%s strategies=%s",
             self.config.trading.mode,
@@ -81,6 +88,8 @@ class WarriorBot:
     async def stop(self) -> None:
         if self._scan_task:
             self._scan_task.cancel()
+        if self._risk_task:
+            self._risk_task.cancel()
         self.ib_client.disconnect()
 
     async def _scan_loop(self) -> None:
@@ -96,6 +105,35 @@ class WarriorBot:
             except Exception:
                 self.logger.exception("Scan loop iteration failed")
             await asyncio.sleep(self.config.scanner.refresh_seconds)
+
+    async def _risk_loop(self) -> None:
+        while True:
+            if not self.ib.isConnected():
+                await asyncio.sleep(5)
+                continue
+            try:
+                self._check_flatten_triggers()
+            except Exception:
+                self.logger.exception("Risk loop iteration failed")
+            await asyncio.sleep(self.config.exits.risk_loop_interval_seconds)
+
+    def _check_flatten_triggers(self) -> None:
+        if self._flattened_today:
+            return
+        now_et = to_eastern(datetime.now(timezone.utc))
+        if now_et.time() >= self.config.exits.eod_flatten_time:
+            self._trigger_flatten("eod_flatten")
+            return
+        snapshot = self.account_state.snapshot()
+        if self.risk_manager.should_flatten_for_loss_limit(snapshot):
+            self._trigger_flatten("daily_loss_limit")
+
+    def _trigger_flatten(self, reason: str) -> None:
+        self.logger.warning("Flattening all positions: reason=%s", reason)
+        panic_stop(self.ib, flatten=True)
+        self.position_manager.clear()
+        self.journal.record_kill_switch_event(triggered_by=reason, action_taken="cancel_all+flatten_all")
+        self._flattened_today = True
 
     async def _onboard_symbol(self, symbol: str) -> None:
         try:
@@ -165,6 +203,7 @@ class WarriorBot:
 
     def _on_new_bar(self, contract: Contract, ctx: SymbolContext) -> None:
         now = datetime.now(timezone.utc)
+        self.position_manager.on_bar(ctx)
         for strategy in self.strategies:
             try:
                 signal = strategy.evaluate(ctx, now)
@@ -202,6 +241,8 @@ class WarriorBot:
         self.account_state.reset_session()
         snapshot = self.account_state.snapshot()
         self.risk_manager.mark_start_of_day(snapshot.net_liquidation)
+        self.position_manager.clear()
+        self._flattened_today = False
         self.logger.info("Daily state reset. Start-of-day equity=%.2f", snapshot.net_liquidation)
 
 

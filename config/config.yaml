@@ -53,6 +53,22 @@ strategies:
     stop_buffer_pct: 0.5
     target_r_multiple: 1.5
 
+exits:
+  scale_out:
+    enabled: false
+    pct: 0.5              # fraction of the position closed at the scale-out price
+    r_multiple: 1.0        # R-multiple at which the scale-out limit order sits
+  breakeven:
+    enabled: false
+    trigger_r_multiple: 1.0   # once price reaches this many R, move the stop to entry
+  trailing:
+    enabled: false
+    method: atr             # "ema" (EMA-9) or "atr"
+    atr_period: 14
+    atr_multiple: 1.5
+  eod_flatten_time: "15:55"   # force-flatten all positions at/after this ET time
+  risk_loop_interval_seconds: 15
+
 scanner:
   scan_code: TOP_PERC_GAIN
   location_code: STK.US.MAJOR

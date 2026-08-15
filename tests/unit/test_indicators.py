@@ -8,6 +8,7 @@ from warrior_bot.strategies.indicators import (
     is_red_to_green,
     opening_range,
     relative_volume,
+    trailing_candidate,
     vwap,
 )
 
@@ -94,3 +95,16 @@ def test_ema_known_value():
 def test_ema_none_with_insufficient_bars():
     bars = make_bars([(10, 10, 10, 10, 100)] * 2)
     assert ema(bars, period=3) is None
+
+
+def test_trailing_candidate_ema_method_returns_ema_9():
+    assert trailing_candidate(last_price=15.0, ema_9=12.5, atr=1.0, method="ema", atr_multiple=1.5) == 12.5
+
+
+def test_trailing_candidate_atr_method_returns_price_minus_atr_multiple():
+    result = trailing_candidate(last_price=15.0, ema_9=12.5, atr=2.0, method="atr", atr_multiple=1.5)
+    assert result == 12.0  # 15.0 - 2.0*1.5
+
+
+def test_trailing_candidate_atr_method_none_when_atr_missing():
+    assert trailing_candidate(last_price=15.0, ema_9=12.5, atr=None, method="atr", atr_multiple=1.5) is None

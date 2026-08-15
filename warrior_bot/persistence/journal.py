@@ -95,6 +95,31 @@ class Journal:
         )
         self.conn.commit()
 
+    def update_order_price(
+        self,
+        order_row_id: int,
+        limit_price: float | None = None,
+        stop_price: float | None = None,
+        qty: float | None = None,
+    ) -> None:
+        """Records an in-place modification (breakeven move, trailing
+        ratchet, or scale-out resize) against the order's existing row,
+        rather than inserting a synthetic new order."""
+        fields = ["ts_last_update = ?"]
+        params: list = [_now()]
+        if limit_price is not None:
+            fields.append("limit_price = ?")
+            params.append(limit_price)
+        if stop_price is not None:
+            fields.append("stop_price = ?")
+            params.append(stop_price)
+        if qty is not None:
+            fields.append("qty = ?")
+            params.append(qty)
+        params.append(order_row_id)
+        self.conn.execute(f"UPDATE orders SET {', '.join(fields)} WHERE id = ?", params)
+        self.conn.commit()
+
     def record_fill(
         self,
         order_row_id: int,

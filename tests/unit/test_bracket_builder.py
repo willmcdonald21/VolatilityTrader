@@ -84,3 +84,32 @@ def test_orders_have_explicit_day_tif():
     assert bracket.parent.tif == "DAY"
     assert bracket.take_profit.tif == "DAY"
     assert bracket.stop_loss.tif == "DAY"
+
+
+def test_default_bracket_target_role_is_target():
+    bracket = build_bracket(FakeIB(), make_signal(), quantity=100)
+    assert bracket.target_role == "target"
+
+
+def test_scale_out_leg_uses_partial_qty_and_price_not_oca_linked_with_stop():
+    bracket = build_bracket(
+        FakeIB(), make_signal(), quantity=100, scale_out_qty=40, scale_out_price=11.0
+    )
+    assert bracket.target_role == "scale_out"
+    assert bracket.take_profit.totalQuantity == 40
+    assert bracket.take_profit.lmtPrice == 11.0
+    # stop still protects the FULL quantity up front -- resizing happens
+    # reactively (in PositionManager) only after the scale-out leg fills
+    assert bracket.stop_loss.totalQuantity == 100
+    assert bracket.take_profit.ocaGroup == ""
+    assert bracket.stop_loss.ocaGroup == ""
+
+
+def test_scale_out_ignored_when_qty_out_of_bounds():
+    # scale_out_qty >= quantity falls back to the default full-qty target
+    bracket = build_bracket(
+        FakeIB(), make_signal(), quantity=100, scale_out_qty=100, scale_out_price=11.0
+    )
+    assert bracket.target_role == "target"
+    assert bracket.take_profit.totalQuantity == 100
+    assert bracket.take_profit.ocaGroup != ""
