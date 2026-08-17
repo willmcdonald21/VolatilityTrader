@@ -66,6 +66,13 @@ news:
   lookback_hours: 48          # how far back to check for a catalyst headline when a symbol is onboarded
   provider_codes: ""          # e.g. "BRFG+DJNL"; empty = auto-discover entitled providers via reqNewsProviders()
 
+notifications:
+  enabled: false               # requires webhook URLs set in .env (see .env.example) -- never put URLs here
+  notify_on_signal: true       # -> trade_activity channel: an entry signal was accepted and sized
+  notify_on_fill: true         # -> trade_activity channel: any leg of a bracket filled
+  notify_on_kill_switch: true  # -> kill_switch channel: manual kill switch, IBKR connection loss
+  notify_on_limits: true       # -> limits channel: daily-loss-limit halt, EOD flatten ("stopped for the day")
+
 exits:
   scale_out:
     enabled: false

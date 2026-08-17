@@ -68,7 +68,7 @@ class RiskManager:
 
         if self._kill_switch_active():
             reason = "kill switch active"
-            alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")
+            alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}", channel="kill_switch")
             return RiskDecision(False, 0, reason, snapshot)
 
         if self._loss_limit_breached(snapshot):
@@ -77,18 +77,18 @@ class RiskManager:
                 f"daily loss limit breached: realized {snapshot.daily_realized_pnl:.2f} "
                 f"<= -{loss_limit:.2f}"
             )
-            alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")
+            alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}", channel="limits")
             return RiskDecision(False, 0, reason, snapshot)
 
         if snapshot.open_positions_count >= self.config.max_concurrent_positions:
             reason = f"max concurrent positions reached ({snapshot.open_positions_count})"
-            alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")
+            alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
             return RiskDecision(False, 0, reason, snapshot)
 
         sized_qty = self._size_position(signal, snapshot, now)
         if sized_qty < 1:
             reason = "position size rounds to zero under current risk caps"
-            alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")
+            alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
             return RiskDecision(False, 0, reason, snapshot)
 
         return RiskDecision(True, sized_qty, "accepted", snapshot)

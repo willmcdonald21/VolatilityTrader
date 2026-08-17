@@ -13,7 +13,8 @@ from warrior_bot.broker.news import discover_provider_codes, fetch_recent_headli
 from warrior_bot.config import AppConfig, load_config
 from warrior_bot.execution.order_manager import OrderManager
 from warrior_bot.execution.position_manager import PositionManager
-from warrior_bot.logging_setup import setup_logging
+from warrior_bot.logging_setup import alert, setup_logging
+from warrior_bot.notify.discord import send_discord_message
 from warrior_bot.persistence.db import get_connection
 from warrior_bot.persistence.journal import Journal
 from warrior_bot.risk.account_state import AccountState
@@ -59,7 +60,12 @@ class WarriorBot:
             self.ib, self.journal, config.exits, stop_limit_offset_pct=config.execution.stop_limit_offset_pct
         )
         self.order_manager = OrderManager(
-            self.ib, self.journal, config.exits, self.position_manager, execution_config=config.execution
+            self.ib,
+            self.journal,
+            config.exits,
+            self.position_manager,
+            execution_config=config.execution,
+            notifications_config=config.notifications,
         )
 
         float_provider = FloatProvider(config.resolve_path("config/float_list.csv"))
@@ -142,7 +148,8 @@ class WarriorBot:
 
     def _trigger_flatten(self, reason: str) -> None:
         self.logger.warning("Flattening all positions: reason=%s", reason)
-        panic_stop(self.ib, flatten=True)
+        alert(f"Flattening all positions and stopping for the day: reason={reason}", channel="limits")
+        panic_stop(self.ib, flatten=True, channel="limits")
         self.position_manager.clear()
         self.journal.record_kill_switch_event(triggered_by=reason, action_taken="cancel_all+flatten_all")
         self._flattened_today = True
@@ -255,6 +262,13 @@ class WarriorBot:
             signal.stop_price,
             signal.target_price,
         )
+        if self.config.notifications.enabled and self.config.notifications.notify_on_signal:
+            send_discord_message(
+                f"📈 {'[DRY RUN] ' if self.dry_run else ''}"
+                f"{signal.symbol} {signal.strategy} {signal.side} qty={decision.sized_qty} "
+                f"entry=${signal.entry_price:.2f} stop=${signal.stop_price:.2f} target=${signal.target_price:.2f}",
+                channel="trade_activity",
+            )
         if self.dry_run:
             return
         self.order_manager.submit_signal(contract, signal, decision.sized_qty, signal_id)

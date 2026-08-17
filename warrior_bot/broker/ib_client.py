@@ -6,6 +6,7 @@ import logging
 from ib_async import IB, Contract, Stock
 
 from warrior_bot.config import AppConfig
+from warrior_bot.logging_setup import alert
 
 logger = logging.getLogger("warrior_bot.broker")
 
@@ -35,6 +36,7 @@ class IBClient:
         if self._reconnecting:
             return
         logger.warning("Disconnected from IBKR — scheduling reconnect")
+        alert("Disconnected from IBKR — attempting to reconnect", channel="kill_switch")
         asyncio.ensure_future(self._reconnect_loop())
 
     async def _reconnect_loop(self) -> None:
@@ -49,6 +51,7 @@ class IBClient:
                 except Exception:
                     logger.exception("Reconnect attempt failed")
                     delay = min(delay * 2, 60)
+            alert("Reconnected to IBKR", channel="kill_switch")
         finally:
             self._reconnecting = False
 

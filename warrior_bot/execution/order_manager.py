@@ -4,9 +4,10 @@ import logging
 
 from ib_async import IB, Contract, Trade
 
-from warrior_bot.config import ExecutionConfig, ExitsConfig
+from warrior_bot.config import ExecutionConfig, ExitsConfig, NotificationsConfig
 from warrior_bot.execution.bracket_builder import Bracket, build_bracket
 from warrior_bot.execution.position_manager import PositionManager
+from warrior_bot.notify.discord import send_discord_message
 from warrior_bot.persistence.journal import Journal
 from warrior_bot.signals.signal import Signal
 
@@ -28,12 +29,14 @@ class OrderManager:
         exits_config: ExitsConfig,
         position_manager: PositionManager,
         execution_config: ExecutionConfig | None = None,
+        notifications_config: NotificationsConfig | None = None,
     ):
         self.ib = ib
         self.journal = journal
         self.exits_config = exits_config
         self.position_manager = position_manager
         self.execution_config = execution_config or ExecutionConfig()
+        self.notifications_config = notifications_config or NotificationsConfig()
         self._order_row_ids: dict[int, int] = {}  # ib order id -> journal orders.id
 
     def submit_signal(self, contract: Contract, signal: Signal, quantity: int, signal_id: int) -> Bracket:
@@ -124,6 +127,13 @@ class OrderManager:
                 commission=commission,
                 realized_pnl=realized_pnl,
             )
+            if self.notifications_config.enabled and self.notifications_config.notify_on_fill:
+                pnl_str = f" (P&L ${realized_pnl:.2f})" if realized_pnl is not None else ""
+                send_discord_message(
+                    f"💰 {trade.contract.symbol} {trade.order.action} "
+                    f"{fill.execution.shares:g} @ ${fill.execution.price:.2f}{pnl_str}",
+                    channel="trade_activity",
+                )
 
         trade.statusEvent += on_status
         trade.fillEvent += on_fill

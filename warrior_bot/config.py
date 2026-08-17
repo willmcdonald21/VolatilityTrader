@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 import yaml
+from dotenv import load_dotenv
 from pydantic import BaseModel, Field, model_validator
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -172,6 +173,17 @@ class LoggingConfig(BaseModel):
     file: str = "data/warrior_bot.log"
 
 
+class NotificationsConfig(BaseModel):
+    # Posts to three separate Discord channels, each its own webhook URL
+    # read from an env var (see .env.example) -- never stored here, since
+    # config.yaml is tracked in git.
+    enabled: bool = False
+    notify_on_signal: bool = True  # -> trade_activity: an entry signal was accepted and sized
+    notify_on_fill: bool = True  # -> trade_activity: any leg of a bracket filled
+    notify_on_kill_switch: bool = True  # -> kill_switch: manual kill switch, IBKR connection loss
+    notify_on_limits: bool = True  # -> limits: daily-loss-limit halt, EOD flatten ("stopped for the day")
+
+
 class AppConfig(BaseModel):
     trading: TradingConfig
     execution: ExecutionConfig = ExecutionConfig()
@@ -179,6 +191,7 @@ class AppConfig(BaseModel):
     strategies: StrategiesConfig
     exits: ExitsConfig = ExitsConfig()
     news: NewsConfig = NewsConfig()
+    notifications: NotificationsConfig = NotificationsConfig()
     scanner: ScannerConfig
     journal: JournalConfig
     kill_switch: KillSwitchConfig
@@ -189,6 +202,7 @@ class AppConfig(BaseModel):
 
 
 def load_config(path: str | Path | None = None) -> AppConfig:
+    load_dotenv(PROJECT_ROOT / ".env")
     config_path = Path(path) if path else PROJECT_ROOT / "config" / "config.yaml"
     with open(config_path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f)
