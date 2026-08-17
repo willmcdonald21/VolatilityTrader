@@ -6,6 +6,7 @@ from warrior_bot.config import AbcdConfig
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
 from warrior_bot.strategies.pullback_validity import validate_pullback
+from warrior_bot.utils.time_utils import session_elapsed_fraction
 
 
 class AbcdStrategy(BaseStrategy):
@@ -26,6 +27,10 @@ class AbcdStrategy(BaseStrategy):
         if state.get("triggered"):
             return None
         if not self._check_engaged(ctx):
+            return None
+
+        rel_vol = ctx.relative_volume(session_elapsed_fraction(now))
+        if rel_vol is None or rel_vol < cfg.min_rel_volume:
             return None
 
         prior_bars = ctx.bars[:-1]

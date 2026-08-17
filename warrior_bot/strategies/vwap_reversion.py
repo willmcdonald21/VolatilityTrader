@@ -57,17 +57,19 @@ class VwapReversionStrategy(BaseStrategy):
             touched_vwap = distance_pct <= cfg.max_vwap_distance_pct
             bounced = current_bar.close > prev_bar.high and current_bar.close > vwap_price
             if touched_vwap and bounced:
-                entry_price = current_bar.close
-                stop_price = min(prev_bar.low, current_bar.low) * (1 - cfg.stop_buffer_pct / 100.0)
-                if stop_price < entry_price:
-                    state["triggered"] = True
-                    return self._build_signal(
-                        ctx,
-                        now,
-                        entry_price=entry_price,
-                        stop_price=stop_price,
-                        target_r_multiple=cfg.target_r_multiple,
-                        context={"setup": "vwap_bounce", "vwap": vwap_price},
-                    )
+                rel_vol = ctx.relative_volume(session_elapsed_fraction(now))
+                if rel_vol is not None and rel_vol >= cfg.min_rel_volume:
+                    entry_price = current_bar.close
+                    stop_price = min(prev_bar.low, current_bar.low) * (1 - cfg.stop_buffer_pct / 100.0)
+                    if stop_price < entry_price:
+                        state["triggered"] = True
+                        return self._build_signal(
+                            ctx,
+                            now,
+                            entry_price=entry_price,
+                            stop_price=stop_price,
+                            target_r_multiple=cfg.target_r_multiple,
+                            context={"setup": "vwap_bounce", "vwap": vwap_price, "relative_volume": rel_vol},
+                        )
 
         return None

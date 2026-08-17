@@ -84,6 +84,7 @@ class BullFlagConfig(BaseModel):
     max_consolidation_bars: int = 15
     stop_buffer_pct: float = 0.5
     target_r_multiple: float = 2.0
+    min_rel_volume: float = 5.0  # Ross's stated hard floor -- "if it doesn't have at least 5x average volume, it's not worth touching"
 
 
 class AbcdConfig(BaseModel):
@@ -93,12 +94,14 @@ class AbcdConfig(BaseModel):
     max_bc_pullback_pct: float = 60.0
     stop_buffer_pct: float = 0.5
     target_r_multiple: float = 2.0
+    min_rel_volume: float = 5.0  # same hard floor as the other strategies -- a blanket five-pillars criterion, not gap_and_go-specific
 
 
 class VwapReversionConfig(BaseModel):
     enabled: bool = True
     max_vwap_distance_pct: float = 1.5
-    red_to_green_volume_multiple: float = 2.0
+    red_to_green_volume_multiple: float = 5.0  # was 2.0 -- raised to match Ross's stated 5x hard floor
+    min_rel_volume: float = 5.0  # applies to the vwap_bounce setup, which previously had no relative-volume gate at all
     stop_buffer_pct: float = 0.5
     target_r_multiple: float = 1.5
 
@@ -155,7 +158,16 @@ class ScannerConfig(BaseModel):
     location_code: str = "STK.US.MAJOR"
     above_price: float = 1.0
     below_price: float = 20.0
-    above_volume: int = 100_000
+    # IBKR's scanner filters on raw share volume, not relative-to-average --
+    # it can't compute true relative volume itself (needs each symbol's own
+    # average, which isn't known until after onboarding). This is just a
+    # coarse liquidity sanity floor to keep dead tickers out of the
+    # candidate list; the REAL 5x relative-volume gate (Ross's stated hard
+    # minimum) is enforced per-strategy after onboarding via
+    # SymbolContext.relative_volume() + each strategy's min_rel_volume.
+    # Keep this low -- a low-float stock running 5x its own (small) average
+    # volume can still have modest raw share volume.
+    above_volume: int = 10_000
     refresh_seconds: int = 60
     max_candidates: int = 25
 

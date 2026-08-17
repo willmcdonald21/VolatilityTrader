@@ -20,9 +20,14 @@ PASSING_BARS = [
 ]
 
 
-def make_ctx(bar_specs, symbol="FLAG"):
+def make_ctx(bar_specs, symbol="FLAG", avg_daily_volume=100):
+    # avg_daily_volume defaults low enough that any of these fixtures'
+    # cumulative volume clears the 5x relative-volume floor by a wide
+    # margin -- tests that care about relative volume specifically pass
+    # an inflated value to push it below threshold instead.
     ctx = SymbolContext(symbol=symbol)
     ctx.bars = make_bars(bar_specs)
+    ctx.avg_daily_volume = avg_daily_volume
     return ctx
 
 
@@ -110,4 +115,14 @@ def test_does_not_retrigger_same_symbol_same_day():
     ctx = make_ctx(PASSING_BARS)
     strategy = BullFlagStrategy(BullFlagConfig())
     assert strategy.evaluate(ctx, NOW) is not None
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_no_signal_when_relative_volume_too_low():
+    # same price structure as PASSING_BARS, but a huge average makes the
+    # day's actual volume look tiny by comparison -- Ross's stated hard
+    # floor: "if it doesn't have at least 5x average volume, it's not
+    # worth touching"
+    ctx = make_ctx(PASSING_BARS, avg_daily_volume=10_000_000)
+    strategy = BullFlagStrategy(BullFlagConfig())
     assert strategy.evaluate(ctx, NOW) is None

@@ -27,7 +27,7 @@ def test_red_to_green_triggers_signal():
             (9.8, 10.2, 9.8, 10.2, 5000),  # current bar: crosses to green
         ],
         prior_close=10.0,
-        avg_daily_volume=20_000,
+        avg_daily_volume=10_000,  # low enough that cumulative volume clears the 5x relative-volume floor
     )
     strategy = VwapReversionStrategy(VwapReversionConfig())
     signal = strategy.evaluate(ctx, NOW)
@@ -59,7 +59,7 @@ def test_vwap_bounce_triggers_signal():
             (9.95, 10.3, 9.95, 10.3, 1000),   # bounces back above prior high and VWAP
         ],
         prior_close=5.0,  # far below everything -> red_to_green never applies
-        avg_daily_volume=20_000,
+        avg_daily_volume=5_000,  # low enough that cumulative volume clears the 5x relative-volume floor
     )
     strategy = VwapReversionStrategy(VwapReversionConfig())
     signal = strategy.evaluate(ctx, NOW)
@@ -83,13 +83,28 @@ def test_no_signal_when_pullback_too_far_from_vwap():
     assert strategy.evaluate(ctx, NOW) is None
 
 
+def test_vwap_bounce_skipped_when_relative_volume_too_low():
+    ctx = make_ctx(
+        bar_specs=[
+            (10.0, 10.0, 10.0, 10.0, 10),
+            (10.0, 10.0, 10.0, 10.0, 10),
+            (10.0, 10.05, 9.9, 9.95, 10),
+            (9.95, 10.3, 9.95, 10.3, 10),
+        ],
+        prior_close=5.0,
+        avg_daily_volume=10_000_000,  # huge average vs. tiny actual volume
+    )
+    strategy = VwapReversionStrategy(VwapReversionConfig())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
 def test_does_not_retrigger_same_symbol_same_day():
     bar_specs = [
         (9.5, 9.6, 9.4, 9.5, 1000),
         (9.5, 9.8, 9.4, 9.8, 1000),
         (9.8, 10.2, 9.8, 10.2, 5000),
     ]
-    ctx = make_ctx(bar_specs, prior_close=10.0, avg_daily_volume=20_000)
+    ctx = make_ctx(bar_specs, prior_close=10.0, avg_daily_volume=10_000)
     strategy = VwapReversionStrategy(VwapReversionConfig())
     assert strategy.evaluate(ctx, NOW) is not None
     assert strategy.evaluate(ctx, NOW) is None

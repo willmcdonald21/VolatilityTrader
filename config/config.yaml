@@ -32,7 +32,7 @@ strategies:
     min_gap_pct: 10.0
     min_price: 1.0
     max_price: 20.0
-    min_rel_volume: 5.0
+    min_rel_volume: 5.0            # hard minimum -- Ross: "if it doesn't have at least 5x average volume, it's not worth touching"
     breakout_lookback_bars: 30    # bars used to compute pre-market/opening-range high
     stop_buffer_pct: 1.0          # stop placed this % below the breakout level
     target_r_multiple: 2.0        # profit target expressed as multiple of risk (R)
@@ -47,6 +47,7 @@ strategies:
     max_consolidation_bars: 15
     stop_buffer_pct: 0.5
     target_r_multiple: 2.0
+    min_rel_volume: 5.0           # same hard floor -- blanket five-pillars criterion, not gap_and_go-specific
   abcd:
     enabled: true
     min_ab_move_pct: 5.0          # minimum A->B spike size
@@ -54,10 +55,12 @@ strategies:
     max_bc_pullback_pct: 60.0
     stop_buffer_pct: 0.5
     target_r_multiple: 2.0
+    min_rel_volume: 5.0           # same hard floor -- blanket five-pillars criterion
   vwap_reversion:
     enabled: true
     max_vwap_distance_pct: 1.5    # price must be within this % of VWAP to qualify for a reversion entry
-    red_to_green_volume_multiple: 2.0  # today's volume vs. average must exceed this for a red-to-green signal
+    red_to_green_volume_multiple: 5.0  # was 2.0 -- raised to match Ross's stated 5x hard floor
+    min_rel_volume: 5.0           # applies to the vwap_bounce setup, which previously had no relative-volume gate at all
     stop_buffer_pct: 0.5
     target_r_multiple: 1.5
 
@@ -99,7 +102,10 @@ scanner:
   location_code: STK.US.MAJOR
   above_price: 1.0
   below_price: 20.0
-  above_volume: 100000
+  above_volume: 10000     # coarse liquidity floor only, NOT the relative-volume gate (IBKR scanner can't compute
+                           # true relative volume). The real 5x minimum is each strategy's min_rel_volume above --
+                           # raise strategies.*.min_rel_volume to 20.0 to tighten the funnel when there's too much
+                           # to look through (Ross's own example: 5x -> ~100 candidates/day, 20x -> ~20)
   refresh_seconds: 15
   max_candidates: 25
 
