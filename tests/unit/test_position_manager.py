@@ -27,12 +27,13 @@ class FakeEvent:
 
 
 class FakeOrder:
-    def __init__(self, action, totalQuantity, auxPrice=None, lmtPrice=None, orderId=1):
+    def __init__(self, action, totalQuantity, auxPrice=None, lmtPrice=None, orderId=1, orderType=None):
         self.action = action
         self.totalQuantity = totalQuantity
         self.auxPrice = auxPrice
         self.lmtPrice = lmtPrice
         self.orderId = orderId
+        self.orderType = orderType
 
 
 class FakeTrade:
@@ -115,8 +116,10 @@ def make_exits_config(
     )
 
 
-def track_position(pm: PositionManager, signal: Signal, quantity=100, target_role="target", target_qty=None):
-    stop_order = FakeOrder("SELL", quantity, auxPrice=signal.stop_price, orderId=2)
+def track_position(
+    pm: PositionManager, signal: Signal, quantity=100, target_role="target", target_qty=None, stop_order_type=None
+):
+    stop_order = FakeOrder("SELL", quantity, auxPrice=signal.stop_price, orderId=2, orderType=stop_order_type)
     stop_trade = FakeTrade(stop_order)
     tq = target_qty if target_qty is not None else quantity
     target_order = FakeOrder("SELL", tq, lmtPrice=signal.target_price, orderId=3)
@@ -346,3 +349,66 @@ def test_reversal_exit_no_pattern_leaves_position_untouched_and_runs_breakeven()
     assert len(market_orders) == 0
     assert "TEST" in pm._positions
     assert stop_trade.order.auxPrice == 10.0  # breakeven still ran since no reversal fired
+
+
+def test_breakeven_updates_stop_limit_price_when_order_is_stop_limit():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False), stop_limit_offset_pct=1.0)
+    signal = make_signal(entry=10.0, stop=9.0)
+    stop_trade, _ = track_position(pm, signal, stop_order_type="STP LMT")
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.0))  # +1.0R triggers breakeven -> stop moves to entry (10.0)
+
+    assert stop_trade.order.auxPrice == 10.0
+    assert stop_trade.order.lmtPrice == 10.0 * 0.99  # 1% below the new trigger, same offset direction as entry
+
+
+def test_trailing_updates_stop_limit_price_when_order_is_stop_limit():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_method="ema"), stop_limit_offset_pct=1.0)
+    signal = make_signal(entry=10.0, stop=9.0)
+    stop_trade, _ = track_position(pm, signal, stop_order_type="STP LMT")
+
+    pm.on_bar(FakeCtx("TEST", last_price=12.0, ema_9=11.0))  # breakeven then trailing ratchets to 11.0
+
+    assert stop_trade.order.auxPrice == 11.0
+    assert stop_trade.order.lmtPrice == 11.0 * 0.99
+
+
+def test_reversal_exit_on_lower_low_after_breakeven_triggers_market_exit():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=True, trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    stop_trade, target_trade = track_position(pm, signal, quantity=100)
+
+    # first bar: reaches breakeven (+1.0R), no reversal pattern present
+    bars = make_bars([(10.0, 10.5, 9.9, 10.4, 1000), (10.4, 11.1, 10.35, 11.0, 1000)])
+    pm.on_bar(FakeCtx("TEST", last_price=11.0, bars=bars))
+    assert "TEST" in pm._positions
+    assert stop_trade.order.auxPrice == 10.0  # breakeven fired
+
+    # second bar: a lower low than the prior bar, isolated from the other
+    # reversal signals (prior bar is red, not green, so red_after_green
+    # doesn't also fire; body/wick ratio doesn't qualify as a topping tail)
+    bars2 = make_bars([(10.4, 10.5, 10.2, 10.3, 1000), (10.3, 10.35, 10.1, 10.25, 1000)])
+    pm.on_bar(FakeCtx("TEST", last_price=10.25, bars=bars2))
+
+    market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
+    assert len(market_orders) == 1
+    assert "TEST" not in pm._positions
+
+
+def test_reversal_exit_lower_low_does_not_fire_before_breakeven():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=True, trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, quantity=100)
+
+    # a lower low exists, but price hasn't reached breakeven (+1.0R) yet --
+    # prior bar is red (not green), so red_after_green doesn't mask the result
+    bars = make_bars([(10.3, 10.35, 9.95, 10.2, 1000), (10.2, 10.25, 9.8, 9.9, 1000)])
+    pm.on_bar(FakeCtx("TEST", last_price=9.9, bars=bars))
+
+    market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
+    assert len(market_orders) == 0
+    assert "TEST" in pm._positions

@@ -9,7 +9,13 @@ from warrior_bot.config import ExitsConfig
 from warrior_bot.persistence.journal import Journal
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import SymbolContext
-from warrior_bot.strategies.indicators import is_high_volume_red_bar, is_red_after_green, is_topping_tail, trailing_candidate
+from warrior_bot.strategies.indicators import (
+    is_high_volume_red_bar,
+    is_lower_low,
+    is_red_after_green,
+    is_topping_tail,
+    trailing_candidate,
+)
 
 logger = logging.getLogger("warrior_bot.execution.position_manager")
 
@@ -40,10 +46,11 @@ class PositionManager:
     and doesn't disturb existing journaling behavior.
     """
 
-    def __init__(self, ib: IB, journal: Journal, config: ExitsConfig):
+    def __init__(self, ib: IB, journal: Journal, config: ExitsConfig, stop_limit_offset_pct: float = 0.5):
         self.ib = ib
         self.journal = journal
         self.config = config
+        self.stop_limit_offset_pct = stop_limit_offset_pct
         self._positions: dict[str, ManagedPosition] = {}
 
     def track(
@@ -143,14 +150,19 @@ class PositionManager:
         logger.info("Trailing: moved stop for %s to %.4f", pos.symbol, new_stop)
 
     def _check_reversal_exit(self, pos: ManagedPosition, ctx: SymbolContext) -> bool:
-        """The three exit indicators from the source material that are
-        directly OHLCV-computable (the other three -- a large L2 seller, a
-        hidden/iceberg seller, decelerating tape -- need order-book/tick
-        data this bot doesn't have). Any one of them firing exits the
-        remaining position immediately via a market order, matching the
-        source material's "don't wait for the stop" urgency -- this is
-        intentionally the second place in the bot (besides the kill switch)
-        that sends a naked market order."""
+        """Exit indicators from the source material that are directly
+        OHLCV-computable (the others -- a large L2 seller, a hidden/iceberg
+        seller, decelerating tape -- need order-book/tick data this bot
+        doesn't have). Any one firing exits the remaining position
+        immediately via a market order, matching the source material's
+        "don't wait for the stop" urgency -- this is intentionally the
+        second place in the bot (besides the kill switch) that sends a
+        naked market order.
+
+        "First lower low" only arms once breakeven has triggered -- the
+        source material is explicit this confirmation is "evaluated only
+        after the position is already profitable/trend-established", not
+        from the first bar after entry."""
         cfg = self.config.reversal_exit
         bars = ctx.bars
         if len(bars) < 2:
@@ -164,6 +176,8 @@ class PositionManager:
             reasons.append("topping_tail")
         if is_red_after_green(prior_bar, current_bar):
             reasons.append("red_after_green")
+        if pos.breakeven_done and is_lower_low(current_bar, prior_bar):
+            reasons.append("lower_low")
         recent = bars[-(cfg.volume_lookback_bars + 1) : -1]
         if recent:
             avg_recent_volume = sum(b.volume for b in recent) / len(recent)
@@ -191,8 +205,18 @@ class PositionManager:
 
     def _modify_stop_price(self, pos: ManagedPosition, new_price: float) -> None:
         pos.stop_order.auxPrice = new_price
+        limit_price = None
+        if getattr(pos.stop_order, "orderType", None) == "STP LMT":
+            # keep the limit offset in the same direction bracket_builder
+            # used when the order was first built, so trailing/breakeven
+            # moves don't drift the limit's protective distance
+            if pos.stop_order.action == "SELL":
+                limit_price = new_price * (1 - self.stop_limit_offset_pct / 100.0)
+            else:
+                limit_price = new_price * (1 + self.stop_limit_offset_pct / 100.0)
+            pos.stop_order.lmtPrice = limit_price
         self.ib.placeOrder(pos.contract, pos.stop_order)
-        self.journal.update_order_price(pos.stop_row_id, stop_price=new_price)
+        self.journal.update_order_price(pos.stop_row_id, stop_price=new_price, limit_price=limit_price)
 
     def _resize_stop_qty(self, pos: ManagedPosition, new_qty: int) -> None:
         pos.stop_order.totalQuantity = new_qty

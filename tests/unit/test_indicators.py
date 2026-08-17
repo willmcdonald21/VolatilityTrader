@@ -6,6 +6,7 @@ from warrior_bot.strategies.indicators import (
     ema,
     gap_pct,
     is_high_volume_red_bar,
+    is_lower_low,
     is_red_after_green,
     is_red_to_green,
     is_topping_tail,
@@ -177,3 +178,15 @@ def test_is_high_volume_red_bar_false_when_not_red():
 def test_is_high_volume_red_bar_false_when_volume_not_elevated():
     bar = make_bars([(10.4, 10.5, 10.0, 10.1, 1500)])[0]  # red, but not 2x the average
     assert is_high_volume_red_bar(bar, avg_recent_volume=1000, multiple=2.0) is False
+
+
+def test_is_lower_low_true():
+    prior = make_bars([(10.0, 10.5, 9.9, 10.2, 1000)])[0]
+    current = make_bars([(10.2, 10.3, 9.7, 9.9, 1000)])[0]
+    assert is_lower_low(current, prior) is True
+
+
+def test_is_lower_low_false_when_low_holds():
+    prior = make_bars([(10.0, 10.5, 9.9, 10.2, 1000)])[0]
+    current = make_bars([(10.2, 10.3, 9.95, 10.1, 1000)])[0]
+    assert is_lower_low(current, prior) is False

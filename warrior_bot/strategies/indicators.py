@@ -149,6 +149,15 @@ def is_red_after_green(prior_bar: Bar, current_bar: Bar) -> bool:
     return prior_bar.close > prior_bar.open and current_bar.close < current_bar.open
 
 
+def is_lower_low(current_bar: Bar, prior_bar: Bar) -> bool:
+    """The first candle whose low undercuts the previous candle's low --
+    described across the source material as the cleanest, most mechanical
+    full-exit confirmation trigger. Meant to be checked only once a
+    position is already profitable/trend-established, not from the first
+    bar after entry -- callers are responsible for that gating."""
+    return current_bar.low < prior_bar.low
+
+
 def is_high_volume_red_bar(bar: Bar, avg_recent_volume: float, multiple: float = 2.0) -> bool:
     """A red candle with a burst of volume well above the recent average --
     aggressive selling, not just a normal light-volume pullback."""

@@ -8,6 +8,9 @@ trading:
   i_understand_live_trading: false
   use_rth: false                 # false = include pre-market/after-hours bars (needed for gap scanning)
 
+execution:
+  stop_limit_offset_pct: 0.5     # stop-loss is a stop-limit order; limit sits this % beyond the trigger (IBKR rejects plain market/stop orders outside RTH)
+
 risk:
   risk_per_trade_pct: 0.005      # fraction of NetLiquidation risked per trade
   daily_loss_limit_pct: 0.02     # halt new entries once daily realized loss exceeds this fraction of start-of-day equity
@@ -90,7 +93,7 @@ scanner:
   above_price: 1.0
   below_price: 20.0
   above_volume: 100000
-  refresh_seconds: 60
+  refresh_seconds: 15
   max_candidates: 25
 
 journal:

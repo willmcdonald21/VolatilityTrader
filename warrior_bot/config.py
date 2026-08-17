@@ -35,6 +35,16 @@ class TradingConfig(BaseModel):
         return self
 
 
+class ExecutionConfig(BaseModel):
+    # IBKR rejects plain market orders outside regular trading hours
+    # (4:00-9:30am / 4:00-8:00pm ET) -- a plain StopOrder resolves to a
+    # market fill once triggered, so the stop-loss leg is built as a
+    # stop-limit (STP LMT) instead. This offset sits the limit price this
+    # % beyond the stop trigger, capping worst-case slippage the same way
+    # the source material's "ask+10c/bid-10c" marketable-limit pattern does.
+    stop_limit_offset_pct: float = Field(default=0.5, ge=0)
+
+
 class RiskConfig(BaseModel):
     risk_per_trade_pct: float = Field(gt=0, le=0.05)
     daily_loss_limit_pct: float = Field(gt=0, le=0.5)
@@ -164,6 +174,7 @@ class LoggingConfig(BaseModel):
 
 class AppConfig(BaseModel):
     trading: TradingConfig
+    execution: ExecutionConfig = ExecutionConfig()
     risk: RiskConfig
     strategies: StrategiesConfig
     exits: ExitsConfig = ExitsConfig()

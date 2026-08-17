@@ -4,7 +4,7 @@ import logging
 
 from ib_async import IB, Contract, Trade
 
-from warrior_bot.config import ExitsConfig
+from warrior_bot.config import ExecutionConfig, ExitsConfig
 from warrior_bot.execution.bracket_builder import Bracket, build_bracket
 from warrior_bot.execution.position_manager import PositionManager
 from warrior_bot.persistence.journal import Journal
@@ -21,16 +21,31 @@ class OrderManager:
     position management (breakeven/trailing/scale-out) is `PositionManager`'s
     job, registered once here right after a bracket is placed."""
 
-    def __init__(self, ib: IB, journal: Journal, exits_config: ExitsConfig, position_manager: PositionManager):
+    def __init__(
+        self,
+        ib: IB,
+        journal: Journal,
+        exits_config: ExitsConfig,
+        position_manager: PositionManager,
+        execution_config: ExecutionConfig | None = None,
+    ):
         self.ib = ib
         self.journal = journal
         self.exits_config = exits_config
         self.position_manager = position_manager
+        self.execution_config = execution_config or ExecutionConfig()
         self._order_row_ids: dict[int, int] = {}  # ib order id -> journal orders.id
 
     def submit_signal(self, contract: Contract, signal: Signal, quantity: int, signal_id: int) -> Bracket:
         scale_out_qty, scale_out_price = self._scale_out_params(signal, quantity)
-        bracket = build_bracket(self.ib, signal, quantity, scale_out_qty=scale_out_qty, scale_out_price=scale_out_price)
+        bracket = build_bracket(
+            self.ib,
+            signal,
+            quantity,
+            scale_out_qty=scale_out_qty,
+            scale_out_price=scale_out_price,
+            stop_limit_offset_pct=self.execution_config.stop_limit_offset_pct,
+        )
         role_by_order_id = {
             bracket.parent.orderId: "parent",
             bracket.take_profit.orderId: bracket.target_role,

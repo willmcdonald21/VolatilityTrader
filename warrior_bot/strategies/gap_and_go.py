@@ -30,6 +30,8 @@ class GapAndGoStrategy(BaseStrategy):
         state = self.state_for(ctx.symbol)
         if state.get("triggered"):
             return None
+        if not self._check_engaged(ctx):
+            return None
 
         price = ctx.last_price
         if price is None or not (cfg.min_price <= price <= cfg.max_price):

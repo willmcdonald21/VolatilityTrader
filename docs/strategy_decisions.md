@@ -1,14 +1,18 @@
 # Strategy enhancement decisions
 
-Source material: four Warrior Trading transcripts in the maintainer's local
+Source material: Warrior Trading transcripts in the maintainer's local
 notes folder (`warrior_trading_strategy_notes.md`, `warrior_trading_roadmap_notes.md`,
-`warrior_trading_full_course_notes.md`, `warrior_trading_candlestick_pattern_notes.md`).
-This file tracks findings from that material that were considered but
-**not** implemented, and why, so the reasoning isn't lost. Implemented
-findings are just... implemented; see `bull_flag.py`/`abcd_pattern.py`
-(pullback validity gates), `pullback_validity.py`, `indicators.py` (MACD,
-candlestick shape detectors), `position_manager.py` (reversal exit),
-`risk_manager.py` (catalyst and time-of-day size boosts), and `config.yaml`.
+`warrior_trading_full_course_notes.md`, `warrior_trading_candlestick_pattern_notes.md`,
+`warrior_trading_execution_risk_notes.md`). This file tracks findings from
+that material that were considered but **not** implemented, and why, so
+the reasoning isn't lost. Implemented findings are just... implemented;
+see `bull_flag.py`/`abcd_pattern.py` (pullback validity gates),
+`pullback_validity.py`, `indicators.py` (MACD, candlestick shape
+detectors, first-lower-low), `base_strategy.py` (`_check_engaged` --
+stock-level 9/20 MACD disengagement gate), `position_manager.py`
+(reversal exit, stop-limit price tracking), `bracket_builder.py`
+(stop-limit order type), `risk_manager.py` (catalyst and time-of-day size
+boosts), and `config.yaml`.
 
 ## Deferred: daily "give-back" circuit breaker
 
@@ -116,4 +120,76 @@ P&L), to separate "the strategy's inherent risk" losses from
 "logic/implementation deviation" losses during review. Not implemented —
 the journal records signals/decisions/orders/fills but has no
 rule-adherence flag. Would need a defined "expected" entry/exit price to
-diff the actual fill against.
+diff the actual fill against. The execution/risk transcript's
+"successful red day" framing (was the day successful by process, not just
+P&L) and its rule-adherence-as-a-metric idea are the same underlying gap.
+
+## Deferred: marketable-limit conversion for the kill switch and reversal exit
+
+The execution/risk transcript makes explicit what earlier files implied:
+IBKR rejects plain market orders outside regular trading hours
+(4:00-9:30am / 4:00-8:00pm ET) — only limit orders work then. The
+bracket's stop-loss was fixed (now a stop-limit order, see
+`bracket_builder.py`), since that's a purely structural change (no live
+market data needed). Two other order-placement paths still use a plain
+`MarketOrder` with no `outsideRth` set and were deliberately left as-is
+for now, at the maintainer's request:
+
+- `utils/panic.py::flatten_all_positions` (the kill switch)
+- `execution/position_manager.py::_reversal_exit`
+
+**Why deferred:** converting these to the source material's "ask+10c /
+bid-10c" marketable-limit pattern needs a live bid/ask quote fetched
+immediately before placing the order (a real execution-layer addition —
+a market-data snapshot call — not just a structural order-type change).
+
+**If/when revisited:** add a small helper (e.g.
+`broker/quotes.py::fetch_marketable_limit_price(ib, contract, action, offset_cents)`)
+using `ib.reqMktData`/`ib.reqTickers` for a live bid/ask snapshot, then
+swap both `MarketOrder` call sites for a `LimitOrder` at that computed
+price. Until then, both paths risk being rejected or failing to fill if
+triggered pre-market/after-hours — worth confirming against the live paper
+Gateway during an actual premarket session.
+
+## Deferred: green-to-red intraday flip circuit breaker
+
+Distinct from (and simpler than) the 50%-give-back-from-peak rule above:
+if today's P&L crosses into "green" territory (roughly a quarter-to-half
+of the daily goal) and then flips negative, that specific transition is
+treated as its own hard walk-away trigger. Unlike the give-back rule, this
+one doesn't need historical trading data — it's buildable today with
+`AccountState`/`RiskManager` alone. **Explicitly deferred at the
+maintainer's request** ("skip for now"), not for a technical reason.
+
+**If/when revisited:** track a `was_green_today` flag (set once
+`daily_realized_pnl` crosses a configurable fraction of
+`daily_profit_goal_usd`, cleared by `reset_daily_state()`), and add a
+`should_flatten_for_green_to_red_flip(snapshot)` check to
+`WarriorBot._check_flatten_triggers` alongside the existing EOD/loss-limit
+triggers, reusing the same `panic_stop()` path.
+
+## Deferred: ~30-second post-entry "instant resolution" check
+
+The execution/risk transcript gives a concrete time window (~30 seconds)
+for the "breakout or bailout" concept from earlier files: price should
+move 2-3+ cents in the trader's favor within seconds of entry, or the
+entry itself is treated as invalidated. **Explicitly deferred at the
+maintainer's request.**
+
+**Why deferred:** the bot operates on 1-minute bars throughout
+(`fetch_warmup_bars`, the `keepUpToDate` live bar stream in `main.py`).
+A ~30-second check needs sub-minute granularity. `broker/market_data.py::subscribe_real_time_bars`
+(5-second real-time bars) already exists but has never been wired into
+`main.py` — it's dead code today. Wiring it up is a real architecture
+change (a second, faster bar stream alongside the existing 1-minute one,
+with its own aggregation/state), not a quick add-on.
+
+## Not applicable to an automated system
+
+From the execution/risk transcript: trading-station hardware (laptop/monitor
+budget), hotkey scripting, Level 2 color-coding preferences, and the
+"ladder view" — all manual-execution-UI concerns with no equivalent in an
+automated bot. The `weekly_goal = daily_goal × 3` / monthly goal cascade is
+a reporting/target-setting formula, not a live-trading gate — could be
+added to `scripts/daily_report.py` later if useful, but doesn't belong in
+the trading logic itself.

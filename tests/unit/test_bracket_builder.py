@@ -113,3 +113,23 @@ def test_scale_out_ignored_when_qty_out_of_bounds():
     assert bracket.target_role == "target"
     assert bracket.take_profit.totalQuantity == 100
     assert bracket.take_profit.ocaGroup != ""
+
+
+def test_stop_loss_is_a_stop_limit_order():
+    # IBKR rejects plain market orders (what a triggered STP resolves to)
+    # outside regular trading hours -- STP LMT keeps the stop working
+    # pre-market/after-hours.
+    bracket = build_bracket(FakeIB(), make_signal(), quantity=100)
+    assert bracket.stop_loss.orderType == "STP LMT"
+    assert bracket.stop_loss.auxPrice == 9.0  # trigger unchanged
+
+
+def test_stop_loss_limit_sits_below_trigger_by_configured_offset():
+    bracket = build_bracket(FakeIB(), make_signal(), quantity=100, stop_limit_offset_pct=1.0)
+    assert bracket.stop_loss.action == "SELL"
+    assert bracket.stop_loss.lmtPrice == 9.0 * 0.99
+
+
+def test_stop_loss_offset_defaults_to_half_percent():
+    bracket = build_bracket(FakeIB(), make_signal(), quantity=100)
+    assert bracket.stop_loss.lmtPrice == 9.0 * 0.995

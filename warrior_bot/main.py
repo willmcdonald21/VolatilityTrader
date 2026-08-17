@@ -55,8 +55,12 @@ class WarriorBot:
         self.risk_manager = RiskManager(
             config.risk, self.account_state, config.resolve_path(config.kill_switch.flag_file)
         )
-        self.position_manager = PositionManager(self.ib, self.journal, config.exits)
-        self.order_manager = OrderManager(self.ib, self.journal, config.exits, self.position_manager)
+        self.position_manager = PositionManager(
+            self.ib, self.journal, config.exits, stop_limit_offset_pct=config.execution.stop_limit_offset_pct
+        )
+        self.order_manager = OrderManager(
+            self.ib, self.journal, config.exits, self.position_manager, execution_config=config.execution
+        )
 
         float_provider = FloatProvider(config.resolve_path("config/float_list.csv"))
 

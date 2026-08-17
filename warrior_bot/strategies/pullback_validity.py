@@ -44,7 +44,10 @@ def validate_pullback(pullback_bars: list[Bar], up_move_bars: list[Bar], ctx: Sy
     if ema_9 is not None and pullback_low < ema_9:
         return PullbackValidity(False, "pullback broke below 9 EMA")
 
-    macd_result = ctx.macd()
+    # (9, 20) matches Ross Cameron's actual chart MACD setup (computed from
+    # his 9/20 EMA pair), not the textbook (12, 26) default -- confirmed by
+    # a later, more execution-detailed transcript.
+    macd_result = ctx.macd(fast=9, slow=20)
     if macd_result is not None:
         macd_line, signal_line = macd_result
         if macd_line <= signal_line:

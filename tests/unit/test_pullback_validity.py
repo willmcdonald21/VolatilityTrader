@@ -85,7 +85,7 @@ def test_rejects_when_macd_not_bullish():
     # plunges negative faster than its own (lagging) signal line
     closes = [15.0] * 20 + [15.0 - 0.5 * i for i in range(1, 15)]
     ctx = make_ctx([(c, c, c, c, 1000) for c in closes])
-    macd_result = ctx.macd()
+    macd_result = ctx.macd(fast=9, slow=20)  # (9, 20) matches what validate_pullback actually checks
     assert macd_result is not None
     assert macd_result[0] <= macd_result[1]  # sanity check: bearish as constructed
 
@@ -103,7 +103,7 @@ def test_rejects_when_macd_not_bullish():
 def test_valid_pullback_with_all_gates_available_and_passing():
     closes = [15.0] * 20 + [15.0 + 0.5 * i for i in range(1, 15)]  # sustained rise -> bullish MACD
     ctx = make_ctx([(c, c, c, c, 1000) for c in closes])
-    macd_result = ctx.macd()
+    macd_result = ctx.macd(fast=9, slow=20)
     assert macd_result is not None
     assert macd_result[0] > macd_result[1]  # sanity check: bullish as constructed
 

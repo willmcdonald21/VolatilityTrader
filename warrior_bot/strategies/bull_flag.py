@@ -22,6 +22,8 @@ class BullFlagStrategy(BaseStrategy):
         state = self.state_for(ctx.symbol)
         if state.get("triggered"):
             return None
+        if not self._check_engaged(ctx):
+            return None
 
         prior_bars = ctx.bars[:-1]
         # minimum viable window: 1 baseline bar + 1 spike bar + the shortest allowed consolidation

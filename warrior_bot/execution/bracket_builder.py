@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ib_async import IB, LimitOrder, Order, StopOrder
+from ib_async import IB, LimitOrder, Order, StopLimitOrder
 
 from warrior_bot.signals.signal import Signal
 
@@ -25,6 +25,7 @@ def build_bracket(
     quantity: int,
     scale_out_qty: int | None = None,
     scale_out_price: float | None = None,
+    stop_limit_offset_pct: float = 0.5,
 ) -> Bracket:
     """Every entry is a 3-order bracket — no naked entries.
 
@@ -41,6 +42,14 @@ def build_bracket(
     instant the smaller scale-out leg fills, leaving the remaining shares
     unprotected. Instead `PositionManager` reacts to the scale-out fill
     itself and resizes the stop down.
+
+    The stop-loss is a stop-limit (STP LMT), not a plain stop -- IBKR
+    rejects plain market orders (which is what a triggered STP order
+    resolves to) outside regular trading hours, and this bot trades
+    pre-market. `stop_limit_offset_pct` sits the limit this % beyond the
+    stop trigger (in the direction that still allows the exit to fill),
+    capping worst-case slippage the same way a manual trader's marketable
+    limit order would.
     """
     reverse_action = "SELL" if signal.side == "BUY" else "BUY"
 
@@ -74,10 +83,20 @@ def build_bracket(
         outsideRth=True,
         tif="DAY",
     )
-    stop_loss = StopOrder(
+    # Limit sits on the far side of the trigger from the stop's protective
+    # direction: a SELL stop (protecting a long) triggers as price falls,
+    # so the limit sits below the trigger to still be fillable on further
+    # downside; a BUY stop (protecting a short) is the mirror image.
+    if reverse_action == "SELL":
+        stop_limit_price = signal.stop_price * (1 - stop_limit_offset_pct / 100.0)
+    else:
+        stop_limit_price = signal.stop_price * (1 + stop_limit_offset_pct / 100.0)
+
+    stop_loss = StopLimitOrder(
         reverse_action,
         quantity,
-        signal.stop_price,
+        lmtPrice=stop_limit_price,
+        stopPrice=signal.stop_price,
         orderId=ib.client.getReqId(),
         parentId=parent.orderId,
         transmit=True,

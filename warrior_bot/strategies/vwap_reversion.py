@@ -26,6 +26,8 @@ class VwapReversionStrategy(BaseStrategy):
         state = self.state_for(ctx.symbol)
         if state.get("triggered"):
             return None
+        if not self._check_engaged(ctx):
+            return None
         if len(ctx.bars) < 3:
             return None
 
