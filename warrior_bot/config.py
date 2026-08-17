@@ -45,6 +45,10 @@ class RiskConfig(BaseModel):
     daily_profit_goal_usd: float | None = None
     cushion_profit_fraction: float = Field(default=0.25, gt=0, le=1)
     cushion_size_fraction: float = Field(default=0.25, gt=0, le=1)
+    catalyst_size_multiplier: float = Field(default=1.25, ge=1.0)
+    time_of_day_boost_start: time = time(7, 0)
+    time_of_day_boost_end: time = time(10, 0)
+    time_of_day_size_multiplier: float = Field(default=1.25, ge=1.0)
 
 
 class GapAndGoConfig(BaseModel):
@@ -58,13 +62,14 @@ class GapAndGoConfig(BaseModel):
     target_r_multiple: float = 2.0
     enable_float_filter: bool = True
     max_float_shares: float = 10_000_000
+    min_float_rotation: float = 0.0  # today's cumulative volume / float; 0 = disabled (needs float_list.csv data)
 
 
 class BullFlagConfig(BaseModel):
     enabled: bool = True
     min_spike_pct: float = 5.0
     max_pullback_pct: float = 50.0
-    min_consolidation_bars: int = 3
+    min_consolidation_bars: int = 1  # "1 or more red candles" per source material -- a single-bar micro pullback is the ideal case, not an edge case
     max_consolidation_bars: int = 15
     stop_buffer_pct: float = 0.5
     target_r_multiple: float = 2.0
@@ -112,12 +117,26 @@ class TrailingConfig(BaseModel):
     atr_multiple: float = Field(default=1.5, gt=0)
 
 
+class ReversalExitConfig(BaseModel):
+    enabled: bool = False
+    topping_tail_wick_ratio: float = Field(default=2.0, gt=0)  # upper wick >= this multiple of the candle body
+    volume_burst_multiple: float = Field(default=2.0, gt=0)  # red-bar volume >= this multiple of recent avg volume
+    volume_lookback_bars: int = Field(default=10, gt=0)
+
+
 class ExitsConfig(BaseModel):
     scale_out: ScaleOutConfig = ScaleOutConfig()
     breakeven: BreakevenConfig = BreakevenConfig()
     trailing: TrailingConfig = TrailingConfig()
+    reversal_exit: ReversalExitConfig = ReversalExitConfig()
     eod_flatten_time: time = time(15, 55)  # 5 min before RTH_CLOSE; force-flatten at/after this ET time
     risk_loop_interval_seconds: int = Field(default=15, gt=0)
+
+
+class NewsConfig(BaseModel):
+    enabled: bool = False
+    lookback_hours: int = Field(default=48, gt=0)
+    provider_codes: str = ""  # empty = auto-discover entitled providers via reqNewsProviders() at startup
 
 
 class ScannerConfig(BaseModel):
@@ -148,6 +167,7 @@ class AppConfig(BaseModel):
     risk: RiskConfig
     strategies: StrategiesConfig
     exits: ExitsConfig = ExitsConfig()
+    news: NewsConfig = NewsConfig()
     scanner: ScannerConfig
     journal: JournalConfig
     kill_switch: KillSwitchConfig

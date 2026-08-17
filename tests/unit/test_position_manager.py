@@ -3,7 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from warrior_bot.config import BreakevenConfig, ExitsConfig, ScaleOutConfig, TrailingConfig
+from tests.unit.fixtures import make_bars
+from warrior_bot.config import BreakevenConfig, ExitsConfig, ReversalExitConfig, ScaleOutConfig, TrailingConfig
 from warrior_bot.execution.position_manager import PositionManager
 from warrior_bot.signals.signal import Signal
 
@@ -57,9 +58,13 @@ class FakeIB:
 class FakeJournal:
     def __init__(self):
         self.price_updates = []
+        self.kill_switch_events = []
 
     def update_order_price(self, order_row_id, limit_price=None, stop_price=None, qty=None):
         self.price_updates.append((order_row_id, limit_price, stop_price, qty))
+
+    def record_kill_switch_event(self, triggered_by, action_taken):
+        self.kill_switch_events.append((triggered_by, action_taken))
 
 
 class FakeCtx:
@@ -67,11 +72,12 @@ class FakeCtx:
     actually reads, so these tests aren't coupled to real EMA/ATR bar math
     (that's covered separately in test_indicators.py)."""
 
-    def __init__(self, symbol, last_price, ema_9=None, atr_value=None):
+    def __init__(self, symbol, last_price, ema_9=None, atr_value=None, bars=None):
         self.symbol = symbol
         self.last_price = last_price
         self.ema_9 = ema_9
         self._atr_value = atr_value
+        self.bars = bars or []
 
     def atr(self, period=14):
         return self._atr_value
@@ -99,11 +105,13 @@ def make_exits_config(
     trailing_enabled=True,
     trailing_method="atr",
     atr_multiple=1.5,
+    reversal_exit_enabled=False,
 ) -> ExitsConfig:
     return ExitsConfig(
         scale_out=ScaleOutConfig(),
         breakeven=BreakevenConfig(enabled=breakeven_enabled, trigger_r_multiple=breakeven_r),
         trailing=TrailingConfig(enabled=trailing_enabled, method=trailing_method, atr_multiple=atr_multiple),
+        reversal_exit=ReversalExitConfig(enabled=reversal_exit_enabled),
     )
 
 
@@ -232,3 +240,109 @@ def test_full_target_fill_untracks_position_and_on_bar_is_a_noop_after():
     placed_before = len(ib.placed)
     pm.on_bar(FakeCtx("TEST", last_price=999.0, ema_9=999.0))  # would trigger breakeven/trailing if still tracked
     assert len(ib.placed) == placed_before
+
+
+def test_reversal_exit_on_topping_tail_triggers_market_exit():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=True))
+    signal = make_signal(entry=10.0, stop=9.0)
+    stop_trade, target_trade = track_position(pm, signal, quantity=100)
+
+    bars = make_bars(
+        [
+            (10.0, 10.5, 9.9, 10.4, 1000),      # prior, green, unremarkable
+            (10.4, 11.0, 10.35, 10.45, 1000),   # topping tail: tiny body, long upper wick
+        ]
+    )
+
+    pm.on_bar(FakeCtx("TEST", last_price=10.45, bars=bars))
+
+    assert stop_trade.order in ib.cancelled
+    assert target_trade.order in ib.cancelled
+    assert "TEST" not in pm._positions
+    market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
+    assert len(market_orders) == 1
+    assert market_orders[0].totalQuantity == 100
+    assert market_orders[0].action == "SELL"
+
+
+def test_reversal_exit_on_red_after_green_triggers_market_exit():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=True))
+    signal = make_signal(entry=10.0, stop=9.0)
+    stop_trade, target_trade = track_position(pm, signal, quantity=100)
+
+    bars = make_bars(
+        [
+            (10.0, 10.5, 9.9, 10.4, 1000),   # prior, green
+            (10.4, 10.5, 10.2, 10.25, 1000),  # red immediately after a green bar
+        ]
+    )
+
+    pm.on_bar(FakeCtx("TEST", last_price=10.25, bars=bars))
+
+    market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
+    assert len(market_orders) == 1
+    assert "TEST" not in pm._positions
+
+
+def test_reversal_exit_on_volume_burst_triggers_market_exit():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=True))
+    signal = make_signal(entry=10.0, stop=9.0)
+    stop_trade, target_trade = track_position(pm, signal, quantity=100)
+
+    bars = make_bars(
+        [
+            (10.0, 10.1, 9.95, 10.0, 500),   # red, normal volume -- part of the "recent average"
+            (10.0, 10.1, 9.95, 10.0, 500),
+            (10.0, 10.05, 9.9, 9.95, 5000),  # red, volume well above the recent average
+        ]
+    )
+
+    pm.on_bar(FakeCtx("TEST", last_price=9.95, bars=bars))
+
+    market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
+    assert len(market_orders) == 1
+    assert "TEST" not in pm._positions
+
+
+def test_reversal_exit_disabled_does_not_trigger():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=False, trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, quantity=100)
+
+    bars = make_bars(
+        [
+            (10.0, 10.5, 9.9, 10.4, 1000),
+            (10.4, 11.0, 10.35, 10.45, 1000),  # would be a topping tail if the feature were enabled
+        ]
+    )
+
+    pm.on_bar(FakeCtx("TEST", last_price=10.45, bars=bars))
+
+    market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
+    assert len(market_orders) == 0
+    assert "TEST" in pm._positions
+
+
+def test_reversal_exit_no_pattern_leaves_position_untouched_and_runs_breakeven():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=True, trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)  # risk_per_share = 1.0
+    stop_trade, _ = track_position(pm, signal, quantity=100)
+
+    bars = make_bars(
+        [
+            (10.0, 10.5, 9.9, 10.4, 1000),   # green
+            (10.4, 11.1, 10.35, 11.0, 1000),  # green, normal body -- no reversal pattern
+        ]
+    )
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.0, bars=bars))  # +1.0R -- breakeven should still fire
+
+    market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
+    assert len(market_orders) == 0
+    assert "TEST" in pm._positions
+    assert stop_trade.order.auxPrice == 10.0  # breakeven still ran since no reversal fired

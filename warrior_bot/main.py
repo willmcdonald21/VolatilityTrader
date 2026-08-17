@@ -9,6 +9,7 @@ from ib_async import Contract
 from warrior_bot.broker.historical import fetch_prior_close, fetch_warmup_bars
 from warrior_bot.broker.ib_client import IBClient
 from warrior_bot.broker.market_data import scan_candidates
+from warrior_bot.broker.news import discover_provider_codes, fetch_recent_headlines
 from warrior_bot.config import AppConfig, load_config
 from warrior_bot.execution.order_manager import OrderManager
 from warrior_bot.execution.position_manager import PositionManager
@@ -17,6 +18,7 @@ from warrior_bot.persistence.db import get_connection
 from warrior_bot.persistence.journal import Journal
 from warrior_bot.risk.account_state import AccountState
 from warrior_bot.risk.risk_manager import RiskManager
+from warrior_bot.scanner.catalyst import classify_headlines
 from warrior_bot.scanner.float_provider import FloatProvider
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.abcd_pattern import AbcdStrategy
@@ -71,12 +73,18 @@ class WarriorBot:
         self._scan_task: asyncio.Task | None = None
         self._risk_task: asyncio.Task | None = None
         self._flattened_today = False
+        self._news_provider_codes = config.news.provider_codes
 
     async def start(self) -> None:
         await self.ib_client.connect()
         snapshot = self.account_state.snapshot()
         self.risk_manager.mark_start_of_day(snapshot.net_liquidation)
         self.journal.record_account_snapshot(snapshot)
+        if self.config.news.enabled and not self._news_provider_codes:
+            try:
+                self._news_provider_codes = await discover_provider_codes(self.ib)
+            except Exception:
+                self.logger.exception("Failed to discover news providers")
         self._scan_task = asyncio.ensure_future(self._scan_loop())
         self._risk_task = asyncio.ensure_future(self._risk_loop())
         self.logger.info(
@@ -172,6 +180,17 @@ class WarriorBot:
         except Exception:
             self.logger.exception("Failed to fetch warmup bars for %s", symbol)
 
+        if self.config.news.enabled and self._news_provider_codes:
+            try:
+                headlines = await fetch_recent_headlines(
+                    self.ib, contract, self._news_provider_codes, self.config.news.lookback_hours
+                )
+                catalyst = classify_headlines(headlines)
+                ctx.catalyst_category = catalyst.category
+                ctx.catalyst_headline = catalyst.headline
+            except Exception:
+                self.logger.exception("Failed to fetch news for %s", symbol)
+
         self.contexts[symbol] = ctx
         self.contracts[symbol] = contract
 
@@ -194,11 +213,12 @@ class WarriorBot:
         keep_updated.updateEvent += on_update
         self._subscriptions[symbol] = keep_updated
         self.logger.info(
-            "Onboarded %s: prior_close=%s avg_daily_volume=%s bars=%d",
+            "Onboarded %s: prior_close=%s avg_daily_volume=%s bars=%d catalyst=%s",
             symbol,
             ctx.prior_close,
             ctx.avg_daily_volume,
             len(ctx.bars),
+            ctx.catalyst_category or "none",
         )
 
     def _on_new_bar(self, contract: Contract, ctx: SymbolContext) -> None:
@@ -211,11 +231,11 @@ class WarriorBot:
                 self.logger.exception("Strategy %s failed evaluating %s", strategy.name, ctx.symbol)
                 continue
             if signal is not None:
-                self._handle_signal(contract, signal)
+                self._handle_signal(contract, signal, now)
 
-    def _handle_signal(self, contract: Contract, signal: Signal) -> None:
+    def _handle_signal(self, contract: Contract, signal: Signal, now: datetime) -> None:
         signal_id = self.journal.record_signal(signal)
-        decision = self.risk_manager.evaluate(signal)
+        decision = self.risk_manager.evaluate(signal, now=now)
         self.journal.record_risk_decision(signal_id, decision)
         if not decision.accepted:
             self.journal.record_rejection(signal, decision.reason)

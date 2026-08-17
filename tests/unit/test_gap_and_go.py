@@ -178,6 +178,46 @@ def test_float_filter_disabled_ignores_large_float(tmp_path):
     assert strategy.evaluate(ctx, NOW) is not None
 
 
+def test_float_rotation_rejects_symbol_under_threshold(tmp_path):
+    csv_path = write_float_list(tmp_path, [("GOGO", 1_000_000, datetime.now().date().isoformat())])
+    ctx = make_ctx(BREAKOUT_BARS)  # cumulative volume across BREAKOUT_BARS = 5000
+    strategy = GapAndGoStrategy(
+        default_config(min_float_rotation=10.0),  # would need cum_volume/float >= 10 -> 10,000,000 volume
+        float_provider=FloatProvider(csv_path),
+    )
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_float_rotation_accepts_symbol_over_threshold(tmp_path):
+    csv_path = write_float_list(tmp_path, [("GOGO", 1_000, datetime.now().date().isoformat())])
+    ctx = make_ctx(BREAKOUT_BARS)  # cumulative volume = 5000 -> rotation = 5.0
+    strategy = GapAndGoStrategy(
+        default_config(min_float_rotation=2.0),
+        float_provider=FloatProvider(csv_path),
+    )
+    assert strategy.evaluate(ctx, NOW) is not None
+
+
+def test_float_rotation_disabled_by_default_ignores_low_rotation(tmp_path):
+    csv_path = write_float_list(tmp_path, [("GOGO", 1_000_000_000, datetime.now().date().isoformat())])
+    ctx = make_ctx(BREAKOUT_BARS)
+    strategy = GapAndGoStrategy(
+        default_config(enable_float_filter=False),  # min_float_rotation=0.0 by default -- isolate rotation from the existing float-size filter
+        float_provider=FloatProvider(csv_path),
+    )
+    assert strategy.evaluate(ctx, NOW) is not None
+
+
+def test_float_rotation_skips_symbol_missing_from_csv(tmp_path):
+    csv_path = write_float_list(tmp_path, [("OTHER", 1_000, "2026-01-01")])
+    ctx = make_ctx(BREAKOUT_BARS)
+    strategy = GapAndGoStrategy(
+        default_config(min_float_rotation=1000.0),  # would reject any known float
+        float_provider=FloatProvider(csv_path),
+    )
+    assert strategy.evaluate(ctx, NOW) is not None
+
+
 def test_reset_daily_allows_retrigger():
     ctx = make_ctx(
         [

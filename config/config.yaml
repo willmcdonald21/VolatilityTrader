@@ -2,7 +2,7 @@
 
 trading:
   mode: paper                    # "paper" or "live". "live" also requires i_understand_live_trading: true
-  host: 127.0.0.1
+  host: 192.168.1.140
   port: 4002                     # IB Gateway paper=4002, TWS paper=7497 (live=4001/7496, refused unless mode=live)
   client_id: 7
   i_understand_live_trading: false
@@ -18,6 +18,10 @@ risk:
   daily_profit_goal_usd: null      # set to enable "profit cushion" sizing; null = feature off, always full size
   cushion_profit_fraction: 0.25    # trade at reduced size until this fraction of the daily goal is realized
   cushion_size_fraction: 0.25      # size multiplier applied while under the cushion threshold
+  catalyst_size_multiplier: 1.25   # position-size boost applied when a news catalyst is detected (requires news.enabled)
+  time_of_day_boost_start: "07:00" # historically highest-edge window (Ross Cameron: 7-10am ET, EU/US session overlap)
+  time_of_day_boost_end: "10:00"
+  time_of_day_size_multiplier: 1.25 # position-size boost applied to signals firing within the above window
 
 strategies:
   gap_and_go:
@@ -31,11 +35,12 @@ strategies:
     target_r_multiple: 2.0        # profit target expressed as multiple of risk (R)
     enable_float_filter: true      # skips symbols missing from config/float_list.csv (graceful no-op until that file exists)
     max_float_shares: 10000000     # matches Ross Cameron's "5 Pillars" filter (<=10M, aggressive traders use 5M)
+    min_float_rotation: 0.0        # day's cumulative volume / float; 0 = disabled (also needs float_list.csv data)
   bull_flag:
     enabled: true
     min_spike_pct: 5.0            # minimum initial move (over lookback) to qualify as a spike
     max_pullback_pct: 50.0        # flag pullback must retrace no more than this % of the spike
-    min_consolidation_bars: 3
+    min_consolidation_bars: 1     # "1 or more red candles" -- a single-bar micro pullback is the ideal case
     max_consolidation_bars: 15
     stop_buffer_pct: 0.5
     target_r_multiple: 2.0
@@ -53,6 +58,11 @@ strategies:
     stop_buffer_pct: 0.5
     target_r_multiple: 1.5
 
+news:
+  enabled: false
+  lookback_hours: 48          # how far back to check for a catalyst headline when a symbol is onboarded
+  provider_codes: ""          # e.g. "BRFG+DJNL"; empty = auto-discover entitled providers via reqNewsProviders()
+
 exits:
   scale_out:
     enabled: false
@@ -66,6 +76,11 @@ exits:
     method: atr             # "ema" (EMA-9) or "atr"
     atr_period: 14
     atr_multiple: 1.5
+  reversal_exit:
+    enabled: false
+    topping_tail_wick_ratio: 2.0   # upper wick >= this multiple of the candle body counts as a topping tail
+    volume_burst_multiple: 2.0     # red-bar volume >= this multiple of recent avg volume counts as a burst
+    volume_lookback_bars: 10       # bars used to compute the "recent average" volume baseline
   eod_flatten_time: "15:55"   # force-flatten all positions at/after this ET time
   risk_loop_interval_seconds: 15
 

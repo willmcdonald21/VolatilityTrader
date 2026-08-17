@@ -11,11 +11,11 @@ from warrior_bot.utils.time_utils import EASTERN
 NOW = datetime(2026, 1, 5, 10, 0, tzinfo=EASTERN)
 
 PASSING_BARS = [
-    (10.0, 10.0, 9.9, 10.0, 1000),    # A baseline
-    (10.0, 11.0, 10.0, 10.9, 2000),   # B spike high
-    (10.9, 10.85, 10.6, 10.7, 500),   # C pullback
-    (10.7, 10.75, 10.65, 10.7, 500),  # continuing pullback
-    (10.7, 11.2, 10.7, 11.2, 1000),   # D breakout above B
+    (10.0, 10.0, 9.9, 10.0, 1000),     # A baseline
+    (10.0, 12.0, 10.0, 11.8, 3000),    # B spike high -- heavy volume
+    (11.8, 11.75, 11.4, 11.5, 300),    # C pullback -- light volume
+    (11.5, 11.55, 11.4, 11.45, 300),   # continuing pullback
+    (11.45, 12.2, 11.45, 12.2, 1000),  # D breakout above B
 ]
 
 
@@ -31,12 +31,12 @@ def test_abcd_breakout_triggers_signal():
     signal = strategy.evaluate(ctx, NOW)
     assert signal is not None
     assert signal.strategy == "abcd"
-    assert signal.entry_price == 11.2
+    assert signal.entry_price == 12.2
     assert signal.stop_price < signal.entry_price
 
 
 def test_no_signal_without_d_breakout():
-    bars = PASSING_BARS[:-1] + [(10.7, 10.95, 10.7, 10.8, 1000)]  # doesn't clear B's high of 11.0
+    bars = PASSING_BARS[:-1] + [(11.45, 11.9, 11.45, 11.6, 1000)]  # doesn't clear B's high of 12.0
     ctx = make_ctx(bars)
     strategy = AbcdStrategy(AbcdConfig())
     assert strategy.evaluate(ctx, NOW) is None
@@ -85,4 +85,20 @@ def test_does_not_retrigger_same_symbol_same_day():
     ctx = make_ctx(PASSING_BARS)
     strategy = AbcdStrategy(AbcdConfig())
     assert strategy.evaluate(ctx, NOW) is not None
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_no_signal_when_pullback_volume_not_lighter_than_up_move():
+    # same price structure as PASSING_BARS (still a valid pattern by the
+    # pre-existing gates) but with pullback volume bumped above the
+    # up-move's 4000 -- isolates the new volume-profile gate specifically
+    bars = [
+        (10.0, 10.0, 9.9, 10.0, 1000),
+        (10.0, 12.0, 10.0, 11.8, 3000),
+        (11.8, 11.75, 11.4, 11.5, 3000),
+        (11.5, 11.55, 11.4, 11.45, 3000),
+        (11.45, 12.2, 11.45, 12.2, 1000),
+    ]
+    ctx = make_ctx(bars)
+    strategy = AbcdStrategy(AbcdConfig())
     assert strategy.evaluate(ctx, NOW) is None

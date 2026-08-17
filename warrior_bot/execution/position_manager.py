@@ -3,13 +3,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from ib_async import IB, Contract, Order, Trade
+from ib_async import IB, Contract, MarketOrder, Order, Trade
 
 from warrior_bot.config import ExitsConfig
 from warrior_bot.persistence.journal import Journal
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import SymbolContext
-from warrior_bot.strategies.indicators import trailing_candidate
+from warrior_bot.strategies.indicators import is_high_volume_red_bar, is_red_after_green, is_topping_tail, trailing_candidate
 
 logger = logging.getLogger("warrior_bot.execution.position_manager")
 
@@ -84,6 +84,9 @@ class PositionManager:
         if last_price is None:
             return
 
+        if self.config.reversal_exit.enabled and self._check_reversal_exit(pos, ctx):
+            return  # position is now flat -- nothing else to evaluate this bar
+
         if not pos.breakeven_done and self.config.breakeven.enabled:
             self._check_breakeven(pos, last_price)
 
@@ -138,6 +141,53 @@ class PositionManager:
 
         self._modify_stop_price(pos, new_stop)
         logger.info("Trailing: moved stop for %s to %.4f", pos.symbol, new_stop)
+
+    def _check_reversal_exit(self, pos: ManagedPosition, ctx: SymbolContext) -> bool:
+        """The three exit indicators from the source material that are
+        directly OHLCV-computable (the other three -- a large L2 seller, a
+        hidden/iceberg seller, decelerating tape -- need order-book/tick
+        data this bot doesn't have). Any one of them firing exits the
+        remaining position immediately via a market order, matching the
+        source material's "don't wait for the stop" urgency -- this is
+        intentionally the second place in the bot (besides the kill switch)
+        that sends a naked market order."""
+        cfg = self.config.reversal_exit
+        bars = ctx.bars
+        if len(bars) < 2:
+            return False
+
+        current_bar = bars[-1]
+        prior_bar = bars[-2]
+        reasons = []
+
+        if is_topping_tail(current_bar, cfg.topping_tail_wick_ratio):
+            reasons.append("topping_tail")
+        if is_red_after_green(prior_bar, current_bar):
+            reasons.append("red_after_green")
+        recent = bars[-(cfg.volume_lookback_bars + 1) : -1]
+        if recent:
+            avg_recent_volume = sum(b.volume for b in recent) / len(recent)
+            if is_high_volume_red_bar(current_bar, avg_recent_volume, cfg.volume_burst_multiple):
+                reasons.append("volume_burst")
+
+        if not reasons:
+            return False
+
+        self._reversal_exit(pos, reasons)
+        return True
+
+    def _reversal_exit(self, pos: ManagedPosition, reasons: list[str]) -> None:
+        self.ib.cancelOrder(pos.stop_order)
+        if pos.target_order is not None:
+            self.ib.cancelOrder(pos.target_order)
+        order = MarketOrder("SELL", pos.remaining_qty)
+        self.ib.placeOrder(pos.contract, order)
+        reason_str = ",".join(reasons)
+        logger.warning("Reversal exit for %s: %s (qty=%d)", pos.symbol, reason_str, pos.remaining_qty)
+        self.journal.record_kill_switch_event(
+            triggered_by=f"reversal_exit:{pos.symbol}:{reason_str}", action_taken="market_exit_position"
+        )
+        self._positions.pop(pos.symbol, None)
 
     def _modify_stop_price(self, pos: ManagedPosition, new_price: float) -> None:
         pos.stop_order.auxPrice = new_price

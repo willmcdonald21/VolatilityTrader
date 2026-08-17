@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from warrior_bot.config import RiskConfig
 from warrior_bot.logging_setup import alert
 from warrior_bot.risk.account_state import AccountSnapshot, AccountState
 from warrior_bot.signals.signal import Signal
+from warrior_bot.utils.time_utils import to_eastern
 
 
 @dataclass
@@ -58,7 +60,7 @@ class RiskManager:
     def should_flatten_for_loss_limit(self, snapshot: AccountSnapshot) -> bool:
         return self.config.flatten_on_daily_loss_limit and self._loss_limit_breached(snapshot)
 
-    def evaluate(self, signal: Signal) -> RiskDecision:
+    def evaluate(self, signal: Signal, now: datetime | None = None) -> RiskDecision:
         snapshot = self.account_state.snapshot()
 
         if self._start_of_day_equity is None:
@@ -83,7 +85,7 @@ class RiskManager:
             alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")
             return RiskDecision(False, 0, reason, snapshot)
 
-        sized_qty = self._size_position(signal, snapshot)
+        sized_qty = self._size_position(signal, snapshot, now)
         if sized_qty < 1:
             reason = "position size rounds to zero under current risk caps"
             alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")
@@ -91,13 +93,28 @@ class RiskManager:
 
         return RiskDecision(True, sized_qty, "accepted", snapshot)
 
-    def _size_position(self, signal: Signal, snapshot: AccountSnapshot) -> int:
+    def _size_position(self, signal: Signal, snapshot: AccountSnapshot, now: datetime | None = None) -> int:
         risk_per_share = signal.risk_per_share
         if risk_per_share <= 0 or signal.entry_price <= 0:
             return 0
 
         dollar_risk_budget = snapshot.net_liquidation * self.config.risk_per_trade_pct
         raw_shares = math.floor(dollar_risk_budget / risk_per_share)
+
+        if signal.context.get("catalyst_category"):
+            # Boost applied to the raw, uncapped share count -- so it can
+            # use more of the room within the hard caps below, but can never
+            # push sizing past them. A catalyst earns more size within the
+            # existing risk budget, not a bigger risk budget.
+            raw_shares = math.floor(raw_shares * self.config.catalyst_size_multiplier)
+
+        if now is not None:
+            # Only applied when the caller supplies a clock reading -- never
+            # guessed from wall-clock time, so sizing stays deterministic
+            # for anyone calling evaluate()/_size_position() without a `now`.
+            now_et = to_eastern(now)
+            if self.config.time_of_day_boost_start <= now_et.time() < self.config.time_of_day_boost_end:
+                raw_shares = math.floor(raw_shares * self.config.time_of_day_size_multiplier)
 
         cap_by_notional = math.floor(self.config.max_position_notional_usd / signal.entry_price)
         cap_by_buying_power = math.floor(snapshot.buying_power / signal.entry_price)

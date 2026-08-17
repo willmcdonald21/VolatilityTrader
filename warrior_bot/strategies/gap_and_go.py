@@ -39,6 +39,13 @@ class GapAndGoStrategy(BaseStrategy):
             if not self.float_provider.passes_filter(ctx.symbol, cfg.max_float_shares):
                 return None
 
+        if cfg.min_float_rotation > 0 and self.float_provider is not None:
+            float_shares = self.float_provider.get_float_shares(ctx.symbol)
+            if float_shares is not None and float_shares > 0:
+                rotation = ctx.cumulative_volume / float_shares
+                if rotation < cfg.min_float_rotation:
+                    return None
+
         gap = ctx.gap_pct
         if gap is None or gap < cfg.min_gap_pct:
             return None

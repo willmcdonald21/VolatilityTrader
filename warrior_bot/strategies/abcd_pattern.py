@@ -5,6 +5,7 @@ from datetime import datetime
 from warrior_bot.config import AbcdConfig
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
+from warrior_bot.strategies.pullback_validity import validate_pullback
 
 
 class AbcdStrategy(BaseStrategy):
@@ -49,6 +50,10 @@ class AbcdStrategy(BaseStrategy):
         ab_range = b_high - a_low
         bc_pullback_pct = (b_high - c_low) / ab_range * 100.0 if ab_range > 0 else 100.0
         if not (cfg.min_bc_pullback_pct <= bc_pullback_pct <= cfg.max_bc_pullback_pct):
+            return None
+
+        validity = validate_pullback(pullback_bars=post_b, up_move_bars=pre_b, ctx=ctx)
+        if not validity.valid:
             return None
 
         current_bar = ctx.bars[-1]

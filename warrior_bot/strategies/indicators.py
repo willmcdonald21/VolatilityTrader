@@ -90,17 +90,71 @@ def swing_points(bars: list[Bar], window: int = 2) -> list[tuple[int, str, float
     return points
 
 
+def _ema_series(values: list[float], period: int) -> list[float]:
+    """Full EMA series (not just the latest value), seeded with a simple
+    average over the first `period` values. series[i] is the EMA as of
+    values[period - 1 + i]. Needed by macd(), which requires an EMA *of*
+    the MACD line's own history, not just a single final value."""
+    if len(values) < period:
+        return []
+    multiplier = 2.0 / (period + 1)
+    series = [sum(values[:period]) / period]
+    for value in values[period:]:
+        series.append((value - series[-1]) * multiplier + series[-1])
+    return series
+
+
 def ema(bars: list[Bar], period: int) -> float | None:
     """Exponential moving average of closes, seeded with a simple average
     over the first `period` closes (standard EMA warm-up)."""
+    series = _ema_series([b.close for b in bars], period)
+    return series[-1] if series else None
+
+
+def macd(bars: list[Bar], fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[float, float] | None:
+    """(macd_line, signal_line) as of the latest bar, or None if there
+    isn't enough history yet -- callers should treat None as "unknown",
+    never as a bearish reading (insufficient warm-up data isn't the same
+    as a bearish crossover)."""
     closes = [b.close for b in bars]
-    if len(closes) < period:
+    fast_series = _ema_series(closes, fast)
+    slow_series = _ema_series(closes, slow)
+    if not fast_series or not slow_series:
         return None
-    multiplier = 2.0 / (period + 1)
-    value = sum(closes[:period]) / period
-    for close in closes[period:]:
-        value = (close - value) * multiplier + value
-    return value
+    offset = slow - fast
+    macd_line = [f - s for f, s in zip(fast_series[offset:], slow_series)]
+    signal_series = _ema_series(macd_line, signal)
+    if not signal_series:
+        return None
+    return macd_line[-1], signal_series[-1]
+
+
+def is_topping_tail(bar: Bar, wick_ratio: float = 2.0) -> bool:
+    """Long upper wick relative to the candle body -- buyers pushed higher
+    but were rejected. One of the three exit indicators from the source
+    material that's directly OHLCV-computable (the other two -- a large
+    Level 2 seller, decelerating tape -- need order-book data this bot
+    doesn't have)."""
+    body = abs(bar.close - bar.open)
+    if body <= 0:
+        return False
+    upper_wick = bar.high - max(bar.open, bar.close)
+    lower_wick = min(bar.open, bar.close) - bar.low
+    return upper_wick >= wick_ratio * body and upper_wick > lower_wick
+
+
+def is_red_after_green(prior_bar: Bar, current_bar: Bar) -> bool:
+    """A red candle immediately following a green one -- momentum stalling
+    or reversing, one bar after a push higher."""
+    return prior_bar.close > prior_bar.open and current_bar.close < current_bar.open
+
+
+def is_high_volume_red_bar(bar: Bar, avg_recent_volume: float, multiple: float = 2.0) -> bool:
+    """A red candle with a burst of volume well above the recent average --
+    aggressive selling, not just a normal light-volume pullback."""
+    if avg_recent_volume <= 0:
+        return False
+    return bar.close < bar.open and bar.volume >= avg_recent_volume * multiple
 
 
 def trailing_candidate(

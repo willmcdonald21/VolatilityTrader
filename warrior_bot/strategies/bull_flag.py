@@ -5,6 +5,7 @@ from datetime import datetime
 from warrior_bot.config import BullFlagConfig
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
+from warrior_bot.strategies.pullback_validity import validate_pullback
 
 
 class BullFlagStrategy(BaseStrategy):
@@ -47,6 +48,10 @@ class BullFlagStrategy(BaseStrategy):
         spike_range = spike_high - baseline_low
         pullback_pct = (spike_high - pullback_low) / spike_range * 100.0 if spike_range > 0 else 100.0
         if pullback_pct > cfg.max_pullback_pct:
+            return None
+
+        validity = validate_pullback(pullback_bars=consolidation, up_move_bars=pre_spike, ctx=ctx)
+        if not validity.valid:
             return None
 
         flag_high = max(b.high for b in consolidation)

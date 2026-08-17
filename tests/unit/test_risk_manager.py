@@ -16,7 +16,7 @@ class FakeAccountState:
         return self._snapshot
 
 
-def make_signal(entry=10.0, stop=9.0, target=12.0) -> Signal:
+def make_signal(entry=10.0, stop=9.0, target=12.0, context=None) -> Signal:
     return Signal(
         symbol="TEST",
         strategy="gap_and_go",
@@ -25,6 +25,7 @@ def make_signal(entry=10.0, stop=9.0, target=12.0) -> Signal:
         stop_price=stop,
         target_price=target,
         ts=datetime.now(timezone.utc),
+        context=context or {},
     )
 
 
@@ -38,6 +39,7 @@ def make_risk_manager(tmp_path, snapshot, **risk_overrides) -> RiskManager:
         daily_profit_goal_usd=risk_overrides.get("daily_profit_goal_usd"),
         cushion_profit_fraction=risk_overrides.get("cushion_profit_fraction", 0.25),
         cushion_size_fraction=risk_overrides.get("cushion_size_fraction", 0.25),
+        catalyst_size_multiplier=risk_overrides.get("catalyst_size_multiplier", 1.25),
     )
     account_state = FakeAccountState(snapshot)
     return RiskManager(config, account_state, kill_switch_path=tmp_path / "KILL_SWITCH")
@@ -128,6 +130,87 @@ def test_sizing_capped_by_buying_power(tmp_path):
 
     assert decision.accepted
     assert decision.sized_qty == 10  # buying_power(100) / entry(10)
+
+
+def test_catalyst_signal_gets_size_boost(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, catalyst_size_multiplier=1.25)
+    signal = make_signal(entry=10.0, stop=9.0, context={"catalyst_category": "earnings"})
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 125  # raw_shares(100) * 1.25
+
+
+def test_no_catalyst_no_size_boost(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, catalyst_size_multiplier=1.25)
+    signal = make_signal(entry=10.0, stop=9.0)  # no catalyst in context
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 100  # unboosted
+
+
+def test_catalyst_boost_still_capped_by_hard_limits(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, catalyst_size_multiplier=100)
+    signal = make_signal(entry=10.0, stop=9.0, context={"catalyst_category": "merger"})
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    # raw_shares(100) * 100 = 10,000 -- but still clamped to max_position_notional_usd(5000)/entry(10)
+    assert decision.sized_qty == 500
+
+
+def test_time_of_day_boost_applied_within_window(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01)
+    signal = make_signal(entry=10.0, stop=9.0)
+    now = datetime(2026, 1, 5, 12, 30, tzinfo=timezone.utc)  # 07:30 ET (EST, UTC-5) -- inside 07:00-10:00
+
+    decision = rm.evaluate(signal, now=now)
+
+    assert decision.accepted
+    assert decision.sized_qty == 125  # raw_shares(100) * 1.25
+
+
+def test_time_of_day_boost_not_applied_outside_window(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01)
+    signal = make_signal(entry=10.0, stop=9.0)
+    now = datetime(2026, 1, 5, 20, 0, tzinfo=timezone.utc)  # 15:00 ET -- outside the window
+
+    decision = rm.evaluate(signal, now=now)
+
+    assert decision.accepted
+    assert decision.sized_qty == 100  # unboosted
+
+
+def test_time_of_day_boost_not_applied_when_now_not_supplied(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01)
+    signal = make_signal(entry=10.0, stop=9.0)
+
+    decision = rm.evaluate(signal)  # no `now` -- must never guess from wall-clock time
+
+    assert decision.accepted
+    assert decision.sized_qty == 100
+
+
+def test_time_of_day_and_catalyst_boosts_stack(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, catalyst_size_multiplier=1.25)
+    signal = make_signal(entry=10.0, stop=9.0, context={"catalyst_category": "earnings"})
+    now = datetime(2026, 1, 5, 12, 30, tzinfo=timezone.utc)  # inside the boost window
+
+    decision = rm.evaluate(signal, now=now)
+
+    assert decision.accepted
+    assert decision.sized_qty == 156  # floor(floor(100*1.25)*1.25) = floor(125*1.25) = floor(156.25) = 156
 
 
 def test_profit_cushion_reduces_size_before_goal_progress(tmp_path):

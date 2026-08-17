@@ -10,6 +10,7 @@ from warrior_bot.strategies.indicators import (
     average_true_range,
     ema,
     gap_pct,
+    macd,
     opening_range,
     relative_volume,
     vwap,
@@ -27,6 +28,8 @@ class SymbolContext:
     bars: list[Bar] = field(default_factory=list)
     prior_close: float | None = None
     avg_daily_volume: float | None = None
+    catalyst_category: str | None = None
+    catalyst_headline: str | None = None
 
     def add_bar(self, bar: Bar) -> None:
         self.bars.append(bar)
@@ -67,6 +70,9 @@ class SymbolContext:
 
     def atr(self, period: int = 14) -> float | None:
         return average_true_range(self.bars, period)
+
+    def macd(self, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[float, float] | None:
+        return macd(self.bars, fast, slow, signal)
 
 
 class BaseStrategy(ABC):
@@ -109,6 +115,10 @@ class BaseStrategy(ABC):
     ) -> Signal:
         risk_per_share = abs(entry_price - stop_price)
         target_price = entry_price + risk_per_share * target_r_multiple
+        full_context = dict(context or {})
+        if ctx.catalyst_category:
+            full_context.setdefault("catalyst_category", ctx.catalyst_category)
+            full_context.setdefault("catalyst_headline", ctx.catalyst_headline)
         return Signal(
             symbol=ctx.symbol,
             strategy=self.name,
@@ -117,5 +127,5 @@ class BaseStrategy(ABC):
             stop_price=stop_price,
             target_price=target_price,
             ts=now,
-            context=context or {},
+            context=full_context,
         )

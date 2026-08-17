@@ -62,3 +62,15 @@ class FloatProvider:
         if datetime.now() - row.updated_at > timedelta(days=self.max_age_days):
             return True
         return row.float_shares <= max_float_shares
+
+    def get_float_shares(self, symbol: str) -> float | None:
+        """Fresh float share count for `symbol`, or None if unknown/stale --
+        same "unknown degrades gracefully" contract as passes_filter."""
+        if not self._loaded:
+            self._load()
+        row = self._rows.get(symbol.upper())
+        if row is None:
+            return None
+        if datetime.now() - row.updated_at > timedelta(days=self.max_age_days):
+            return None
+        return row.float_shares

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from tests.unit.fixtures import make_bars
+from tests.unit.fixtures import flat_bars, make_bars
 from warrior_bot.strategies.indicators import (
     average_true_range,
     ema,
     gap_pct,
+    is_high_volume_red_bar,
+    is_red_after_green,
     is_red_to_green,
+    is_topping_tail,
+    macd,
     opening_range,
     relative_volume,
     trailing_candidate,
@@ -108,3 +112,68 @@ def test_trailing_candidate_atr_method_returns_price_minus_atr_multiple():
 
 def test_trailing_candidate_atr_method_none_when_atr_missing():
     assert trailing_candidate(last_price=15.0, ema_9=12.5, atr=None, method="atr", atr_multiple=1.5) is None
+
+
+def test_macd_none_with_insufficient_bars():
+    bars = make_bars(flat_bars(10.0, 1000, 33))  # needs 34 for fast(12)+slow(26)+signal(9) warm-up
+    assert macd(bars) is None
+
+
+def test_macd_bullish_on_sustained_rise():
+    closes = [15.0] * 20 + [15.0 + 0.5 * i for i in range(1, 15)]
+    bars = make_bars([(c, c, c, c, 1000) for c in closes])
+    result = macd(bars)
+    assert result is not None
+    macd_line, signal_line = result
+    assert macd_line > signal_line
+
+
+def test_macd_bearish_on_sustained_decline():
+    closes = [15.0] * 20 + [15.0 - 0.5 * i for i in range(1, 15)]
+    bars = make_bars([(c, c, c, c, 1000) for c in closes])
+    result = macd(bars)
+    assert result is not None
+    macd_line, signal_line = result
+    assert macd_line < signal_line
+
+
+def test_is_topping_tail_true_for_long_upper_wick():
+    bar = make_bars([(10.0, 11.0, 9.95, 10.05, 1000)])[0]  # tiny body, long upper wick
+    assert is_topping_tail(bar) is True
+
+
+def test_is_topping_tail_false_for_normal_candle():
+    bar = make_bars([(10.0, 10.5, 9.8, 10.4, 1000)])[0]
+    assert is_topping_tail(bar) is False
+
+
+def test_is_topping_tail_false_for_doji_zero_body():
+    bar = make_bars([(10.0, 11.0, 9.0, 10.0, 1000)])[0]
+    assert is_topping_tail(bar) is False
+
+
+def test_is_red_after_green_true():
+    prior = make_bars([(10.0, 10.5, 9.9, 10.4, 1000)])[0]  # green
+    current = make_bars([(10.4, 10.5, 10.0, 10.1, 1000)])[0]  # red
+    assert is_red_after_green(prior, current) is True
+
+
+def test_is_red_after_green_false_when_prior_is_red():
+    prior = make_bars([(10.4, 10.5, 10.0, 10.1, 1000)])[0]  # red
+    current = make_bars([(10.1, 10.2, 9.9, 10.0, 1000)])[0]  # red
+    assert is_red_after_green(prior, current) is False
+
+
+def test_is_high_volume_red_bar_true():
+    bar = make_bars([(10.4, 10.5, 10.0, 10.1, 5000)])[0]  # red, high volume
+    assert is_high_volume_red_bar(bar, avg_recent_volume=1000, multiple=2.0) is True
+
+
+def test_is_high_volume_red_bar_false_when_not_red():
+    bar = make_bars([(10.0, 10.5, 9.9, 10.4, 5000)])[0]  # green, high volume
+    assert is_high_volume_red_bar(bar, avg_recent_volume=1000, multiple=2.0) is False
+
+
+def test_is_high_volume_red_bar_false_when_volume_not_elevated():
+    bar = make_bars([(10.4, 10.5, 10.0, 10.1, 1500)])[0]  # red, but not 2x the average
+    assert is_high_volume_red_bar(bar, avg_recent_volume=1000, multiple=2.0) is False
