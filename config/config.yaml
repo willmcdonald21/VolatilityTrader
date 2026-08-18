@@ -14,7 +14,7 @@ execution:
 risk:
   risk_per_trade_pct: 0.005      # fraction of NetLiquidation risked per trade
   daily_loss_limit_pct: 0.02     # halt new entries once daily realized loss exceeds this fraction of start-of-day equity
-  flatten_on_daily_loss_limit: false  # if true, force-close open positions when the daily halt triggers
+  flatten_on_daily_loss_limit: true  # force-close open positions when the daily halt triggers -- enabled for the unattended overnight test since no one can intervene manually
   max_concurrent_positions: 3
   max_position_notional_usd: 5000
   max_shares_per_trade: 2000
@@ -70,7 +70,7 @@ news:
   provider_codes: ""          # e.g. "BRFG+DJNL"; empty = auto-discover entitled providers via reqNewsProviders()
 
 notifications:
-  enabled: false               # requires webhook URLs set in .env (see .env.example) -- never put URLs here
+  enabled: true                # requires webhook URLs set in .env (see .env.example) -- never put URLs here
   notify_on_signal: true       # -> trade_activity channel: an entry signal was accepted and sized
   notify_on_fill: true         # -> trade_activity channel: every buy/sell/trim fill
   notify_on_kill_switch: true  # -> kill_switch channel: manual kill switch, IBKR connection loss
@@ -83,10 +83,10 @@ exits:
     pct: 0.5              # fraction of the position closed at the scale-out price
     r_multiple: 1.0        # R-multiple at which the scale-out limit order sits
   breakeven:
-    enabled: false
+    enabled: true
     trigger_r_multiple: 1.0   # once price reaches this many R, move the stop to entry
   trailing:
-    enabled: false
+    enabled: true
     method: atr             # "ema" (EMA-9) or "atr"
     atr_period: 14
     atr_multiple: 1.5
