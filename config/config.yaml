@@ -2,7 +2,7 @@
 
 trading:
   mode: paper                    # "paper" or "live". "live" also requires i_understand_live_trading: true
-  host: 192.168.1.140
+  host: 127.0.0.1
   port: 4002                     # IB Gateway paper=4002, TWS paper=7497 (live=4001/7496, refused unless mode=live)
   client_id: 7
   i_understand_live_trading: false
