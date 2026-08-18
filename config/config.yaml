@@ -4,7 +4,7 @@ trading:
   mode: paper                    # "paper" or "live". "live" also requires i_understand_live_trading: true
   host: 127.0.0.1
   port: 4002                     # IB Gateway paper=4002, TWS paper=7497 (live=4001/7496, refused unless mode=live)
-  client_id: 8
+  client_id: 9
   i_understand_live_trading: false
   use_rth: false                 # false = include pre-market/after-hours bars (needed for gap scanning)
 
@@ -107,7 +107,7 @@ scanner:
                            # true relative volume). The real 5x minimum is each strategy's min_rel_volume above --
                            # raise strategies.*.min_rel_volume to 20.0 to tighten the funnel when there's too much
                            # to look through (Ross's own example: 5x -> ~100 candidates/day, 20x -> ~20)
-  refresh_seconds: 15
+  refresh_seconds: 5
   max_candidates: 25
 
 journal:
