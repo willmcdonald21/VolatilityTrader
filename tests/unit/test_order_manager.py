@@ -146,13 +146,49 @@ def test_scale_out_fill_labeled_trim(monkeypatch):
     om = make_order_manager()
     sent = _capture_sends(monkeypatch, om)
     trade = FakeTrade(FakeOrder(action="SELL"))
-    om._attach_tracking(trade, row_id=1, role="scale_out")
+    om._attach_tracking(trade, row_id=1, role="scale_out", entry_price=5.0)
 
     trade.fillEvent.emit(trade, make_fill(shares=50, price=6.0, realized_pnl=25.0))
 
     trade_activity = _by_channel(sent, "trade_activity")
     assert "TRIM AAPL 50 @ $6.00" in trade_activity[0]
     assert len(_by_channel(sent, "pnl")) == 1  # trims realize P&L too -- still posts to the pnl channel
+
+
+def test_trim_message_includes_pct_gain_from_entry(monkeypatch):
+    om = make_order_manager()
+    sent = _capture_sends(monkeypatch, om)
+    trade = FakeTrade(FakeOrder(action="SELL"))
+    om._attach_tracking(trade, row_id=1, role="scale_out", entry_price=1.79)
+
+    trade.fillEvent.emit(trade, make_fill(shares=1000, price=1.93, realized_pnl=140.0))
+
+    trade_activity = _by_channel(sent, "trade_activity")
+    assert "(+7.8% from entry)" in trade_activity[0]
+
+
+def test_trim_message_pct_gain_negative_when_below_entry(monkeypatch):
+    om = make_order_manager()
+    sent = _capture_sends(monkeypatch, om)
+    trade = FakeTrade(FakeOrder(action="SELL"))
+    om._attach_tracking(trade, row_id=1, role="scale_out", entry_price=10.0)
+
+    trade.fillEvent.emit(trade, make_fill(shares=50, price=9.0, realized_pnl=-50.0))
+
+    trade_activity = _by_channel(sent, "trade_activity")
+    assert "(-10.0% from entry)" in trade_activity[0]
+
+
+def test_non_trim_fills_do_not_include_pct_gain(monkeypatch):
+    om = make_order_manager()
+    sent = _capture_sends(monkeypatch, om)
+    trade = FakeTrade(FakeOrder(action="SELL"))
+    om._attach_tracking(trade, row_id=1, role="target", entry_price=5.0)
+
+    trade.fillEvent.emit(trade, make_fill(shares=100, price=6.0, realized_pnl=100.0))
+
+    trade_activity = _by_channel(sent, "trade_activity")
+    assert "from entry" not in trade_activity[0]
 
 
 def test_no_messages_when_notifications_disabled(monkeypatch):

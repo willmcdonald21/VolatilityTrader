@@ -81,7 +81,7 @@ class OrderManager:
                 status=trade.orderStatus.status,
             )
             self._order_row_ids[order.orderId] = row_id
-            self._attach_tracking(trade, row_id, role)
+            self._attach_tracking(trade, row_id, role, signal.entry_price)
             trades_by_role[role] = (trade, row_id)
 
         logger.info(
@@ -115,7 +115,7 @@ class OrderManager:
         scale_out_price = signal.entry_price + signal.risk_per_share * cfg.r_multiple
         return scale_out_qty, scale_out_price
 
-    def _attach_tracking(self, trade: Trade, row_id: int, role: str) -> None:
+    def _attach_tracking(self, trade: Trade, row_id: int, role: str, entry_price: float | None = None) -> None:
         def on_status(t: Trade) -> None:
             self.journal.update_order_status(row_id, t.orderStatus.status)
 
@@ -139,9 +139,13 @@ class OrderManager:
             if self.notifications_config.enabled and self.notifications_config.notify_on_fill:
                 label = _FILL_LABELS.get(role, "SELL")
                 pnl_str = f" (P&L ${realized_pnl:.2f})" if realized_pnl is not None else ""
+                pct_str = ""
+                if role == "scale_out" and entry_price:
+                    pct_change = (fill.execution.price - entry_price) / entry_price * 100.0
+                    pct_str = f" ({pct_change:+.1f}% from entry)"
                 send_discord_message(
                     f"💰 {label} {trade.contract.symbol} "
-                    f"{fill.execution.shares:g} @ ${fill.execution.price:.2f}{pnl_str}",
+                    f"{fill.execution.shares:g} @ ${fill.execution.price:.2f}{pct_str}{pnl_str}",
                     channel="trade_activity",
                 )
             if (
