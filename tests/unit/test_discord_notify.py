@@ -97,3 +97,41 @@ def test_swallows_exceptions_from_failed_request(monkeypatch):
     monkeypatch.setattr(discord_module.urllib.request, "urlopen", failing_urlopen)
 
     discord_module.send_discord_message("hello", channel="limits")  # must not raise
+
+
+def test_no_op_when_pnl_webhook_url_not_set(monkeypatch):
+    monkeypatch.delenv("DISCORD_WEBHOOK_PNL", raising=False)
+    called = []
+    monkeypatch.setattr(discord_module.urllib.request, "urlopen", lambda *a, **k: called.append(1))
+
+    discord_module.send_discord_message("AAPL: +$1.00", channel="pnl")
+
+    assert called == []
+
+
+def test_build_pnl_message_green_chart_for_gains():
+    message = discord_module.build_pnl_message("AAPL", trade_pnl=114.0, daily_pnl=340.5)
+
+    assert message == "📈 AAPL: +$114.00\n📈 Daily P&L: +$340.50"
+
+
+def test_build_pnl_message_red_chart_for_losses():
+    message = discord_module.build_pnl_message("AAPL", trade_pnl=-50.25, daily_pnl=-12.0)
+
+    assert message == "📉 AAPL: -$50.25\n📉 Daily P&L: -$12.00"
+
+
+def test_build_pnl_message_independent_emoji_per_line():
+    # a winning trade on a red day overall -- each line's emoji reflects
+    # its own sign, not one indicator for the whole message
+    message = discord_module.build_pnl_message("AAPL", trade_pnl=25.0, daily_pnl=-200.0)
+
+    lines = message.split("\n")
+    assert lines[0].startswith("📈")
+    assert lines[1].startswith("📉")
+
+
+def test_build_pnl_message_zero_is_treated_as_green():
+    message = discord_module.build_pnl_message("AAPL", trade_pnl=0.0, daily_pnl=0.0)
+
+    assert message.startswith("📈 AAPL: +$0.00")

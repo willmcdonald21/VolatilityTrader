@@ -39,9 +39,18 @@ class IBClient:
         alert("Disconnected from IBKR — attempting to reconnect", channel="kill_switch")
         asyncio.ensure_future(self._reconnect_loop())
 
+    # Consecutive failed reconnect attempts before escalating from "just a
+    # blip" (kill_switch, already alerted in _on_disconnected) to "trading
+    # has likely stopped for the day" (limits) -- e.g. an expired Gateway
+    # session/login that needs a human to intervene, not something that
+    # will resolve itself by retrying.
+    RECONNECT_ALERT_THRESHOLD = 5
+
     async def _reconnect_loop(self) -> None:
         self._reconnecting = True
         delay = 2
+        consecutive_failures = 0
+        session_alert_sent = False
         try:
             while not self.ib.isConnected():
                 logger.warning("Reconnecting in %ss...", delay)
@@ -50,7 +59,17 @@ class IBClient:
                     await self.connect()
                 except Exception:
                     logger.exception("Reconnect attempt failed")
+                    consecutive_failures += 1
                     delay = min(delay * 2, 60)
+                    if consecutive_failures >= self.RECONNECT_ALERT_THRESHOLD and not session_alert_sent:
+                        alert(
+                            f"IBKR reconnect has failed {consecutive_failures} times in a row -- "
+                            "the bot may be unable to continue trading today (check Gateway login/session)",
+                            channel="limits",
+                        )
+                        session_alert_sent = True
+            if session_alert_sent:
+                alert("IBKR reconnected -- trading can resume", channel="limits")
             alert("Reconnected to IBKR", channel="kill_switch")
         finally:
             self._reconnecting = False

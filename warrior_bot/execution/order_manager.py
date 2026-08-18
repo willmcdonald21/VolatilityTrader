@@ -7,11 +7,18 @@ from ib_async import IB, Contract, Trade
 from warrior_bot.config import ExecutionConfig, ExitsConfig, NotificationsConfig
 from warrior_bot.execution.bracket_builder import Bracket, build_bracket
 from warrior_bot.execution.position_manager import PositionManager
-from warrior_bot.notify.discord import send_discord_message
+from warrior_bot.notify.discord import build_pnl_message, send_discord_message
 from warrior_bot.persistence.journal import Journal
+from warrior_bot.risk.account_state import AccountState
 from warrior_bot.signals.signal import Signal
 
 logger = logging.getLogger("warrior_bot.execution.order_manager")
+
+# order_manager.py's `role` -> the label used in trade_activity messages.
+# "target"/"stop" both mean "the position (or what's left of it) closed" --
+# a full sell; "scale_out" is a partial close ("trim"); "parent" is the
+# opening entry.
+_FILL_LABELS = {"parent": "BUY", "scale_out": "TRIM"}
 
 
 class OrderManager:
@@ -30,6 +37,7 @@ class OrderManager:
         position_manager: PositionManager,
         execution_config: ExecutionConfig | None = None,
         notifications_config: NotificationsConfig | None = None,
+        account_state: AccountState | None = None,
     ):
         self.ib = ib
         self.journal = journal
@@ -37,6 +45,7 @@ class OrderManager:
         self.position_manager = position_manager
         self.execution_config = execution_config or ExecutionConfig()
         self.notifications_config = notifications_config or NotificationsConfig()
+        self.account_state = account_state
         self._order_row_ids: dict[int, int] = {}  # ib order id -> journal orders.id
 
     def submit_signal(self, contract: Contract, signal: Signal, quantity: int, signal_id: int) -> Bracket:
@@ -72,7 +81,7 @@ class OrderManager:
                 status=trade.orderStatus.status,
             )
             self._order_row_ids[order.orderId] = row_id
-            self._attach_tracking(trade, row_id)
+            self._attach_tracking(trade, row_id, role)
             trades_by_role[role] = (trade, row_id)
 
         logger.info(
@@ -106,7 +115,7 @@ class OrderManager:
         scale_out_price = signal.entry_price + signal.risk_per_share * cfg.r_multiple
         return scale_out_qty, scale_out_price
 
-    def _attach_tracking(self, trade: Trade, row_id: int) -> None:
+    def _attach_tracking(self, trade: Trade, row_id: int, role: str) -> None:
         def on_status(t: Trade) -> None:
             self.journal.update_order_status(row_id, t.orderStatus.status)
 
@@ -128,11 +137,21 @@ class OrderManager:
                 realized_pnl=realized_pnl,
             )
             if self.notifications_config.enabled and self.notifications_config.notify_on_fill:
+                label = _FILL_LABELS.get(role, "SELL")
                 pnl_str = f" (P&L ${realized_pnl:.2f})" if realized_pnl is not None else ""
                 send_discord_message(
-                    f"💰 {trade.contract.symbol} {trade.order.action} "
+                    f"💰 {label} {trade.contract.symbol} "
                     f"{fill.execution.shares:g} @ ${fill.execution.price:.2f}{pnl_str}",
                     channel="trade_activity",
+                )
+            if (
+                realized_pnl is not None
+                and self.notifications_config.enabled
+                and self.notifications_config.notify_on_pnl
+            ):
+                daily_pnl = self.account_state.snapshot().daily_realized_pnl if self.account_state else realized_pnl
+                send_discord_message(
+                    build_pnl_message(trade.contract.symbol, realized_pnl, daily_pnl), channel="pnl"
                 )
 
         trade.statusEvent += on_status

@@ -72,9 +72,10 @@ news:
 notifications:
   enabled: false               # requires webhook URLs set in .env (see .env.example) -- never put URLs here
   notify_on_signal: true       # -> trade_activity channel: an entry signal was accepted and sized
-  notify_on_fill: true         # -> trade_activity channel: any leg of a bracket filled
+  notify_on_fill: true         # -> trade_activity channel: every buy/sell/trim fill
   notify_on_kill_switch: true  # -> kill_switch channel: manual kill switch, IBKR connection loss
-  notify_on_limits: true       # -> limits channel: daily-loss-limit halt, EOD flatten ("stopped for the day")
+  notify_on_limits: true       # -> limits channel: daily-loss-limit halt, EOD flatten, IBKR session failure
+  notify_on_pnl: true          # -> pnl channel: per-trade + running daily realized P&L on every closing/trim fill
 
 exits:
   scale_out:

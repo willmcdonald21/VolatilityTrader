@@ -10,23 +10,24 @@ logger = logging.getLogger("warrior_bot.notify.discord")
 
 _DISCORD_MESSAGE_LIMIT = 2000
 
-# Three separate channels, each its own webhook -- kill-switch/connection
-# events, daily-limit/EOD "trading stopped" events, and routine trade
-# activity (signals + fills) each land in their own place rather than one
-# noisy firehose.
+# Four separate channels, each its own webhook -- kill-switch/connection
+# events, daily-limit/EOD "trading stopped" events, routine trade activity
+# (signals + fills), and per-trade/daily P&L each land in their own place
+# rather than one noisy firehose.
 _CHANNEL_ENV_VARS = {
     "kill_switch": "DISCORD_WEBHOOK_KILL_SWITCH",
     "limits": "DISCORD_WEBHOOK_LIMITS",
     "trade_activity": "DISCORD_WEBHOOK_TRADE_ACTIVITY",
+    "pnl": "DISCORD_WEBHOOK_PNL",
 }
 
 
-def send_discord_message(content: str, channel: str) -> None:
-    """Fire-and-forget post to one of the named webhook channels (see
-    _CHANNEL_ENV_VARS), read from environment variables -- deliberately
-    never from config.yaml, which is tracked in git. No-ops silently if
-    that channel's variable isn't set, so notifications are opt-in with
-    zero setup cost otherwise.
+def _post_payload(payload: dict, channel: str) -> None:
+    """Fire-and-forget POST of a Discord webhook payload to one of the
+    named channels (see _CHANNEL_ENV_VARS), whose URL is read from an
+    environment variable -- deliberately never from config.yaml, which is
+    tracked in git. No-ops silently if that channel's variable isn't set,
+    so notifications are opt-in with zero setup cost otherwise.
 
     Runs the actual HTTP call on a background thread rather than making
     the caller `await` it: this needs to be safely callable from both the
@@ -44,7 +45,7 @@ def send_discord_message(content: str, channel: str) -> None:
 
     def _post() -> None:
         try:
-            data = json.dumps({"content": content[:_DISCORD_MESSAGE_LIMIT]}).encode("utf-8")
+            data = json.dumps(payload).encode("utf-8")
             request = urllib.request.Request(
                 webhook_url,
                 data=data,
@@ -59,3 +60,28 @@ def send_discord_message(content: str, channel: str) -> None:
             logger.exception("Failed to send Discord notification to channel %r", channel)
 
     threading.Thread(target=_post, daemon=True).start()
+
+
+def send_discord_message(content: str, channel: str) -> None:
+    _post_payload({"content": content[:_DISCORD_MESSAGE_LIMIT]}, channel)
+
+
+def _format_signed_dollars(value: float) -> str:
+    sign = "+" if value >= 0 else "-"
+    return f"{sign}${abs(value):.2f}"
+
+
+def _pnl_emoji(value: float) -> str:
+    return "📈" if value >= 0 else "📉"
+
+
+def build_pnl_message(symbol: str, trade_pnl: float, daily_pnl: float) -> str:
+    """Two lines for the pnl channel: the closing trade's realized P&L,
+    then the day's cumulative realized P&L below it -- each prefixed with
+    its own up/down chart emoji by its own sign, so a winning trade on an
+    otherwise red day still reads correctly (green chart / red chart),
+    independent of the other line."""
+    return (
+        f"{_pnl_emoji(trade_pnl)} {symbol}: {_format_signed_dollars(trade_pnl)}\n"
+        f"{_pnl_emoji(daily_pnl)} Daily P&L: {_format_signed_dollars(daily_pnl)}"
+    )
