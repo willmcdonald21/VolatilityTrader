@@ -148,6 +148,13 @@ class RiskManager:
             # size-boost treatment as the other multipliers above.
             raw_shares = math.floor(raw_shares * self.config.shallow_pullback_size_multiplier)
 
+        if signal.context.get("bottoming_tail_confirmation"):
+            # "Hammering out the base" on the pullback low -- sellers
+            # pushed lower but were rejected and price recovered. Soft
+            # bullish confirmation, same boost treatment as the other soft
+            # signals above, not a hard entry gate.
+            raw_shares = math.floor(raw_shares * self.config.bottoming_tail_size_multiplier)
+
         if now is not None:
             # Only applied when the caller supplies a clock reading -- never
             # guessed from wall-clock time, so sizing stays deterministic

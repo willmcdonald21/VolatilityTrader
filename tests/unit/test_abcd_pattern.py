@@ -40,6 +40,22 @@ def test_abcd_breakout_triggers_signal():
     assert signal.stop_price < signal.entry_price
 
 
+def test_bottoming_tail_confirmation_false_for_normal_pullback():
+    ctx = make_ctx(PASSING_BARS)
+    strategy = AbcdStrategy(AbcdConfig())
+    signal = strategy.evaluate(ctx, NOW)
+    assert signal.context["bottoming_tail_confirmation"] is False
+
+
+def test_bottoming_tail_confirmation_true_when_c_low_bar_is_a_hammer():
+    bars = PASSING_BARS[:3] + [(11.45, 11.5, 11.3, 11.42, 300), PASSING_BARS[4]]
+    ctx = make_ctx(bars)
+    strategy = AbcdStrategy(AbcdConfig())
+    signal = strategy.evaluate(ctx, NOW)
+    assert signal is not None
+    assert signal.context["bottoming_tail_confirmation"] is True
+
+
 def test_no_signal_without_d_breakout():
     bars = PASSING_BARS[:-1] + [(11.45, 11.9, 11.45, 11.6, 1000)]  # doesn't clear B's high of 12.0
     ctx = make_ctx(bars)

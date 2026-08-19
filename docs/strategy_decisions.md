@@ -5,7 +5,7 @@ notes folder (`warrior_trading_strategy_notes.md`, `warrior_trading_roadmap_note
 `warrior_trading_full_course_notes.md`, `warrior_trading_candlestick_pattern_notes.md`,
 `warrior_trading_execution_risk_notes.md`, `warrior_trading_dip_or_dump_notes.md`,
 `warrior_trading_candlestick_deep_dive_notes.md`, `warrior_trading_three_concepts_notes.md`,
-`warrior_trading_5_failure_causes_notes.md`).
+`warrior_trading_5_failure_causes_notes.md`, `warrior_trading_raw_candlesticks_notes.md`).
 This file tracks findings from that material that were considered but
 **not** implemented, and why, so the reasoning isn't lost. Implemented
 findings are just... implemented; see `bull_flag.py`/`abcd_pattern.py`
@@ -16,6 +16,82 @@ stock-level 9/20 MACD disengagement gate; `SymbolContext.scanner_rank`),
 `position_manager.py` (reversal exit, stop-limit price tracking),
 `bracket_builder.py` (stop-limit order type), `risk_manager.py` (catalyst,
 time-of-day, and "obviousness" size boosts), and `config.yaml`.
+
+## Implemented: "Reading Raw Candlesticks" additions
+
+This transcript's central thesis (raw candlesticks/tick data > computed
+indicators, argued from a data-hierarchy + lag standpoint) mostly
+reinforces architecture already confirmed in prior files' sessions. Two
+genuinely new pieces, both filling gaps this file's own concepts pointed
+at directly:
+
+- **`is_bottoming_tail()`** (`indicators.py`) -- the exact mirror of the
+  existing `is_topping_tail()` (long lower wick vs. long upper wick),
+  matching this file's "hammer" description. This was explicitly flagged
+  as a gap in an earlier session ("Deferred: candlestick shape as entry
+  confirmation (not just exit)" -- `is_topping_tail()` existed for the
+  exit signal but there was no bullish-confirmation counterpart). Wired
+  into `bull_flag.py`/`abcd_pattern.py`: a bottoming tail on the pullback's
+  low bar sets `bottoming_tail_confirmation` in the signal's context,
+  which `RiskManager` turns into a soft size boost
+  (`risk.bottoming_tail_size_multiplier`) -- same discrete
+  threshold-and-multiplier treatment as every other soft signal
+  (catalyst, obviousness, shallow pullback), exactly as that earlier
+  deferral note anticipated ("would follow the same soft-boost pattern...
+  if added").
+- **`is_momentum_exhausted()`** (`indicators.py`) -- sequential shrinking
+  green-candle bodies *and* shrinking volume across N bars (default 3),
+  a trend-exhaustion warning distinct from any single bearish-shaped
+  candle. Both conditions are required jointly, matching the source
+  material's explicit nuance that shrinking body size alone (with volume
+  still rising) is a weaker, lower-confidence version of this signal, not
+  the same thing. Wired into `PositionManager._check_reversal_exit` as a
+  fifth exit reason (`momentum_exhaustion`), alongside the existing
+  topping-tail/red-after-green/first-lower-low/volume-burst checks --
+  the natural home for it, since it's the same "OHLCV-computable
+  exit warning" bucket those already live in. Unlike "first lower low,"
+  it isn't gated behind breakeven, since it's a distinct signal that
+  doesn't need the position already profitable to be meaningful.
+
+**Confirmed already correct, no change needed:**
+- **"Candle over candle" / "candle under candle."** `is_lower_low()`
+  already *is* "candle under candle" (already used exactly as this
+  file's confirmation-after-a-warning-candle pattern:
+  `PositionManager`'s reversal exit fires "first lower low" as
+  confirmation after a topping-tail/red-after-green warning). No
+  `is_higher_high()` counterpart was added: the bullish breakout entries
+  across all three breakout-style strategies already require the close
+  to clear a *multi-bar computed range high* (`flag_high`, `b_high`,
+  `breakout_high`), which is a stronger version of "candle over candle"
+  (a single immediately-prior bar's high) rather than a gap needing a
+  separate, weaker primitive alongside it. Adding one with no real
+  caller would have been unused code.
+- **Data hierarchy (Level 2 -> candlesticks -> indicators) and sub-bar/
+  tick-level entry triggers.** This is the clearest statement yet of why
+  the bot's 1-minute-bar-only architecture is structurally slower than
+  the trader it's modeling, but it doesn't add anything actionable beyond
+  the existing deferrals: `broker/market_data.py::subscribe_real_time_bars`
+  (5-second bars) is still dead code (see "Deferred: ~30-second
+  post-entry 'instant resolution' check" below), and Level 2/order-book
+  data is still the same deferred gap noted under "sector heat and Level
+  2" below. No new deferral needed -- this file is additional motivation
+  for the existing ones, not a new one.
+- **Context-dependency (candlestick signals matter more after a clear
+  trend, less during sideways/choppy action).** Already structurally true
+  of this bot: `pullback_validity.py`'s candle-shape checks only ever run
+  *after* a strategy has already confirmed a qualifying directional
+  move (`min_spike_pct`, `min_ab_move_pct`, `min_gap_pct`) -- there's no
+  code path where a candle-shape gate gets evaluated during undifferentiated
+  sideways action in the first place, so no additional "is this a trend"
+  classifier was needed.
+- **Doji variant taxonomy** (standard/long-legged/gravestone/dragonfly).
+  These are graduated points along the same continuous wick-ratio/body
+  spectrum `candle_strength()` and the topping/bottoming-tail wick-ratio
+  checks already measure -- a "gravestone doji" is just a near-zero-body
+  topping tail, a "dragonfly doji" a near-zero-body bottoming tail. No
+  discrete named classifiers add detection capability beyond what's
+  already parametrically expressible; not built out as a separate
+  taxonomy.
 
 ## Implemented: "5 Leading Causes of Trader Failure" additions
 

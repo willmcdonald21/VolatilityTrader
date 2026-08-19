@@ -195,6 +195,42 @@ def is_topping_tail(bar: Bar, wick_ratio: float = 2.0) -> bool:
     return upper_wick >= wick_ratio * body and upper_wick > lower_wick
 
 
+def is_bottoming_tail(bar: Bar, wick_ratio: float = 2.0) -> bool:
+    """Mirror of is_topping_tail: long lower wick relative to the candle
+    body -- sellers pushed lower but were rejected and price recovered
+    ("hammering out the base"). A soft bullish confirmation signal on a
+    pullback's low bar, not a hard entry gate -- color-independent, same
+    as the source material's own framing (bullish regardless of whether
+    the small body itself closed red or green)."""
+    body = abs(bar.close - bar.open)
+    if body <= 0:
+        return False
+    upper_wick = bar.high - max(bar.open, bar.close)
+    lower_wick = min(bar.open, bar.close) - bar.low
+    return lower_wick >= wick_ratio * body and lower_wick > upper_wick
+
+
+def is_momentum_exhausted(bars: list[Bar], lookback: int = 3) -> bool:
+    """Sequential shrinking green-candle bodies combined with shrinking
+    volume across the most recent `lookback` bars -- trend exhaustion, a
+    warning sign a reversal may be imminent even with no single
+    bearish-shaped candle yet. Requires BOTH signals jointly: the source
+    material explicitly treats shrinking body size alone (with volume
+    still rising) as a weaker, lower-confidence version of this signal,
+    not the same thing -- still-growing volume on a shrinking body can
+    still reflect genuine, if slowing, buying interest."""
+    if len(bars) < lookback:
+        return False
+    recent = bars[-lookback:]
+    if not all(b.close > b.open for b in recent):
+        return False
+    bodies = [b.close - b.open for b in recent]
+    volumes = [b.volume for b in recent]
+    shrinking_bodies = all(bodies[i] < bodies[i - 1] for i in range(1, len(bodies)))
+    shrinking_volume = all(volumes[i] < volumes[i - 1] for i in range(1, len(volumes)))
+    return shrinking_bodies and shrinking_volume
+
+
 def is_red_after_green(prior_bar: Bar, current_bar: Bar) -> bool:
     """A red candle immediately following a green one -- momentum stalling
     or reversing, one bar after a push higher."""

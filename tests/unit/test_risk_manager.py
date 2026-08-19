@@ -48,6 +48,7 @@ def make_risk_manager(tmp_path, snapshot, **risk_overrides) -> RiskManager:
         obvious_size_multiplier=risk_overrides.get("obvious_size_multiplier", 1.25),
         shallow_pullback_threshold_pct=risk_overrides.get("shallow_pullback_threshold_pct", 25.0),
         shallow_pullback_size_multiplier=risk_overrides.get("shallow_pullback_size_multiplier", 1.25),
+        bottoming_tail_size_multiplier=risk_overrides.get("bottoming_tail_size_multiplier", 1.25),
         # Unlike every other multiplier above, the starter-trade ones are
         # gated on RiskManager's own internal state (this being the day's
         # first trade), not on something present/absent in the signal's
@@ -332,6 +333,28 @@ def test_starter_trade_state_resets_on_mark_start_of_day(tmp_path):
 
     assert decision.accepted
     assert decision.sized_qty == 50  # starter-size branch applies again on the new day's trade #1
+
+
+def test_bottoming_tail_confirmation_gets_size_boost(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, bottoming_tail_size_multiplier=1.25)
+    signal = make_signal(entry=10.0, stop=9.0, context={"bottoming_tail_confirmation": True})
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 125  # raw_shares(100) * 1.25
+
+
+def test_no_bottoming_tail_no_size_boost(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, bottoming_tail_size_multiplier=1.25)
+    signal = make_signal(entry=10.0, stop=9.0, context={"bottoming_tail_confirmation": False})
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 100  # unboosted
 
 
 def test_time_of_day_boost_applied_within_window(tmp_path):

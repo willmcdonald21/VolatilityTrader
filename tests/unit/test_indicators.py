@@ -6,8 +6,10 @@ from warrior_bot.strategies.indicators import (
     candle_strength,
     ema,
     gap_pct,
+    is_bottoming_tail,
     is_high_volume_red_bar,
     is_lower_low,
+    is_momentum_exhausted,
     is_red_after_green,
     is_red_to_green,
     is_topping_tail,
@@ -155,6 +157,35 @@ def test_is_topping_tail_false_for_doji_zero_body():
     assert is_topping_tail(bar) is False
 
 
+def test_is_bottoming_tail_true_for_long_lower_wick():
+    bar = make_bars([(10.05, 10.1, 9.0, 10.0, 1000)])[0]  # tiny body, long lower wick ("hammer")
+    assert is_bottoming_tail(bar) is True
+
+
+def test_is_bottoming_tail_true_regardless_of_red_or_green_body():
+    # bullish "hammer" per the source material even when the small body
+    # itself closed red, not just green
+    red_hammer = make_bars([(10.05, 10.1, 9.0, 10.0, 1000)])[0]  # red: close < open
+    green_hammer = make_bars([(10.0, 10.1, 9.0, 10.05, 1000)])[0]  # green: close > open
+    assert is_bottoming_tail(red_hammer) is True
+    assert is_bottoming_tail(green_hammer) is True
+
+
+def test_is_bottoming_tail_false_for_normal_candle():
+    bar = make_bars([(10.0, 10.5, 9.8, 10.4, 1000)])[0]
+    assert is_bottoming_tail(bar) is False
+
+
+def test_is_bottoming_tail_false_for_doji_zero_body():
+    bar = make_bars([(10.0, 11.0, 9.0, 10.0, 1000)])[0]
+    assert is_bottoming_tail(bar) is False
+
+
+def test_is_bottoming_tail_false_when_upper_wick_dominates():
+    bar = make_bars([(10.0, 11.0, 9.95, 10.05, 1000)])[0]  # this is the topping-tail fixture, mirror-checked
+    assert is_bottoming_tail(bar) is False
+
+
 def test_is_red_after_green_true():
     prior = make_bars([(10.0, 10.5, 9.9, 10.4, 1000)])[0]  # green
     current = make_bars([(10.4, 10.5, 10.0, 10.1, 1000)])[0]  # red
@@ -180,6 +211,63 @@ def test_is_high_volume_red_bar_false_when_not_red():
 def test_is_high_volume_red_bar_false_when_volume_not_elevated():
     bar = make_bars([(10.4, 10.5, 10.0, 10.1, 1500)])[0]  # red, but not 2x the average
     assert is_high_volume_red_bar(bar, avg_recent_volume=1000, multiple=2.0) is False
+
+
+EXHAUSTION_BARS_SHRINKING_BODY_AND_VOLUME = [
+    (10.0, 10.95, 9.95, 10.9, 3000),   # body 0.9, volume 3000
+    (10.9, 11.55, 10.85, 11.5, 2000),  # body 0.6, volume 2000
+    (11.5, 11.85, 11.45, 11.8, 1000),  # body 0.3, volume 1000
+]
+
+
+def test_is_momentum_exhausted_true_when_body_and_volume_both_shrink():
+    bars = make_bars(EXHAUSTION_BARS_SHRINKING_BODY_AND_VOLUME)
+    assert is_momentum_exhausted(bars, lookback=3) is True
+
+
+def test_is_momentum_exhausted_false_when_volume_still_rising():
+    # same shrinking-body shape, but volume rising -- the source material's
+    # explicit "weaker, lower-confidence" case, not treated as exhaustion
+    bars = make_bars(
+        [
+            (10.0, 10.95, 9.95, 10.9, 1000),
+            (10.9, 11.55, 10.85, 11.5, 2000),
+            (11.5, 11.85, 11.45, 11.8, 3000),
+        ]
+    )
+    assert is_momentum_exhausted(bars, lookback=3) is False
+
+
+def test_is_momentum_exhausted_false_when_bodies_not_shrinking():
+    bars = make_bars(
+        [
+            (10.0, 10.35, 9.95, 10.3, 3000),
+            (10.3, 10.95, 10.25, 10.9, 2000),
+            (10.9, 11.85, 10.85, 11.8, 1000),
+        ]
+    )
+    assert is_momentum_exhausted(bars, lookback=3) is False
+
+
+def test_is_momentum_exhausted_false_when_a_bar_is_red():
+    bars = make_bars(
+        [
+            (10.0, 10.95, 9.95, 10.9, 3000),
+            (11.5, 11.55, 10.85, 10.9, 2000),  # red: close < open
+            (11.5, 11.85, 11.45, 11.8, 1000),
+        ]
+    )
+    assert is_momentum_exhausted(bars, lookback=3) is False
+
+
+def test_is_momentum_exhausted_false_with_insufficient_bars():
+    bars = make_bars(EXHAUSTION_BARS_SHRINKING_BODY_AND_VOLUME[:2])
+    assert is_momentum_exhausted(bars, lookback=3) is False
+
+
+def test_is_momentum_exhausted_respects_custom_lookback():
+    bars = make_bars(EXHAUSTION_BARS_SHRINKING_BODY_AND_VOLUME[:2])
+    assert is_momentum_exhausted(bars, lookback=2) is True
 
 
 def test_resample_bars_empty_returns_empty():

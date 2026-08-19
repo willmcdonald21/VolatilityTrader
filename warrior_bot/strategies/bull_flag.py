@@ -5,7 +5,7 @@ from datetime import datetime
 from warrior_bot.config import BullFlagConfig, PullbackQualityConfig
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
-from warrior_bot.strategies.indicators import candle_strength
+from warrior_bot.strategies.indicators import candle_strength, is_bottoming_tail
 from warrior_bot.strategies.pullback_validity import validate_pullback
 from warrior_bot.utils.time_utils import session_elapsed_fraction
 
@@ -67,7 +67,8 @@ class BullFlagStrategy(BaseStrategy):
         if not (cfg.min_consolidation_bars <= len(consolidation) <= cfg.max_consolidation_bars):
             return None
 
-        pullback_low = min(b.low for b in consolidation)
+        pullback_low_bar = min(consolidation, key=lambda b: b.low)
+        pullback_low = pullback_low_bar.low
         spike_range = spike_high - baseline_low
         pullback_pct = (spike_high - pullback_low) / spike_range * 100.0 if spike_range > 0 else 100.0
         if pullback_pct > cfg.max_pullback_pct:
@@ -99,5 +100,10 @@ class BullFlagStrategy(BaseStrategy):
             entry_price=entry_price,
             stop_price=stop_price,
             target_r_multiple=cfg.target_r_multiple,
-            context={"spike_high": spike_high, "flag_high": flag_high, "pullback_pct": pullback_pct},
+            context={
+                "spike_high": spike_high,
+                "flag_high": flag_high,
+                "pullback_pct": pullback_pct,
+                "bottoming_tail_confirmation": is_bottoming_tail(pullback_low_bar),
+            },
         )

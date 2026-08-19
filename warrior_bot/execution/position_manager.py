@@ -12,6 +12,7 @@ from warrior_bot.strategies.base_strategy import SymbolContext
 from warrior_bot.strategies.indicators import (
     is_high_volume_red_bar,
     is_lower_low,
+    is_momentum_exhausted,
     is_red_after_green,
     is_topping_tail,
     trailing_candidate,
@@ -162,7 +163,13 @@ class PositionManager:
         "First lower low" only arms once breakeven has triggered -- the
         source material is explicit this confirmation is "evaluated only
         after the position is already profitable/trend-established", not
-        from the first bar after entry."""
+        from the first bar after entry.
+
+        "Momentum exhaustion" (sequential shrinking green-candle bodies
+        *and* shrinking volume) is unconditional like the other checks --
+        it's a distinct warning sign that doesn't require any single bar
+        to look bearish, so it isn't gated behind breakeven the way
+        "first lower low" is."""
         cfg = self.config.reversal_exit
         bars = ctx.bars
         if len(bars) < 2:
@@ -183,6 +190,8 @@ class PositionManager:
             avg_recent_volume = sum(b.volume for b in recent) / len(recent)
             if is_high_volume_red_bar(current_bar, avg_recent_volume, cfg.volume_burst_multiple):
                 reasons.append("volume_burst")
+        if is_momentum_exhausted(bars, cfg.momentum_exhaustion_lookback_bars):
+            reasons.append("momentum_exhaustion")
 
         if not reasons:
             return False

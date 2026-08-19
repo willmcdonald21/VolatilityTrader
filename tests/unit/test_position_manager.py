@@ -310,6 +310,32 @@ def test_reversal_exit_on_volume_burst_triggers_market_exit():
     assert "TEST" not in pm._positions
 
 
+def test_reversal_exit_on_momentum_exhaustion_triggers_market_exit():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=True))
+    signal = make_signal(entry=10.0, stop=9.0)
+    stop_trade, target_trade = track_position(pm, signal, quantity=100)
+
+    # three green bars, shrinking body AND shrinking volume -- none of the
+    # other reversal-exit checks (topping tail, red-after-green, lower
+    # low, volume burst) fire on this shape, isolating momentum exhaustion
+    bars = make_bars(
+        [
+            (10.0, 10.95, 9.95, 10.9, 3000),
+            (10.9, 11.55, 10.85, 11.5, 2000),
+            (11.5, 11.85, 11.45, 11.8, 1000),
+        ]
+    )
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.8, bars=bars))
+
+    assert stop_trade.order in ib.cancelled
+    assert target_trade.order in ib.cancelled
+    assert "TEST" not in pm._positions
+    market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
+    assert len(market_orders) == 1
+
+
 def test_reversal_exit_disabled_does_not_trigger():
     ib = FakeIB()
     pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=False, trailing_enabled=False))

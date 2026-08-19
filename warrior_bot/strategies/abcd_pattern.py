@@ -5,7 +5,7 @@ from datetime import datetime
 from warrior_bot.config import AbcdConfig, PullbackQualityConfig
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
-from warrior_bot.strategies.indicators import candle_strength
+from warrior_bot.strategies.indicators import candle_strength, is_bottoming_tail
 from warrior_bot.strategies.pullback_validity import validate_pullback
 from warrior_bot.utils.time_utils import session_elapsed_fraction
 
@@ -58,7 +58,8 @@ class AbcdStrategy(BaseStrategy):
         post_b = window[b_idx + 1 :]
         if not post_b:
             return None
-        c_low = min(b.low for b in post_b)
+        c_low_bar = min(post_b, key=lambda b: b.low)
+        c_low = c_low_bar.low
         ab_range = b_high - a_low
         bc_pullback_pct = (b_high - c_low) / ab_range * 100.0 if ab_range > 0 else 100.0
         if not (cfg.min_bc_pullback_pct <= bc_pullback_pct <= cfg.max_bc_pullback_pct):
@@ -89,5 +90,11 @@ class AbcdStrategy(BaseStrategy):
             entry_price=entry_price,
             stop_price=stop_price,
             target_r_multiple=cfg.target_r_multiple,
-            context={"a_low": a_low, "b_high": b_high, "c_low": c_low, "bc_pullback_pct": bc_pullback_pct},
+            context={
+                "a_low": a_low,
+                "b_high": b_high,
+                "c_low": c_low,
+                "bc_pullback_pct": bc_pullback_pct,
+                "bottoming_tail_confirmation": is_bottoming_tail(c_low_bar),
+            },
         )

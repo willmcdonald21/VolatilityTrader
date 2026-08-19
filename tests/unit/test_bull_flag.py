@@ -41,6 +41,22 @@ def test_flag_breakout_triggers_signal():
     assert signal.stop_price < signal.entry_price
 
 
+def test_bottoming_tail_confirmation_false_for_normal_pullback():
+    ctx = make_ctx(PASSING_BARS)
+    strategy = BullFlagStrategy(BullFlagConfig())
+    signal = strategy.evaluate(ctx, NOW)
+    assert signal.context["bottoming_tail_confirmation"] is False
+
+
+def test_bottoming_tail_confirmation_true_when_pullback_low_bar_is_a_hammer():
+    bars = PASSING_BARS[:4] + [(11.6, 11.65, 11.3, 11.58, 300), PASSING_BARS[5]]
+    ctx = make_ctx(bars)
+    strategy = BullFlagStrategy(BullFlagConfig())
+    signal = strategy.evaluate(ctx, NOW)
+    assert signal is not None
+    assert signal.context["bottoming_tail_confirmation"] is True
+
+
 def test_no_signal_without_flag_breakout():
     bars = PASSING_BARS[:-1] + [(11.55, 11.7, 11.5, 11.5, 1000)]  # fails to clear flag high of 11.75
     ctx = make_ctx(bars)

@@ -71,6 +71,10 @@ class RiskConfig(BaseModel):
     # obviousness boosts above.
     shallow_pullback_threshold_pct: float = Field(default=25.0, ge=0)
     shallow_pullback_size_multiplier: float = Field(default=1.25, ge=1.0)
+    # A bottoming tail (long lower wick, "hammering out the base") on the
+    # pullback's low bar -- soft bullish confirmation, same boost treatment
+    # as the other soft signals above.
+    bottoming_tail_size_multiplier: float = Field(default=1.25, ge=1.0)
     # Daily "starter position" regime protocol: take smaller-than-normal
     # size on the day's first trade; if it loses, treat that as a cold-
     # market caution flag and cap size for the rest of the session (an
@@ -183,6 +187,7 @@ class ReversalExitConfig(BaseModel):
     topping_tail_wick_ratio: float = Field(default=2.0, gt=0)  # upper wick >= this multiple of the candle body
     volume_burst_multiple: float = Field(default=2.0, gt=0)  # red-bar volume >= this multiple of recent avg volume
     volume_lookback_bars: int = Field(default=10, gt=0)
+    momentum_exhaustion_lookback_bars: int = Field(default=3, gt=1)  # consecutive shrinking-body+shrinking-volume green bars
 
 
 class ExitsConfig(BaseModel):

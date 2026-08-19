@@ -31,6 +31,7 @@ risk:
   shallow_pullback_size_multiplier: 1.25 # position-size boost when a bull_flag pullback retraces <= the threshold above
   starter_trade_size_multiplier: 0.5     # smaller-than-normal size on the day's first trade ("starter position" regime test)
   starter_trade_downgrade_multiplier: 0.5 # applied to all trades for the rest of the session if the starter trade lost
+  bottoming_tail_size_multiplier: 1.25   # boost when the pullback low bar is a bottoming tail ("hammering out the base")
 
 pullback_quality:
   # Entry-time "dip or dump" dump-avoidance checks, shared by bull_flag/abcd's
@@ -120,6 +121,7 @@ exits:
     topping_tail_wick_ratio: 2.0   # upper wick >= this multiple of the candle body counts as a topping tail
     volume_burst_multiple: 2.0     # red-bar volume >= this multiple of recent avg volume counts as a burst
     volume_lookback_bars: 10       # bars used to compute the "recent average" volume baseline
+    momentum_exhaustion_lookback_bars: 3  # consecutive shrinking-body + shrinking-volume green bars = exhaustion warning
   eod_flatten_time: "15:55"   # force-flatten all positions at/after this ET time
   risk_loop_interval_seconds: 15
 
