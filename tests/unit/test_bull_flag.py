@@ -118,6 +118,23 @@ def test_does_not_retrigger_same_symbol_same_day():
     assert strategy.evaluate(ctx, NOW) is None
 
 
+def test_no_signal_when_breakout_candle_strength_below_default_threshold():
+    # Small wicks on both ends (not a topping-tail shape -- isolates this
+    # from the existing 5-minute-veto topping-tail check) but the body
+    # itself closes red, well above flag_high.
+    bars = PASSING_BARS[:-1] + [(12.0, 12.05, 11.85, 11.9, 1000)]
+    ctx = make_ctx(bars)
+    strategy = BullFlagStrategy(BullFlagConfig())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_signal_when_breakout_candle_strength_gate_disabled():
+    bars = PASSING_BARS[:-1] + [(12.0, 12.05, 11.85, 11.9, 1000)]
+    ctx = make_ctx(bars)
+    strategy = BullFlagStrategy(BullFlagConfig(min_breakout_candle_strength=-1.0))
+    assert strategy.evaluate(ctx, NOW) is not None
+
+
 def test_no_signal_when_relative_volume_too_low():
     # same price structure as PASSING_BARS, but a huge average makes the
     # day's actual volume look tiny by comparison -- Ross's stated hard

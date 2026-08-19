@@ -30,6 +30,11 @@ class SymbolContext:
     avg_daily_volume: float | None = None
     catalyst_category: str | None = None
     catalyst_headline: str | None = None
+    # 1-based scanner rank ("obviousness") at the moment this symbol was
+    # onboarded -- e.g. 1 means it was the single leading % gainer that
+    # scan tick. Captured once, like catalyst_category, not re-checked
+    # per bar.
+    scanner_rank: int | None = None
 
     def add_bar(self, bar: Bar) -> None:
         self.bars.append(bar)
@@ -53,6 +58,17 @@ class SymbolContext:
     @property
     def ema_20(self) -> float | None:
         return ema(self.bars, 20)
+
+    @property
+    def ema_200(self) -> float | None:
+        """Completes the source material's confirmed indicator set
+        (9/20/200 EMA + VWAP + MACD + volume + candlesticks). Not wired
+        into any gate -- no concrete filter rule was ever given for it
+        (unlike the 9 EMA pullback-hold gate), and with only 60 minutes of
+        warmup bars (`fetch_warmup_bars`), it's typically still None for
+        most of this bot's actual 7-10am ET trading window anyway. Exposed
+        for context/journaling, not decision-making."""
+        return ema(self.bars, 200)
 
     @property
     def gap_pct(self) -> float | None:
@@ -136,6 +152,8 @@ class BaseStrategy(ABC):
         if ctx.catalyst_category:
             full_context.setdefault("catalyst_category", ctx.catalyst_category)
             full_context.setdefault("catalyst_headline", ctx.catalyst_headline)
+        if ctx.scanner_rank is not None:
+            full_context.setdefault("scanner_rank", ctx.scanner_rank)
         return Signal(
             symbol=ctx.symbol,
             strategy=self.name,

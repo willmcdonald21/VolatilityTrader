@@ -50,6 +50,40 @@ def relative_volume(volume_so_far: float, avg_daily_volume: float, elapsed_fract
     return volume_so_far / expected_by_now
 
 
+def resample_bars(bars: list[Bar], bucket_minutes: int) -> list[Bar]:
+    """Downsample 1-minute bars into `bucket_minutes`-wide OHLCV bars,
+    aligned to absolute wall-clock boundaries (e.g. :00/:05/:10 for a
+    5-minute bucket) rather than to the first bar's own timestamp.
+
+    Used for multi-timeframe confirmation (checking MACD/candle-shape state
+    on a slower timeframe than the one used for entry) purely by
+    downsampling bar history this bot already has -- no second IB bar
+    subscription needed. The trailing bucket may be partial (still forming)
+    if the caller's `bars` don't yet span a full period; that's expected,
+    same as how a live 5-minute chart's current candle is partial too.
+    """
+    if bucket_minutes <= 0 or not bars:
+        return []
+    buckets: dict[int, list[Bar]] = {}
+    for bar in bars:
+        bucket_key = int(bar.time.timestamp() // 60 // bucket_minutes)
+        buckets.setdefault(bucket_key, []).append(bar)
+    resampled = []
+    for key in sorted(buckets):
+        group = buckets[key]
+        resampled.append(
+            Bar(
+                time=group[0].time,
+                open=group[0].open,
+                high=max(b.high for b in group),
+                low=min(b.low for b in group),
+                close=group[-1].close,
+                volume=sum(b.volume for b in group),
+            )
+        )
+    return resampled
+
+
 def opening_range(bars: list[Bar], lookback_bars: int) -> tuple[float, float] | None:
     """(high, low) over the most recent `lookback_bars` bars."""
     window = bars[-lookback_bars:] if lookback_bars > 0 else bars
@@ -127,6 +161,24 @@ def macd(bars: list[Bar], fast: int = 12, slow: int = 26, signal: int = 9) -> tu
     if not signal_series:
         return None
     return macd_line[-1], signal_series[-1]
+
+
+def candle_strength(bar: Bar) -> float:
+    """Signed, wick-weighted candle conviction in [-1, 1]: (close - open) /
+    (high - low). +1.0 is a full-bodied green candle (open=low, close=high,
+    the single strongest bullish shape); -1.0 the mirror-image full-bodied
+    red candle. A candle's color alone understates/overstates conviction --
+    a green candle with a large upper wick scores well below +1.0 even
+    though it's colored green, and a red candle with a large lower wick
+    scores well above -1.0 -- which is the point: wick structure, not raw
+    color, should drive how much a candle is trusted. Returns 0.0 for a
+    zero-range bar (doji-like indecision, or malformed data) rather than
+    dividing by zero.
+    """
+    range_ = bar.high - bar.low
+    if range_ <= 0:
+        return 0.0
+    return (bar.close - bar.open) / range_
 
 
 def is_topping_tail(bar: Bar, wick_ratio: float = 2.0) -> bool:

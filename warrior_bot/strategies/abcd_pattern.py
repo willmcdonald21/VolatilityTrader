@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from warrior_bot.config import AbcdConfig
+from warrior_bot.config import AbcdConfig, PullbackQualityConfig
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
+from warrior_bot.strategies.indicators import candle_strength
 from warrior_bot.strategies.pullback_validity import validate_pullback
 from warrior_bot.utils.time_utils import session_elapsed_fraction
 
@@ -20,6 +21,10 @@ class AbcdStrategy(BaseStrategy):
     name = "abcd"
     config: AbcdConfig
     LOOKBACK_BARS = 40
+
+    def __init__(self, config: AbcdConfig, pullback_quality_config: PullbackQualityConfig | None = None):
+        super().__init__(config)
+        self.pullback_quality_config = pullback_quality_config or PullbackQualityConfig()
 
     def evaluate(self, ctx: SymbolContext, now: datetime) -> Signal | None:
         cfg = self.config
@@ -59,12 +64,17 @@ class AbcdStrategy(BaseStrategy):
         if not (cfg.min_bc_pullback_pct <= bc_pullback_pct <= cfg.max_bc_pullback_pct):
             return None
 
-        validity = validate_pullback(pullback_bars=post_b, up_move_bars=pre_b, ctx=ctx)
+        validity = validate_pullback(
+            pullback_bars=post_b, up_move_bars=pre_b, ctx=ctx, config=self.pullback_quality_config
+        )
         if not validity.valid:
             return None
 
         current_bar = ctx.bars[-1]
         if current_bar.close <= b_high:
+            return None
+
+        if candle_strength(current_bar) < cfg.min_breakout_candle_strength:
             return None
 
         entry_price = current_bar.close

@@ -60,6 +60,17 @@ class RiskConfig(BaseModel):
     time_of_day_boost_start: time = time(7, 0)
     time_of_day_boost_end: time = time(10, 0)
     time_of_day_size_multiplier: float = Field(default=1.25, ge=1.0)
+    obvious_rank_threshold: int = Field(default=3, gt=0)  # "obvious" = top-N leading % gainers on the scanner
+    obvious_size_multiplier: float = Field(default=1.25, ge=1.0)
+    # Graduated retracement confidence: a bull_flag pullback retracing no
+    # more than this % of the spike is "ideal" per the source material
+    # ("I'd rather see it hovering in the top 25% of the move"), distinct
+    # from the hard 50% invalidation ceiling already enforced by
+    # bull_flag.max_pullback_pct -- a shallow pullback earns a size boost
+    # on top of the base size, same treatment as the catalyst/time-of-day/
+    # obviousness boosts above.
+    shallow_pullback_threshold_pct: float = Field(default=25.0, ge=0)
+    shallow_pullback_size_multiplier: float = Field(default=1.25, ge=1.0)
 
 
 class GapAndGoConfig(BaseModel):
@@ -74,6 +85,33 @@ class GapAndGoConfig(BaseModel):
     enable_float_filter: bool = True
     max_float_shares: float = 10_000_000
     min_float_rotation: float = 0.0  # today's cumulative volume / float; 0 = disabled (needs float_list.csv data)
+    min_breakout_candle_strength: float = Field(default=0.0, ge=-1.0, le=1.0)
+
+
+class PullbackQualityConfig(BaseModel):
+    """Shared entry-time dump-avoidance gates for bull_flag/abcd, on top of
+    the existing volume/VWAP/9EMA/MACD checks in pullback_validity.py --
+    "dip or dump" checklist items directly OHLCV-computable at entry time,
+    not just as an exit signal (is_topping_tail/is_high_volume_red_bar
+    already existed for PositionManager's reversal exit)."""
+
+    reject_topping_tail: bool = True
+    topping_tail_wick_ratio: float = Field(default=2.0, gt=0)
+    reject_high_volume_red_bar: bool = True
+    high_volume_red_bar_multiple: float = Field(default=2.0, gt=0)
+    # Multi-timeframe confirmation: the same MACD/topping-tail checks,
+    # recomputed on 5-minute bars resampled from the existing 1-minute
+    # history (no new IB subscription needed) -- catches a deteriorating
+    # 5-minute trend that a clean 1-minute pullback can mask.
+    require_5m_macd_confirmation: bool = True
+    reject_5m_topping_tail: bool = True
+    # Precise pairwise volume-profile rule: each pullback bar's volume must
+    # be lighter than the specific green candle immediately preceding the
+    # pullback (up_move_bars[-1]) -- a stricter, more targeted check than
+    # the aggregate "pullback total < up-move total" comparison above,
+    # which can still pass while one individual red bar in a multi-bar
+    # pullback outweighs the anchor green candle alone.
+    require_pullback_lighter_than_prior_green_bar: bool = True
 
 
 class BullFlagConfig(BaseModel):
@@ -85,6 +123,7 @@ class BullFlagConfig(BaseModel):
     stop_buffer_pct: float = 0.5
     target_r_multiple: float = 2.0
     min_rel_volume: float = 5.0  # Ross's stated hard floor -- "if it doesn't have at least 5x average volume, it's not worth touching"
+    min_breakout_candle_strength: float = Field(default=0.0, ge=-1.0, le=1.0)
 
 
 class AbcdConfig(BaseModel):
@@ -95,6 +134,7 @@ class AbcdConfig(BaseModel):
     stop_buffer_pct: float = 0.5
     target_r_multiple: float = 2.0
     min_rel_volume: float = 5.0  # same hard floor as the other strategies -- a blanket five-pillars criterion, not gap_and_go-specific
+    min_breakout_candle_strength: float = Field(default=0.0, ge=-1.0, le=1.0)
 
 
 class VwapReversionConfig(BaseModel):
@@ -202,6 +242,7 @@ class AppConfig(BaseModel):
     execution: ExecutionConfig = ExecutionConfig()
     risk: RiskConfig
     strategies: StrategiesConfig
+    pullback_quality: PullbackQualityConfig = PullbackQualityConfig()
     exits: ExitsConfig = ExitsConfig()
     news: NewsConfig = NewsConfig()
     notifications: NotificationsConfig = NotificationsConfig()

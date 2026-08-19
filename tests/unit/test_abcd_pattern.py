@@ -93,6 +93,20 @@ def test_does_not_retrigger_same_symbol_same_day():
     assert strategy.evaluate(ctx, NOW) is None
 
 
+def test_no_signal_when_breakout_candle_strength_below_default_threshold():
+    bars = PASSING_BARS[:-1] + [(12.3, 12.6, 12.1, 12.15, 1000)]  # closes above B's high but red/weak-bodied
+    ctx = make_ctx(bars)
+    strategy = AbcdStrategy(AbcdConfig())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_signal_when_breakout_candle_strength_gate_disabled():
+    bars = PASSING_BARS[:-1] + [(12.3, 12.6, 12.1, 12.15, 1000)]
+    ctx = make_ctx(bars)
+    strategy = AbcdStrategy(AbcdConfig(min_breakout_candle_strength=-1.0))
+    assert strategy.evaluate(ctx, NOW) is not None
+
+
 def test_no_signal_when_relative_volume_too_low():
     ctx = make_ctx(PASSING_BARS, avg_daily_volume=10_000_000)
     strategy = AbcdStrategy(AbcdConfig())

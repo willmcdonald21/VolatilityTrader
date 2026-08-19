@@ -21,6 +21,18 @@ def make_strategy() -> DummyStrategy:
     return DummyStrategy(DummyConfig())
 
 
+def test_ema_200_none_with_insufficient_bars():
+    ctx = SymbolContext(symbol="TEST")
+    ctx.bars = make_bars([(10.0, 10.0, 10.0, 10.0, 100)] * 60)  # matches the bot's real warmup window
+    assert ctx.ema_200 is None
+
+
+def test_ema_200_computed_once_enough_bars_available():
+    ctx = SymbolContext(symbol="TEST")
+    ctx.bars = make_bars([(10.0, 10.0, 10.0, 10.0, 100)] * 200)
+    assert ctx.ema_200 == 10.0
+
+
 def test_build_signal_attaches_catalyst_context_when_present():
     strategy = make_strategy()
     ctx = SymbolContext(symbol="TEST", catalyst_category="earnings", catalyst_headline="XYZ Reports Earnings")
@@ -59,6 +71,28 @@ def test_build_signal_preserves_caller_supplied_context_alongside_catalyst():
 
     assert signal.context["spike_high"] == 12.0
     assert signal.context["catalyst_category"] == "fda"
+
+
+def test_build_signal_attaches_scanner_rank_when_present():
+    strategy = make_strategy()
+    ctx = SymbolContext(symbol="TEST", scanner_rank=2)
+
+    signal = strategy._build_signal(
+        ctx, datetime.now(timezone.utc), entry_price=10.0, stop_price=9.0, target_r_multiple=2.0
+    )
+
+    assert signal.context["scanner_rank"] == 2
+
+
+def test_build_signal_omits_scanner_rank_when_absent():
+    strategy = make_strategy()
+    ctx = SymbolContext(symbol="TEST")
+
+    signal = strategy._build_signal(
+        ctx, datetime.now(timezone.utc), entry_price=10.0, stop_price=9.0, target_r_multiple=2.0
+    )
+
+    assert "scanner_rank" not in signal.context
 
 
 def _make_ctx_with_macd_trend(rising: bool) -> SymbolContext:

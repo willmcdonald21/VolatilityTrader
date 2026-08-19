@@ -25,6 +25,26 @@ risk:
   time_of_day_boost_start: "07:00" # historically highest-edge window (Ross Cameron: 7-10am ET, EU/US session overlap)
   time_of_day_boost_end: "10:00"
   time_of_day_size_multiplier: 1.25 # position-size boost applied to signals firing within the above window
+  obvious_rank_threshold: 3        # "obvious" = one of the top-N leading % gainers on the scanner ("Dip or Dump" checklist)
+  obvious_size_multiplier: 1.25    # position-size boost when the signal's symbol was top-N ranked at onboarding time
+  shallow_pullback_threshold_pct: 25.0  # "top 25% of the move" -- ideal/high-confidence retracement depth
+  shallow_pullback_size_multiplier: 1.25 # position-size boost when a bull_flag pullback retraces <= the threshold above
+
+pullback_quality:
+  # Entry-time "dip or dump" dump-avoidance checks, shared by bull_flag/abcd's
+  # pullback validity gate -- same underlying signals already used for the
+  # reversal *exit* (see exits.reversal_exit below), now also blocking entry
+  # into a pullback that already shows dump characteristics.
+  reject_topping_tail: true
+  topping_tail_wick_ratio: 2.0
+  reject_high_volume_red_bar: true
+  high_volume_red_bar_multiple: 2.0
+  # Multi-timeframe confirmation: re-check MACD/topping-tail on 5-minute bars
+  # resampled from the existing 1-minute history -- a clean 1-minute pullback
+  # can still sit under a deteriorating 5-minute trend.
+  require_5m_macd_confirmation: true
+  reject_5m_topping_tail: true
+  require_pullback_lighter_than_prior_green_bar: true  # each pullback bar's volume < the specific green candle right before the pullback
 
 strategies:
   gap_and_go:
@@ -39,6 +59,7 @@ strategies:
     enable_float_filter: true      # skips symbols missing from config/float_list.csv (graceful no-op until that file exists)
     max_float_shares: 10000000     # matches Ross Cameron's "5 Pillars" filter (<=10M, aggressive traders use 5M)
     min_float_rotation: 0.0        # day's cumulative volume / float; 0 = disabled (also needs float_list.csv data)
+    min_breakout_candle_strength: 0.0  # (close-open)/(high-low) of the breakout bar; 0.0 = must close net-bullish, not just above the level
   bull_flag:
     enabled: true
     min_spike_pct: 5.0            # minimum initial move (over lookback) to qualify as a spike
@@ -48,6 +69,7 @@ strategies:
     stop_buffer_pct: 0.5
     target_r_multiple: 2.0
     min_rel_volume: 5.0           # same hard floor -- blanket five-pillars criterion, not gap_and_go-specific
+    min_breakout_candle_strength: 0.0
   abcd:
     enabled: true
     min_ab_move_pct: 5.0          # minimum A->B spike size
@@ -56,6 +78,7 @@ strategies:
     stop_buffer_pct: 0.5
     target_r_multiple: 2.0
     min_rel_volume: 5.0           # same hard floor -- blanket five-pillars criterion
+    min_breakout_candle_strength: 0.0
   vwap_reversion:
     enabled: true
     max_vwap_distance_pct: 1.5    # price must be within this % of VWAP to qualify for a reversion entry

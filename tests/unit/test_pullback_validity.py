@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from tests.unit.fixtures import make_bars
+from warrior_bot.config import PullbackQualityConfig
 from warrior_bot.strategies.base_strategy import SymbolContext
 from warrior_bot.strategies.pullback_validity import validate_pullback
 
@@ -100,6 +101,98 @@ def test_rejects_when_macd_not_bullish():
     assert "MACD" in result.reason
 
 
+def test_rejects_when_topping_tail_in_pullback():
+    # 2-bar ctx: too little history for ema_9/1-min-macd/5-min-macd (all
+    # gracefully skip), isolating the new topping-tail-in-pullback gate.
+    # vwap ~= 10.317 here, so the pullback low (10.4) clears it.
+    ctx = make_ctx([(10.0, 10.5, 10.0, 10.4, 1000), (10.4, 10.45, 10.35, 10.4, 200)])
+    up_move = make_bars([(10.0, 10.5, 10.0, 10.4, 1000)])
+    pullback = make_bars([(10.4, 11.0, 10.4, 10.45, 50)])  # long upper wick, tiny body
+
+    result = validate_pullback(pullback, up_move, ctx)
+
+    assert not result.valid
+    assert result.reason == "topping tail in pullback"
+
+
+def test_rejects_when_high_volume_red_bar_in_pullback():
+    # 4 up-move bars, the last one a much bigger "spike" bar (volume 3000)
+    # -- avg_recent_volume=825, threshold=1650 -- so the pullback bar's
+    # volume (2000) clears the high-volume-red-bar threshold while still
+    # being lighter than both the up-move's *total* volume (3300, the
+    # aggregate gate) and the immediately preceding green candle's volume
+    # alone (3000, the pairwise gate), isolating this gate from those two.
+    up_move = make_bars(
+        [
+            (10.0, 10.1, 10.0, 10.1, 100),
+            (10.1, 10.2, 10.1, 10.2, 100),
+            (10.2, 10.3, 10.2, 10.3, 100),
+            (10.3, 10.4, 10.3, 10.4, 3000),
+        ]
+    )
+    ctx = make_ctx(
+        [
+            (10.0, 10.1, 10.0, 10.1, 100),
+            (10.1, 10.2, 10.1, 10.2, 100),
+            (10.2, 10.3, 10.2, 10.3, 100),
+            (10.3, 10.4, 10.3, 10.4, 3000),
+        ]
+    )
+    pullback = make_bars([(10.5, 10.55, 10.4, 10.45, 2000)])  # red, volume >= 2x avg_recent_volume(825)
+
+    result = validate_pullback(pullback, up_move, ctx)
+
+    assert not result.valid
+    assert result.reason == "high-volume red bar in pullback"
+
+
+def test_rejects_when_pullback_bar_exceeds_immediately_preceding_green_candle():
+    # Two up-move bars (baseline 100, spike 200 -- sum 300) and two
+    # pullback bars (210, 80 -- sum 290, *lighter* than the up-move total,
+    # so the aggregate gate passes) but the first pullback bar (210) alone
+    # exceeds the specific green spike candle right before it (200) --
+    # isolates the new pairwise gate from the aggregate one.
+    ctx = make_ctx([(10.0, 10.5, 10.0, 10.4, 1000), (10.4, 10.45, 10.35, 10.4, 200)])
+    up_move = make_bars([(10.0, 10.2, 10.0, 10.15, 100), (10.15, 10.6, 10.15, 10.5, 200)])
+    pullback = make_bars([(10.5, 10.55, 10.4, 10.45, 210), (10.45, 10.48, 10.4, 10.42, 80)])
+
+    result = validate_pullback(pullback, up_move, ctx)
+
+    assert not result.valid
+    assert result.reason == "pullback bar volume not lighter than the immediately preceding green candle"
+
+
+def test_pairwise_volume_gate_disabled_via_config():
+    ctx = make_ctx([(10.0, 10.5, 10.0, 10.4, 1000), (10.4, 10.45, 10.35, 10.4, 200)])
+    up_move = make_bars([(10.0, 10.2, 10.0, 10.15, 100), (10.15, 10.6, 10.15, 10.5, 200)])
+    pullback = make_bars([(10.5, 10.55, 10.4, 10.45, 210), (10.45, 10.48, 10.4, 10.42, 80)])
+    config = PullbackQualityConfig(require_pullback_lighter_than_prior_green_bar=False)
+
+    result = validate_pullback(pullback, up_move, ctx, config=config)
+
+    assert result.valid
+
+
+def test_dump_checklist_gates_disabled_via_config():
+    # Same topping-tail pullback bar as above, but every new gate disabled
+    # -- should pass, proving the checks are genuinely opt-out, not just
+    # individually threshold-tunable.
+    ctx = make_ctx([(10.0, 10.5, 10.0, 10.4, 1000), (10.4, 10.45, 10.35, 10.4, 200)])
+    up_move = make_bars([(10.0, 10.5, 10.0, 10.4, 1000)])
+    pullback = make_bars([(10.4, 11.0, 10.4, 10.45, 50)])
+    config = PullbackQualityConfig(
+        reject_topping_tail=False,
+        reject_high_volume_red_bar=False,
+        require_5m_macd_confirmation=False,
+        reject_5m_topping_tail=False,
+        require_pullback_lighter_than_prior_green_bar=False,
+    )
+
+    result = validate_pullback(pullback, up_move, ctx, config=config)
+
+    assert result.valid
+
+
 def test_valid_pullback_with_all_gates_available_and_passing():
     closes = [15.0] * 20 + [15.0 + 0.5 * i for i in range(1, 15)]  # sustained rise -> bullish MACD
     ctx = make_ctx([(c, c, c, c, 1000) for c in closes])
@@ -114,3 +207,49 @@ def test_valid_pullback_with_all_gates_available_and_passing():
 
     assert result.valid
     assert result.reason is None
+
+
+def test_rejects_on_5_minute_macd_veto_despite_bullish_1_minute_macd():
+    # Three phases: a long gentle decline (100 bars), an accelerating
+    # steeper decline into the reversal (30 bars), then a bounce (9 bars).
+    # The accelerating phase keeps the slower-reacting 5-minute MACD
+    # (9/20-*bucket* EMAs) still clearly bearish at the moment of the
+    # bounce, while the fast-reacting 1-minute MACD (9/20-*bar* EMAs) picks
+    # up the bounce quickly enough to read bullish -- exactly the "clean
+    # fast timeframe, deteriorating slow timeframe" divergence the
+    # multi-timeframe veto exists to catch. Volume is deliberately tiny on
+    # the long history and real only on the last few bounce bars, so
+    # ctx.vwap tracks the recent price level instead of the historical
+    # decline (same isolation technique the existing vwap/ema tests use) --
+    # otherwise the earlier VWAP gate would reject first and this
+    # wouldn't isolate the new 5-minute check. (Parameters found by
+    # search, not hand-derived -- MACD crossover timing on a resampled
+    # series isn't tractable to compute by hand; see the sanity-check
+    # asserts below.)
+    closes = [500.0 - 0.1 * i for i in range(100)]
+    for i in range(1, 31):
+        closes.append(closes[-1] - 0.3 * i)
+    for _ in range(9):
+        closes.append(closes[-1] + 2.0)
+    volumes = [0.01] * (len(closes) - 6) + [1000.0] * 6
+    ctx = make_ctx(list(zip(closes, closes, closes, closes, volumes)))
+
+    one_min_macd = ctx.macd(fast=9, slow=20)
+    assert one_min_macd is not None
+    assert one_min_macd[0] > one_min_macd[1]  # sanity check: bullish as constructed
+
+    from warrior_bot.strategies.indicators import macd, resample_bars
+
+    five_min_macd = macd(resample_bars(ctx.bars, bucket_minutes=5), fast=9, slow=20)
+    assert five_min_macd is not None
+    assert five_min_macd[0] <= five_min_macd[1]  # sanity check: still bearish as constructed
+
+    up_move = make_bars([(closes[-2], closes[-2] + 0.1, closes[-2], closes[-1], 1000)])
+    pullback = make_bars([(closes[-1], closes[-1] + 0.05, closes[-1] - 0.05, closes[-1], 50)])
+    assert pullback[0].low >= ctx.vwap  # sanity check: isolates the 5-min gate from the VWAP gate
+    assert pullback[0].low >= ctx.ema_9  # sanity check: isolates the 5-min gate from the 9 EMA gate
+
+    result = validate_pullback(pullback, up_move, ctx)
+
+    assert not result.valid
+    assert result.reason == "5-minute MACD not bullish (multi-timeframe veto)"

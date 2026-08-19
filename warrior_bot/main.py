@@ -75,9 +75,9 @@ class WarriorBot:
         if config.strategies.gap_and_go.enabled:
             self.strategies.append(GapAndGoStrategy(config.strategies.gap_and_go, float_provider=float_provider))
         if config.strategies.bull_flag.enabled:
-            self.strategies.append(BullFlagStrategy(config.strategies.bull_flag))
+            self.strategies.append(BullFlagStrategy(config.strategies.bull_flag, config.pullback_quality))
         if config.strategies.abcd.enabled:
-            self.strategies.append(AbcdStrategy(config.strategies.abcd))
+            self.strategies.append(AbcdStrategy(config.strategies.abcd, config.pullback_quality))
         if config.strategies.vwap_reversion.enabled:
             self.strategies.append(VwapReversionStrategy(config.strategies.vwap_reversion))
 
@@ -118,9 +118,9 @@ class WarriorBot:
                 continue
             try:
                 symbols = await scan_candidates(self.ib, self.config)
-                for symbol in symbols:
+                for rank, symbol in enumerate(symbols, start=1):
                     if symbol not in self.contexts:
-                        await self._onboard_symbol(symbol)
+                        await self._onboard_symbol(symbol, scanner_rank=rank)
             except Exception:
                 self.logger.exception("Scan loop iteration failed")
             await asyncio.sleep(self.config.scanner.refresh_seconds)
@@ -155,14 +155,14 @@ class WarriorBot:
         self.journal.record_kill_switch_event(triggered_by=reason, action_taken="cancel_all+flatten_all")
         self._flattened_today = True
 
-    async def _onboard_symbol(self, symbol: str) -> None:
+    async def _onboard_symbol(self, symbol: str, scanner_rank: int | None = None) -> None:
         try:
             contract = await self.ib_client.qualify_stock(symbol)
         except Exception:
             self.logger.exception("Could not qualify contract for %s", symbol)
             return
 
-        ctx = SymbolContext(symbol=symbol)
+        ctx = SymbolContext(symbol=symbol, scanner_rank=scanner_rank)
 
         try:
             ctx.prior_close = await fetch_prior_close(self.ib, contract)
@@ -225,12 +225,13 @@ class WarriorBot:
         keep_updated.updateEvent += on_update
         self._subscriptions[symbol] = keep_updated
         self.logger.info(
-            "Onboarded %s: prior_close=%s avg_daily_volume=%s bars=%d catalyst=%s",
+            "Onboarded %s: prior_close=%s avg_daily_volume=%s bars=%d catalyst=%s scanner_rank=%s",
             symbol,
             ctx.prior_close,
             ctx.avg_daily_volume,
             len(ctx.bars),
             ctx.catalyst_category or "none",
+            ctx.scanner_rank,
         )
 
     def _on_new_bar(self, contract: Contract, ctx: SymbolContext) -> None:

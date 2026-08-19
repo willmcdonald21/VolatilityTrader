@@ -108,6 +108,25 @@ class RiskManager:
             # existing risk budget, not a bigger risk budget.
             raw_shares = math.floor(raw_shares * self.config.catalyst_size_multiplier)
 
+        scanner_rank = signal.context.get("scanner_rank")
+        if scanner_rank is not None and scanner_rank <= self.config.obvious_rank_threshold:
+            # "Obviousness" boost -- Warrior Trading's "Dip or Dump" dump
+            # checklist: a stock outside the top-N leading % gainers lacks
+            # the crowd participation needed to keep absorbing profit-taking
+            # during a pullback. Same soft size-boost treatment as the
+            # catalyst/time-of-day multipliers, not a hard entry gate.
+            raw_shares = math.floor(raw_shares * self.config.obvious_size_multiplier)
+
+        pullback_pct = signal.context.get("pullback_pct")
+        if pullback_pct is not None and pullback_pct <= self.config.shallow_pullback_threshold_pct:
+            # Graduated retracement confidence -- "I'd rather see it
+            # hovering in the top 25% of the move": a shallow bull_flag
+            # pullback is higher-confidence than one merely under the hard
+            # 50% invalidation ceiling (bull_flag.max_pullback_pct, already
+            # enforced before a signal ever reaches here). Same soft
+            # size-boost treatment as the other multipliers above.
+            raw_shares = math.floor(raw_shares * self.config.shallow_pullback_size_multiplier)
+
         if now is not None:
             # Only applied when the caller supplies a clock reading -- never
             # guessed from wall-clock time, so sizing stays deterministic

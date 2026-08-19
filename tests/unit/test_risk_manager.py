@@ -40,6 +40,10 @@ def make_risk_manager(tmp_path, snapshot, **risk_overrides) -> RiskManager:
         cushion_profit_fraction=risk_overrides.get("cushion_profit_fraction", 0.25),
         cushion_size_fraction=risk_overrides.get("cushion_size_fraction", 0.25),
         catalyst_size_multiplier=risk_overrides.get("catalyst_size_multiplier", 1.25),
+        obvious_rank_threshold=risk_overrides.get("obvious_rank_threshold", 3),
+        obvious_size_multiplier=risk_overrides.get("obvious_size_multiplier", 1.25),
+        shallow_pullback_threshold_pct=risk_overrides.get("shallow_pullback_threshold_pct", 25.0),
+        shallow_pullback_size_multiplier=risk_overrides.get("shallow_pullback_size_multiplier", 1.25),
     )
     account_state = FakeAccountState(snapshot)
     return RiskManager(config, account_state, kill_switch_path=tmp_path / "KILL_SWITCH")
@@ -164,6 +168,72 @@ def test_catalyst_boost_still_capped_by_hard_limits(tmp_path):
     assert decision.accepted
     # raw_shares(100) * 100 = 10,000 -- but still clamped to max_position_notional_usd(5000)/entry(10)
     assert decision.sized_qty == 500
+
+
+def test_obvious_rank_signal_gets_size_boost(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, obvious_rank_threshold=3, obvious_size_multiplier=1.25)
+    signal = make_signal(entry=10.0, stop=9.0, context={"scanner_rank": 1})
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 125  # raw_shares(100) * 1.25
+
+
+def test_rank_outside_obvious_threshold_no_size_boost(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, obvious_rank_threshold=3, obvious_size_multiplier=1.25)
+    signal = make_signal(entry=10.0, stop=9.0, context={"scanner_rank": 10})
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 100  # unboosted -- rank 10 is outside the top-3 threshold
+
+
+def test_no_scanner_rank_no_size_boost(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01)
+    signal = make_signal(entry=10.0, stop=9.0)  # no scanner_rank in context
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 100
+
+
+def test_shallow_pullback_signal_gets_size_boost(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, shallow_pullback_threshold_pct=25.0, shallow_pullback_size_multiplier=1.25)
+    signal = make_signal(entry=10.0, stop=9.0, context={"pullback_pct": 10.0})  # well within the top-25% band
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 125  # raw_shares(100) * 1.25
+
+
+def test_deep_but_valid_pullback_no_size_boost(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, shallow_pullback_threshold_pct=25.0, shallow_pullback_size_multiplier=1.25)
+    signal = make_signal(entry=10.0, stop=9.0, context={"pullback_pct": 40.0})  # valid but deeper than the shallow threshold
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 100  # unboosted
+
+
+def test_no_pullback_pct_no_size_boost(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01)
+    signal = make_signal(entry=10.0, stop=9.0)  # no pullback_pct in context (e.g. a gap_and_go signal)
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 100
 
 
 def test_time_of_day_boost_applied_within_window(tmp_path):

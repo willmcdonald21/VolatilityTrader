@@ -88,6 +88,34 @@ def test_no_signal_outside_price_band():
     assert strategy.evaluate(ctx, NOW) is None
 
 
+def test_no_signal_when_breakout_candle_strength_below_default_threshold():
+    ctx = make_ctx(
+        [
+            (5.5, 5.7, 5.4, 5.6, 1000),
+            (5.6, 5.8, 5.5, 5.7, 1000),
+            (5.7, 5.9, 5.6, 5.75, 1000),
+            (5.75, 5.85, 5.7, 5.8, 1000),
+            (6.0, 7.0, 5.85, 5.95, 1000),  # closes above breakout_high(5.9) but red/weak-bodied
+        ]
+    )
+    strategy = GapAndGoStrategy(default_config())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_signal_when_breakout_candle_strength_gate_disabled():
+    ctx = make_ctx(
+        [
+            (5.5, 5.7, 5.4, 5.6, 1000),
+            (5.6, 5.8, 5.5, 5.7, 1000),
+            (5.7, 5.9, 5.6, 5.75, 1000),
+            (5.75, 5.85, 5.7, 5.8, 1000),
+            (6.0, 7.0, 5.85, 5.95, 1000),
+        ]
+    )
+    strategy = GapAndGoStrategy(default_config(min_breakout_candle_strength=-1.0))
+    assert strategy.evaluate(ctx, NOW) is not None
+
+
 def test_no_signal_when_relative_volume_too_low():
     ctx = make_ctx(
         [

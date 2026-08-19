@@ -12,6 +12,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from warrior_bot.config import load_config
 
+# Ross Cameron's own stated rule: don't draw conclusions about a strategy's
+# edge from fewer than ~100 trades -- a handful of losses is statistically
+# meaningless noise against a strategy with a genuine (but non-100%) win
+# rate, and over-reacting to it is a leading cause of abandoning a working
+# strategy prematurely.
+MIN_TRADES_FOR_CONCLUSIONS = 100
+
 
 def main() -> None:
     config = load_config()
@@ -48,10 +55,19 @@ def main() -> None:
         print("No accepted trades in the journal yet.")
     else:
         print(f"{'Strategy':<16} {'Trades':>7} {'Win%':>7} {'PnL':>10} {'Avg R':>8}")
+        low_sample_strategies = []
         for strategy, b in sorted(by_strategy.items()):
             win_pct = (b["wins"] / b["trades"] * 100) if b["trades"] else 0.0
             avg_r = b["r_sum"] / b["trades"] if b["trades"] else 0.0
-            print(f"{strategy:<16} {b['trades']:>7} {win_pct:>6.1f}% {b['pnl']:>10.2f} {avg_r:>8.2f}")
+            flag = " *" if b["trades"] < MIN_TRADES_FOR_CONCLUSIONS else ""
+            print(f"{strategy:<16} {b['trades']:>7} {win_pct:>6.1f}% {b['pnl']:>10.2f} {avg_r:>8.2f}{flag}")
+            if b["trades"] < MIN_TRADES_FOR_CONCLUSIONS:
+                low_sample_strategies.append(strategy)
+        if low_sample_strategies:
+            print(
+                f"\n* fewer than {MIN_TRADES_FOR_CONCLUSIONS} trades ({', '.join(low_sample_strategies)}) -- "
+                "too small a sample to judge whether the strategy has a real edge yet."
+            )
 
     rejections = conn.execute(
         "SELECT reason, COUNT(*) as n FROM rejections GROUP BY reason ORDER BY n DESC"

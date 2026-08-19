@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from warrior_bot.config import BullFlagConfig
+from warrior_bot.config import BullFlagConfig, PullbackQualityConfig
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
+from warrior_bot.strategies.indicators import candle_strength
 from warrior_bot.strategies.pullback_validity import validate_pullback
 from warrior_bot.utils.time_utils import session_elapsed_fraction
 
@@ -12,11 +13,26 @@ from warrior_bot.utils.time_utils import session_elapsed_fraction
 class BullFlagStrategy(BaseStrategy):
     """Momentum spike followed by a tight pullback/consolidation (the
     "flag"), entered on the break of the flag's high. Stop below the flag
-    low."""
+    low.
+
+    Per the source material, "micro pullback" and "bull flag" name the
+    *same* pattern -- only the chart timeframe differs (micro pullback on
+    10-second/1-minute bars, bull flag on 5-minute+ bars). This bot only
+    ever ingests 1-minute bars, so every signal this class produces is,
+    strictly speaking, a micro pullback; the "bull_flag" name is kept for
+    continuity with the rest of the codebase/config, not as a claim about
+    timeframe. Running this same detection logic against 5-minute-resampled
+    bars (a genuine slower-timeframe "bull flag" pass) is a deferred,
+    separate piece of work -- see docs/strategy_decisions.md.
+    """
 
     name = "bull_flag"
     config: BullFlagConfig
     LOOKBACK_BARS = 40
+
+    def __init__(self, config: BullFlagConfig, pullback_quality_config: PullbackQualityConfig | None = None):
+        super().__init__(config)
+        self.pullback_quality_config = pullback_quality_config or PullbackQualityConfig()
 
     def evaluate(self, ctx: SymbolContext, now: datetime) -> Signal | None:
         cfg = self.config
@@ -57,13 +73,18 @@ class BullFlagStrategy(BaseStrategy):
         if pullback_pct > cfg.max_pullback_pct:
             return None
 
-        validity = validate_pullback(pullback_bars=consolidation, up_move_bars=pre_spike, ctx=ctx)
+        validity = validate_pullback(
+            pullback_bars=consolidation, up_move_bars=pre_spike, ctx=ctx, config=self.pullback_quality_config
+        )
         if not validity.valid:
             return None
 
         flag_high = max(b.high for b in consolidation)
         current_bar = ctx.bars[-1]
         if current_bar.close <= flag_high:
+            return None
+
+        if candle_strength(current_bar) < cfg.min_breakout_candle_strength:
             return None
 
         entry_price = current_bar.close

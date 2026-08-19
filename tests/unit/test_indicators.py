@@ -3,6 +3,7 @@ from __future__ import annotations
 from tests.unit.fixtures import flat_bars, make_bars
 from warrior_bot.strategies.indicators import (
     average_true_range,
+    candle_strength,
     ema,
     gap_pct,
     is_high_volume_red_bar,
@@ -13,6 +14,7 @@ from warrior_bot.strategies.indicators import (
     macd,
     opening_range,
     relative_volume,
+    resample_bars,
     trailing_candidate,
     vwap,
 )
@@ -178,6 +180,70 @@ def test_is_high_volume_red_bar_false_when_not_red():
 def test_is_high_volume_red_bar_false_when_volume_not_elevated():
     bar = make_bars([(10.4, 10.5, 10.0, 10.1, 1500)])[0]  # red, but not 2x the average
     assert is_high_volume_red_bar(bar, avg_recent_volume=1000, multiple=2.0) is False
+
+
+def test_resample_bars_empty_returns_empty():
+    assert resample_bars([], bucket_minutes=5) == []
+
+
+def test_resample_bars_zero_bucket_returns_empty():
+    bars = make_bars([(10.0, 10.5, 9.8, 10.2, 100)])
+    assert resample_bars(bars, bucket_minutes=0) == []
+
+
+def test_resample_bars_groups_into_5_minute_buckets():
+    # 7 one-minute bars starting exactly on a 5-minute wall-clock boundary
+    # (fixtures.BASE_TIME is 09:30 UTC) -> bucket 1 gets minutes :30-:34
+    # (5 bars), bucket 2 gets :35-:36 (2 bars, a partial/forming bucket).
+    bars = make_bars(
+        [
+            (10.0, 10.5, 9.8, 10.2, 100),
+            (10.2, 10.6, 10.1, 10.4, 100),
+            (10.4, 10.8, 10.3, 10.6, 100),
+            (10.6, 10.7, 10.2, 10.3, 100),
+            (10.3, 10.9, 10.3, 10.8, 100),
+            (10.8, 11.0, 10.7, 10.9, 100),
+            (10.9, 11.1, 10.8, 11.0, 100),
+        ]
+    )
+    resampled = resample_bars(bars, bucket_minutes=5)
+    assert len(resampled) == 2
+    first, second = resampled
+    assert first.open == 10.0
+    assert first.high == 10.9
+    assert first.low == 9.8
+    assert first.close == 10.8
+    assert first.volume == 500
+    assert second.open == 10.8
+    assert second.high == 11.1
+    assert second.low == 10.7
+    assert second.close == 11.0
+    assert second.volume == 200
+
+
+def test_candle_strength_full_bodied_green_is_plus_one():
+    bar = make_bars([(10.0, 11.0, 10.0, 11.0, 1000)])[0]  # open=low, close=high
+    assert candle_strength(bar) == 1.0
+
+
+def test_candle_strength_full_bodied_red_is_minus_one():
+    bar = make_bars([(11.0, 11.0, 10.0, 10.0, 1000)])[0]  # open=high, close=low
+    assert candle_strength(bar) == -1.0
+
+
+def test_candle_strength_green_with_large_upper_wick_is_weaker_than_full_bodied():
+    bar = make_bars([(10.0, 11.0, 9.95, 10.05, 1000)])[0]  # closes green but barely, long upper wick
+    assert 0 < candle_strength(bar) < 1.0
+
+
+def test_candle_strength_red_with_large_lower_wick_is_less_bearish_than_full_bodied():
+    bar = make_bars([(10.05, 10.05, 9.0, 9.95, 1000)])[0]  # closes red but barely, long lower wick
+    assert -1.0 < candle_strength(bar) < 0
+
+
+def test_candle_strength_zero_range_returns_zero():
+    bar = make_bars([(10.0, 10.0, 10.0, 10.0, 1000)])[0]
+    assert candle_strength(bar) == 0.0
 
 
 def test_is_lower_low_true():
