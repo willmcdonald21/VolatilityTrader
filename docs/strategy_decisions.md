@@ -6,7 +6,8 @@ notes folder (`warrior_trading_strategy_notes.md`, `warrior_trading_roadmap_note
 `warrior_trading_execution_risk_notes.md`, `warrior_trading_dip_or_dump_notes.md`,
 `warrior_trading_candlestick_deep_dive_notes.md`, `warrior_trading_three_concepts_notes.md`,
 `warrior_trading_5_failure_causes_notes.md`, `warrior_trading_raw_candlesticks_notes.md`,
-`warrior_trading_ta_master_class_notes.md`, `warrior_trading_dip_buying_notes.md`).
+`warrior_trading_ta_master_class_notes.md`, `warrior_trading_dip_buying_notes.md`,
+`warrior_trading_leverage_mechanics_notes.md`).
 This file tracks findings from that material that were considered but
 **not** implemented, and why, so the reasoning isn't lost. Implemented
 findings are just... implemented; see `bull_flag.py`/`abcd_pattern.py`
@@ -97,6 +98,77 @@ surfaced by checking each item against the actual code:
   breaker" section below; still explicitly deferred at the maintainer's
   request, now with this file's concrete numbers recorded for whenever
   it's revisited deliberately.
+
+## "Leverage Mechanics & Small-Account Day-One Walkthrough" additions
+
+This transcript's new content is a statistical justification for the gain%
+filter, worked leverage/buying-power numbers, one new named exit pattern,
+an L2 concept distinct from the single-large-seller signal already
+deferred, and named terminology ("resulting") for a bias the journal
+review framework already guards against structurally. No net-new,
+concretely-specified, low-risk rule surfaced -- everything below is either
+a reinforcement of an existing implementation or a deferral for the same
+reason as an already-deferred item.
+
+**Confirmed already correct, no change needed:**
+- **The >=10% gain filter as outlier detection, not an arbitrary cutoff.**
+  The transcript's explicit statistical framing (most stocks trade within
+  a normal +/-4-5% daily range; a >10% mover is a rare statistical outlier,
+  typically only ~5-10 out of the whole tradeable universe on a given day)
+  is exactly what `gap_and_go.min_gap_pct: 10.0` already encodes
+  (`config.yaml`) -- this file adds the *why*, not a new threshold. Same
+  reinforcement for `min_rel_volume: 5.0` (all four strategies,
+  `config.yaml`): this transcript restates the "90% of my profit comes
+  from >5x relative volume" stat cited in an earlier session, confirming
+  that stat's "5x" reading (not a literal "500x") is the one already coded.
+- **Leverage/buying-power sizing model.** The transcript's worked example
+  (6x leverage: $1,000 cash -> $6,000 buying power; risk is a function of
+  stop distance, not notional size; buying power, not equity, gates max
+  position size) describes exactly the two-quantity model already in place:
+  `AccountState.snapshot()` (`account_state.py`) polls `net_liquidation`
+  and `buying_power` as two independently-reported IBKR values, never one
+  derived from the other. `RiskManager._size_position` (`risk_manager.py`)
+  computes `dollar_risk_budget` from `net_liquidation` (equity) via
+  `risk_per_trade_pct`, entirely independent of `cap_by_buying_power =
+  buying_power / entry_price`, which caps notional position size
+  separately. This is the same "position size vs. dollar-risk
+  independence" principle already confirmed for the (unleveraged) GX
+  example under "Implemented: candlestick deep-dive additions" above --
+  this transcript's contribution is a leveraged small-account worked
+  example of the identical mechanic, not a new one.
+- **Stair-stepping at half-/whole-dollar levels** (the NEXI $19.00 ->
+  $19.50 -> $20.00 walkthrough) is the same behavior
+  `round_number_breakout` already captures (see "Implemented: 'TA Master
+  Class' additions" below) -- another live-trade instance of an existing
+  signal, not a new one.
+- **"Resulting" bias** (Annie Duke's term for judging a decision by its
+  outcome instead of its process) is named terminology for the same gap
+  already tracked under "Deferred: trade rule-adherence tagging" below --
+  see that section for the reinforcement; no new deferral needed.
+- **"Stacked sellers"** (many moderate resting sell orders across several
+  price levels near resistance, vs. one large order at one level) is a
+  variant of the same L2/order-book gap already tracked under "Deferred:
+  sector heat and Level 2 / order-book features" below -- see that section
+  for the reinforcement; no new deferral needed.
+
+**Deferred:**
+- **"Jackknife" exit indicator** (a squeeze-up that reverses sharply within
+  the same or immediately next bar -- faster/sharper than an ordinary
+  topping tail). Conceptually a stricter, graduated-severity variant of
+  the already-implemented `is_topping_tail()` (`indicators.py`), but the
+  transcript gives no numeric wick-ratio or bar-count threshold to
+  distinguish "jackknife" from an ordinary topping tail -- same category of
+  risk already avoided for "regime-dependent sizing" and the deferred
+  trend-line/S/R work above (implementing a threshold not actually
+  specified in the source material would be inventing an untested
+  heuristic, not extracting one). The "speed" dimension specifically would
+  also need sub-minute resolution to distinguish from a same-bar-only
+  shape check, which is the same architecture gap as the existing
+  "Deferred: sub-minute (10-second) micro-pullback resolution" section.
+  **Status: not implemented.** If/when revisited with a concrete threshold,
+  the natural home is `PositionManager._check_reversal_exit`
+  (`position_manager.py`) alongside the existing `topping_tail` reason, at
+  a stricter `wick_ratio` than the default `2.0`.
 
 ## Implemented: "TA Master Class" additions
 
@@ -719,6 +791,16 @@ Three of the six source-material exit indicators fall in this bucket too
 (topping tail, red-after-green, volume burst) are implemented in
 `PositionManager`'s reversal-exit check.
 
+The leverage-mechanics transcript's "stacked sellers" (many moderate
+resting sell orders spread across several price levels near a resistance
+point, functionally the same overhead-supply signal as one large order,
+just distributed) is the same gap, not a new one — still needs
+market-depth data this bot doesn't subscribe to. If/when L2 support is
+ever added, worth summing resting ask-side size across a price band near
+a target level (not just checking best-ask or a single abnormal-size
+order) so this shape is covered by the same feature as the single-large-
+seller case, rather than needing two separate detectors.
+
 ## Deferred: price "sweet spot" ($5-$10) and arbitrary tighter stops
 
 - The roadmap transcript refines the $1-$20 price band to a $5-$10
@@ -743,6 +825,19 @@ rule-adherence flag. Would need a defined "expected" entry/exit price to
 diff the actual fill against. The execution/risk transcript's
 "successful red day" framing (was the day successful by process, not just
 P&L) and its rule-adherence-as-a-metric idea are the same underlying gap.
+
+The leverage-mechanics transcript names this same principle "resulting"
+(Annie Duke's term, from *Thinking in Bets*, for judging a decision by its
+outcome rather than the quality of the reasoning behind it at the time it
+was made) — worth keeping as the searchable term if this is ever built
+out, since it's a precise match for what a rule-adherence flag would
+actually be grading against. Doesn't change the deferral: this bot's
+signals are already 100% rule-adherent by construction (see "Confirmed
+already correct" under "Implemented: 'TA Master Class' additions" above,
+which is the distinct-but-related "is the rule set itself well
+calibrated" question), so a "resulting"-aware tag would only ever have
+something to flag for a human reviewing *why* a rule fired the way it did
+— not for catching an automated rule violation, since none can occur.
 
 ## Deferred: marketable-limit conversion for the kill switch and reversal exit
 
