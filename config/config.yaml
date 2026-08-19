@@ -32,6 +32,7 @@ risk:
   starter_trade_size_multiplier: 0.5     # smaller-than-normal size on the day's first trade ("starter position" regime test)
   starter_trade_downgrade_multiplier: 0.5 # applied to all trades for the rest of the session if the starter trade lost
   bottoming_tail_size_multiplier: 1.25   # boost when the pullback low bar is a bottoming tail ("hammering out the base")
+  round_number_size_multiplier: 1.25     # boost when the breakout candle crosses a psychological round-number level
 
 pullback_quality:
   # Entry-time "dip or dump" dump-avoidance checks, shared by bull_flag/abcd's

@@ -4,6 +4,7 @@ from tests.unit.fixtures import flat_bars, make_bars
 from warrior_bot.strategies.indicators import (
     average_true_range,
     candle_strength,
+    crossed_round_number,
     ema,
     gap_pct,
     is_bottoming_tail,
@@ -17,6 +18,7 @@ from warrior_bot.strategies.indicators import (
     opening_range,
     relative_volume,
     resample_bars,
+    round_number_increment,
     trailing_candidate,
     vwap,
 )
@@ -268,6 +270,45 @@ def test_is_momentum_exhausted_false_with_insufficient_bars():
 def test_is_momentum_exhausted_respects_custom_lookback():
     bars = make_bars(EXHAUSTION_BARS_SHRINKING_BODY_AND_VOLUME[:2])
     assert is_momentum_exhausted(bars, lookback=2) is True
+
+
+def test_round_number_increment_half_dollar_below_ten():
+    assert round_number_increment(5.0) == 0.5
+    assert round_number_increment(9.99) == 0.5
+
+
+def test_round_number_increment_whole_dollar_at_or_above_ten():
+    assert round_number_increment(10.0) == 1.0
+    assert round_number_increment(25.0) == 1.0
+
+
+def test_crossed_round_number_true_crossing_one_dollar():
+    assert crossed_round_number(prior_price=0.95, current_price=1.05) is True
+
+
+def test_crossed_round_number_true_crossing_half_dollar_below_ten():
+    assert crossed_round_number(prior_price=5.45, current_price=5.55) is True
+
+
+def test_crossed_round_number_true_crossing_whole_dollar_above_ten():
+    assert crossed_round_number(prior_price=24.7, current_price=25.3) is True
+
+
+def test_crossed_round_number_false_when_no_level_crossed():
+    assert crossed_round_number(prior_price=5.1, current_price=5.4) is False
+
+
+def test_crossed_round_number_false_when_price_did_not_rise():
+    assert crossed_round_number(prior_price=1.05, current_price=0.95) is False
+
+
+def test_crossed_round_number_false_when_price_unchanged():
+    assert crossed_round_number(prior_price=1.0, current_price=1.0) is False
+
+
+def test_crossed_round_number_uses_prior_price_granularity():
+    # starts under $10 (half-dollar grid) even though it ends above $10
+    assert crossed_round_number(prior_price=9.8, current_price=10.2) is True
 
 
 def test_resample_bars_empty_returns_empty():

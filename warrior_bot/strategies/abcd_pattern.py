@@ -5,7 +5,7 @@ from datetime import datetime
 from warrior_bot.config import AbcdConfig, PullbackQualityConfig
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
-from warrior_bot.strategies.indicators import candle_strength, is_bottoming_tail
+from warrior_bot.strategies.indicators import candle_strength, crossed_round_number, is_bottoming_tail
 from warrior_bot.strategies.pullback_validity import validate_pullback
 from warrior_bot.utils.time_utils import session_elapsed_fraction
 
@@ -83,6 +83,7 @@ class AbcdStrategy(BaseStrategy):
         if stop_price >= entry_price:
             return None
 
+        prior_bar = ctx.bars[-2]
         state["triggered"] = True
         return self._build_signal(
             ctx,
@@ -96,5 +97,6 @@ class AbcdStrategy(BaseStrategy):
                 "c_low": c_low,
                 "bc_pullback_pct": bc_pullback_pct,
                 "bottoming_tail_confirmation": is_bottoming_tail(c_low_bar),
+                "round_number_breakout": crossed_round_number(prior_bar.close, current_bar.close),
             },
         )

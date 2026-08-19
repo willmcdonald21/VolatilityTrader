@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -102,6 +103,32 @@ def is_red_to_green(prior_close: float, current_price: float, prior_price: float
     """True on the bar where price crosses from below prior_close (red) to
     at/above prior_close (green)."""
     return prior_price < prior_close <= current_price
+
+
+def round_number_increment(price: float) -> float:
+    """Psychological price-level granularity: half-dollar increments below
+    $10, whole-dollar at/above $10 -- source material's explicit split
+    (low-priced stocks cluster orders at half-dollar levels; above ~$10
+    the granularity that matters shifts to whole dollars)."""
+    return 0.5 if price < 10.0 else 1.0
+
+
+def crossed_round_number(prior_price: float, current_price: float) -> bool:
+    """True if price just crossed upward through a psychological
+    round-number level it was still below -- a breakout through horizontal
+    resistance at a level where resting sell/take-profit orders cluster
+    (source material's own strongest example: $1.00 for low-priced
+    stocks, "very hard... to break and hold over $1"). Granularity is
+    based on `prior_price` (the level being broken *from*), not the
+    post-breakout price, so a move from $9.80 to $10.20 is correctly
+    evaluated against the $0.50 grid it started on, not the $1 grid it
+    ends on."""
+    if current_price <= prior_price:
+        return False
+    increment = round_number_increment(prior_price)
+    prior_level = math.floor(prior_price / increment)
+    current_level = math.floor(current_price / increment)
+    return current_level > prior_level
 
 
 def swing_points(bars: list[Bar], window: int = 2) -> list[tuple[int, str, float]]:

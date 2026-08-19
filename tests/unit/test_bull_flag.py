@@ -39,6 +39,7 @@ def test_flag_breakout_triggers_signal():
     assert signal.strategy == "bull_flag"
     assert signal.entry_price == 12.2
     assert signal.stop_price < signal.entry_price
+    assert signal.context["round_number_breakout"] is True  # crosses $12.0 on the breakout bar
 
 
 def test_bottoming_tail_confirmation_false_for_normal_pullback():

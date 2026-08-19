@@ -5,7 +5,8 @@ notes folder (`warrior_trading_strategy_notes.md`, `warrior_trading_roadmap_note
 `warrior_trading_full_course_notes.md`, `warrior_trading_candlestick_pattern_notes.md`,
 `warrior_trading_execution_risk_notes.md`, `warrior_trading_dip_or_dump_notes.md`,
 `warrior_trading_candlestick_deep_dive_notes.md`, `warrior_trading_three_concepts_notes.md`,
-`warrior_trading_5_failure_causes_notes.md`, `warrior_trading_raw_candlesticks_notes.md`).
+`warrior_trading_5_failure_causes_notes.md`, `warrior_trading_raw_candlesticks_notes.md`,
+`warrior_trading_ta_master_class_notes.md`).
 This file tracks findings from that material that were considered but
 **not** implemented, and why, so the reasoning isn't lost. Implemented
 findings are just... implemented; see `bull_flag.py`/`abcd_pattern.py`
@@ -16,6 +17,97 @@ stock-level 9/20 MACD disengagement gate; `SymbolContext.scanner_rank`),
 `position_manager.py` (reversal exit, stop-limit price tracking),
 `bracket_builder.py` (stop-limit order type), `risk_manager.py` (catalyst,
 time-of-day, and "obviousness" size boosts), and `config.yaml`.
+
+## Implemented: "TA Master Class" additions
+
+This is the broadest-scoped transcript so far (trend-line detection,
+horizontal S/R clustering, a three-pattern hierarchy, a decision-vs-outcome
+grading framework, and stop-placement-by-nearest-support). Most of it is
+either a substantial new subsystem better deferred deliberately than built
+in a drive-by pass, or already true of the existing architecture. One
+piece was concretely specified and low-risk enough to implement now:
+
+- **Psychological round-number breakout confirmation.** Source material's
+  clearest, most quantifiable new rule: half-dollar levels matter below
+  ~$10, whole-dollar levels at/above, with $1.00 called out as
+  particularly significant for low-priced stocks ("very hard... to break
+  and hold over $1"). Added `indicators.py::round_number_increment()` /
+  `crossed_round_number()` and wired into all three breakout-style
+  strategies (`gap_and_go`, `bull_flag`, `abcd`): if the breakout candle's
+  close crossed a round-number level that the immediately preceding bar's
+  close was still under, `round_number_breakout` is set in the signal's
+  context, and `RiskManager` turns it into a soft size boost
+  (`risk.round_number_size_multiplier`) -- same discrete
+  threshold-and-multiplier treatment as every other soft signal in this
+  file. Deliberately scoped to *crossing* a level (a concrete, binary,
+  well-defined event), not proximity to one, which would need an
+  arbitrary "how close counts" tolerance the source material doesn't
+  specify.
+
+**Deferred (substantial new subsystems, not drive-by additions):**
+- **Trend-line detection** (ascending/descending support and resistance,
+  fit from sequential pullback lows / rally highs) and **horizontal S/R
+  clustering with "broken level flips role"** state tracking. Both are
+  genuinely new capabilities, not extensions of an existing gate:
+  trend-line fitting needs a line-fit (even a simple two-point fit) across
+  `swing_points()` output (which already exists as a building block) with
+  a defined tolerance band; horizontal-level clustering needs grouping of
+  prior highs/lows with round-number weighting; "broken level flips role"
+  needs new *persistent per-symbol state* tracked across the session
+  (which levels are currently classified support vs. resistance, and
+  when a break should be considered to have "held" long enough to
+  reclassify). None of this is concretely specified precisely enough in
+  the source material to implement safely in a single pass (e.g. no
+  stated tolerance band for what counts as "connecting" two pullback
+  lows, no stated bar-count for how long a break must "hold" before
+  flipping role) -- worth a deliberate design pass if/when wanted, not a
+  guessed implementation bundled into a strategy-notes ingestion session.
+- **Stop-placement by nearest valid support** (when multiple candidate
+  stop levels exist -- pullback low, EMA, VWAP, horizontal S/R, trend
+  line -- prefer whichever is closest to entry). **Confirmed the core
+  principle is already followed**: every strategy already stops at the
+  single tightest legitimate structural level for its own pattern
+  (`bull_flag`/`abcd` at the pullback/C low, `gap_and_go` at the breakout
+  level) -- these aren't arbitrary distances. **Declined to extend this
+  to a multi-candidate comparison** (e.g. swap in `ctx.ema_9`/`ctx.vwap`
+  when tighter than the pullback low): a stop placed at a level that
+  wasn't the one actually invalidating the pattern risks *more* noise
+  stopouts, not fewer, and the source material doesn't specify a
+  validity/ranking rule for when an alternate candidate is safe to use
+  instead of the pattern's own structural level. Implementing this
+  without that rule would be inventing an untested stop-placement
+  heuristic, the same category of risk already avoided for the "market
+  heat" and "nearest support" ideas in earlier sessions.
+
+**Confirmed already correct, no change needed:**
+- **Decision-quality vs. outcome-quality / process-adherence grading.**
+  Structurally guaranteed for this bot in a way it isn't for a human
+  discretionary trader: a signal only ever exists when a strategy's own
+  coded conditions actually fired, so there is no code path for a
+  "rule-violating trade that happened to work" the way a human can
+  override their own plan -- process adherence is 100% by construction
+  for every trade this bot places (modulo bugs). This is a different
+  question from the existing "Deferred: trade rule-adherence tagging"
+  section below (which is about whether the *rule set itself* is well
+  calibrated, judged from aggregate journal review) -- this file
+  reinforces that existing deferral rather than replacing it or adding a
+  new gap.
+- **Three-pattern hierarchy (bull flag > ABCD > micro pullback).**
+  "Micro pullback" and "bull flag" are the same code path today (per the
+  `bull_flag.py` docstring note from an earlier session -- this bot only
+  ingests 1-minute bars, so every signal is technically a micro
+  pullback), so a 3-way preference ranking doesn't map onto 3 distinct
+  strategies the way it would for a human discretionarily choosing
+  between chart timeframes. The `bull_flag` > `abcd` half of the ranking
+  is a genuine, distinct preference, but -- unlike the round-number
+  signal above -- it's a subjective "which pattern do I trust more in
+  general" preference rather than an objective structural property of a
+  specific setup, and giving `abcd` a blanket smaller-size treatment
+  purely for being pattern #2 would be a values call about capital
+  allocation, not a mechanical rule extracted from the transcript. Left
+  unimplemented rather than guessed at; each strategy's own independently
+  tuned pullback-depth/quality config already reflects that they're
+  different, deliberately-scoped patterns.
 
 ## Implemented: "Reading Raw Candlesticks" additions
 

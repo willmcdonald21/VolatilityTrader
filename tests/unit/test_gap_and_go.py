@@ -42,6 +42,23 @@ def test_breakout_triggers_signal():
     assert signal.entry_price == 6.5
     assert signal.stop_price < signal.entry_price
     assert signal.target_price > signal.entry_price
+    assert signal.context["round_number_breakout"] is True  # crosses $6.0 on the breakout bar
+
+
+def test_round_number_breakout_false_when_no_level_crossed():
+    ctx = make_ctx(
+        [
+            (5.5, 5.7, 5.4, 5.6, 1000),
+            (5.6, 5.8, 5.5, 5.7, 1000),
+            (5.7, 5.9, 5.6, 5.75, 1000),
+            (5.75, 5.85, 5.7, 5.8, 1000),
+            (5.8, 5.98, 5.8, 5.95, 1000),  # breakout bar, stays within the $5.50-$6.00 bucket
+        ]
+    )
+    strategy = GapAndGoStrategy(default_config())
+    signal = strategy.evaluate(ctx, NOW)
+    assert signal is not None
+    assert signal.context["round_number_breakout"] is False
 
 
 def test_no_signal_without_breakout():

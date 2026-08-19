@@ -155,6 +155,14 @@ class RiskManager:
             # signals above, not a hard entry gate.
             raw_shares = math.floor(raw_shares * self.config.bottoming_tail_size_multiplier)
 
+        if signal.context.get("round_number_breakout"):
+            # Breaking through a psychological round-number level (e.g.
+            # $1.00) on the breakout candle itself -- resting sell/
+            # take-profit orders cluster at these levels, so clearing one
+            # decisively is a stronger signal than an ordinary breakout.
+            # Soft boost, same treatment as the other soft signals above.
+            raw_shares = math.floor(raw_shares * self.config.round_number_size_multiplier)
+
         if now is not None:
             # Only applied when the caller supplies a clock reading -- never
             # guessed from wall-clock time, so sizing stays deterministic

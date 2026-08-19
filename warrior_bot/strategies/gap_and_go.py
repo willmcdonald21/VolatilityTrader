@@ -6,7 +6,7 @@ from warrior_bot.config import GapAndGoConfig
 from warrior_bot.scanner.float_provider import FloatProvider
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
-from warrior_bot.strategies.indicators import candle_strength, opening_range
+from warrior_bot.strategies.indicators import candle_strength, crossed_round_number, opening_range
 from warrior_bot.utils.time_utils import session_elapsed_fraction
 
 
@@ -76,6 +76,7 @@ class GapAndGoStrategy(BaseStrategy):
         if stop_price >= entry_price:
             return None
 
+        prior_bar = ctx.bars[-2]
         state["triggered"] = True
         return self._build_signal(
             ctx,
@@ -83,5 +84,10 @@ class GapAndGoStrategy(BaseStrategy):
             entry_price=entry_price,
             stop_price=stop_price,
             target_r_multiple=cfg.target_r_multiple,
-            context={"gap_pct": gap, "relative_volume": rel_vol, "breakout_high": breakout_high},
+            context={
+                "gap_pct": gap,
+                "relative_volume": rel_vol,
+                "breakout_high": breakout_high,
+                "round_number_breakout": crossed_round_number(prior_bar.close, current_bar.close),
+            },
         )

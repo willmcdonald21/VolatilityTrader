@@ -49,6 +49,7 @@ def make_risk_manager(tmp_path, snapshot, **risk_overrides) -> RiskManager:
         shallow_pullback_threshold_pct=risk_overrides.get("shallow_pullback_threshold_pct", 25.0),
         shallow_pullback_size_multiplier=risk_overrides.get("shallow_pullback_size_multiplier", 1.25),
         bottoming_tail_size_multiplier=risk_overrides.get("bottoming_tail_size_multiplier", 1.25),
+        round_number_size_multiplier=risk_overrides.get("round_number_size_multiplier", 1.25),
         # Unlike every other multiplier above, the starter-trade ones are
         # gated on RiskManager's own internal state (this being the day's
         # first trade), not on something present/absent in the signal's
@@ -350,6 +351,28 @@ def test_no_bottoming_tail_no_size_boost(tmp_path):
     snapshot = default_snapshot(net_liquidation=10_000)
     rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, bottoming_tail_size_multiplier=1.25)
     signal = make_signal(entry=10.0, stop=9.0, context={"bottoming_tail_confirmation": False})
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 100  # unboosted
+
+
+def test_round_number_breakout_gets_size_boost(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, round_number_size_multiplier=1.25)
+    signal = make_signal(entry=10.0, stop=9.0, context={"round_number_breakout": True})
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 125  # raw_shares(100) * 1.25
+
+
+def test_no_round_number_breakout_no_size_boost(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, round_number_size_multiplier=1.25)
+    signal = make_signal(entry=10.0, stop=9.0, context={"round_number_breakout": False})
 
     decision = rm.evaluate(signal)
 

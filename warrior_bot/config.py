@@ -75,6 +75,10 @@ class RiskConfig(BaseModel):
     # pullback's low bar -- soft bullish confirmation, same boost treatment
     # as the other soft signals above.
     bottoming_tail_size_multiplier: float = Field(default=1.25, ge=1.0)
+    # Breaking above a psychological round-number level (half-dollar below
+    # $10, whole-dollar at/above) on the breakout candle itself -- source
+    # material's strongest example is $1.00 for low-priced stocks.
+    round_number_size_multiplier: float = Field(default=1.25, ge=1.0)
     # Daily "starter position" regime protocol: take smaller-than-normal
     # size on the day's first trade; if it loses, treat that as a cold-
     # market caution flag and cap size for the rest of the session (an
