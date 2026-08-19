@@ -6,6 +6,7 @@ from warrior_bot.config import PullbackQualityConfig
 from warrior_bot.strategies.base_strategy import SymbolContext
 from warrior_bot.strategies.indicators import (
     Bar,
+    has_rising_volume_on_advance,
     is_high_volume_red_bar,
     is_topping_tail,
     macd,
@@ -32,9 +33,11 @@ def validate_pullback(
 
     Base checks, all framed as hard invalidations in the source material
     ("I would not take that trade" / "do not take the breakout entry"):
-    lighter volume on the pullback than the preceding up-move, holds above
-    VWAP, holds above the 9 EMA, and a non-bearish MACD. A gate is only
-    ever enforced when its underlying data is actually available --
+    rising volume on the preceding advance, lighter volume on the pullback
+    than that advance, holds above VWAP, holds above the 9 EMA (by close,
+    not by low -- a brief wick through the EMA that closes back above it
+    is tolerated as noise), and a non-bearish MACD. A gate is only ever
+    enforced when its underlying data is actually available --
     insufficient warm-up history (e.g. MACD needs ~34 bars) means
     "unknown", not "invalid", so it never blocks a signal on its own.
 
@@ -71,6 +74,9 @@ def validate_pullback(
                 False, "pullback bar volume not lighter than the immediately preceding green candle"
             )
 
+    if config.require_rising_volume_on_advance and not has_rising_volume_on_advance(up_move_bars):
+        return PullbackValidity(False, "volume declining on the preceding advance")
+
     pullback_low = min(b.low for b in pullback_bars)
 
     vwap = ctx.vwap
@@ -78,7 +84,12 @@ def validate_pullback(
         return PullbackValidity(False, "pullback broke below VWAP")
 
     ema_9 = ctx.ema_9
-    if ema_9 is not None and pullback_low < ema_9:
+    if ema_9 is not None and any(b.close < ema_9 for b in pullback_bars):
+        # Close-based, not low-based (unlike the VWAP check above): the
+        # source material explicitly tolerates "a brief single-candle wick
+        # below the 9 EMA that immediately reclaims it" as noise, not a
+        # disqualifying break -- only a bar that actually *closes* below
+        # the EMA counts as a real break.
         return PullbackValidity(False, "pullback broke below 9 EMA")
 
     # (9, 20) matches Ross Cameron's actual chart MACD setup (computed from

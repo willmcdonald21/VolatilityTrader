@@ -6,7 +6,7 @@ notes folder (`warrior_trading_strategy_notes.md`, `warrior_trading_roadmap_note
 `warrior_trading_execution_risk_notes.md`, `warrior_trading_dip_or_dump_notes.md`,
 `warrior_trading_candlestick_deep_dive_notes.md`, `warrior_trading_three_concepts_notes.md`,
 `warrior_trading_5_failure_causes_notes.md`, `warrior_trading_raw_candlesticks_notes.md`,
-`warrior_trading_ta_master_class_notes.md`).
+`warrior_trading_ta_master_class_notes.md`, `warrior_trading_dip_buying_notes.md`).
 This file tracks findings from that material that were considered but
 **not** implemented, and why, so the reasoning isn't lost. Implemented
 findings are just... implemented; see `bull_flag.py`/`abcd_pattern.py`
@@ -17,6 +17,86 @@ stock-level 9/20 MACD disengagement gate; `SymbolContext.scanner_rank`),
 `position_manager.py` (reversal exit, stop-limit price tracking),
 `bracket_builder.py` (stop-limit order type), `risk_manager.py` (catalyst,
 time-of-day, and "obviousness" size boosts), and `config.yaml`.
+
+## Implemented: "Dip-Buying Methodology" additions
+
+This transcript's own explicit dip-vs-reversal checklist (4 required + 2
+bonus checks) turned out to already be ~90% implemented across earlier
+sessions -- pullback-lighter-than-preceding-green-candle (file 6's
+`require_pullback_lighter_than_prior_green_bar`), MACD-must-be-positive
+(already the base MACD gate), and round-number proximity (file 11's
+`round_number_breakout`, though framed as *crossing* a level rather than
+this file's *proximity to* one -- close enough in spirit not to need a
+second, overlapping check) were all already there. Two genuine gaps
+surfaced by checking each item against the actual code:
+
+- **Rising volume on the advance.** The existing volume checks
+  (`require_pullback_lighter_than_prior_green_bar`, the aggregate
+  pullback-vs-up-move comparison) all compare the *pullback* against the
+  *up-move* -- none of them checked whether the up-move itself was
+  volume-confirmed. Added `indicators.py::has_rising_volume_on_advance()`
+  (second-half vs. first-half average volume across the up-move bars, not
+  strict bar-by-bar monotonicity, which would be too brittle against
+  normal noise) and wired it into `validate_pullback` as a new hard gate,
+  `pullback_quality.require_rising_volume_on_advance` (default on) --
+  matches the "required check" framing of the other three checklist items
+  already implemented as hard gates in `pullback_validity.py`, not the
+  "bonus" (soft) framing used for the L2/round-number checks.
+- **9 EMA gate was stricter than the source material describes.** The
+  existing check used `pullback_low < ema_9` (any bar's *low*, i.e. any
+  wick at all, would invalidate the whole pullback). This transcript is
+  explicit that "a brief single-candle wick below the 9 EMA that
+  immediately reclaims it" should be tolerated as noise -- only a bar
+  that actually *closes* below the EMA is a real break. Changed to
+  `any(b.close < ema_9 for b in pullback_bars)`. Deliberately left the
+  VWAP check on the same line using `pullback_low` (low-based) unchanged
+  -- the source material's wick-tolerance nuance is specific to the 9
+  EMA, not stated for VWAP. Confirmed via the full test suite that this
+  strictly-more-permissive change didn't flip any existing "should
+  reject" fixture to "passes" (the existing 9-EMA rejection test's
+  fixture rejects on both the old low-based and new close-based logic, so
+  it wasn't accidentally testing wick-tolerance by coincidence).
+
+**Confirmed already correct, no change needed:**
+- **Iceberg/hidden-seller detection** and the L2 "large resting seller"
+  bonus check both need tick-level time-and-sales/order-book data this
+  bot doesn't subscribe to -- the same gap already tracked under
+  "Deferred: sector heat and Level 2 / order-book features" below;
+  reinforced, not new.
+- **Tail-risk tracking** (a single outsized loss can distort the
+  aggregate P/L ratio) is exactly what `scripts/daily_report.py`'s
+  worst-single-trade-R column (added for file 9) already surfaces.
+- **Breakout vs. dip as separate sub-strategy win-rate/R:R profiles**:
+  already how the bot is structured -- `gap_and_go` (breakout-style) and
+  `bull_flag`/`abcd` (pullback-style) are independently configured
+  strategies with their own tunables, not pooled into one signal type.
+- **Alternative (60-65% win rate, ~1:1 P/L) target profile** as a more
+  realistic early-stage benchmark than the 2:1 framing used elsewhere:
+  purely informational for judging `daily_report.py`'s existing win% and
+  avg-R output against; doesn't need its own code, since both numbers are
+  already surfaced and a second hardcoded "pass/fail against benchmark
+  X or Y" column wouldn't add information beyond what's already visible.
+
+**Deferred (substantial new subsystems, not drive-by additions):**
+- **Scale-in / add-to-winners position building** (starter size -> add on
+  each subsequent new-high confirmation -> immediate full exit on stop,
+  rather than the current single-shot entry). This is a materially
+  different order-management model than what exists today: every
+  strategy currently produces exactly one signal -> one bracket order ->
+  one stop/target for the life of a position (`OrderManager`,
+  `PositionManager`). Building genuine scale-in support would need new
+  state (how many adds so far, blended cost basis, a re-evaluation path
+  for *already-open* positions rather than just fresh signals) and
+  changes how `RiskManager`'s risk-per-trade sizing model works (which
+  currently assumes one entry price and one stop per position). Comparable
+  in scope to the already-deferred 5-minute bull-flag detection pass and
+  trend-line/S/R detection -- worth a deliberate design pass, not
+  something to bolt on inside a strategy-notes ingestion session.
+- **Graduated give-back circuit breaker and regime-linked size-cap
+  toggle** -- see the enriched "Deferred: daily 'give-back' circuit
+  breaker" section below; still explicitly deferred at the maintainer's
+  request, now with this file's concrete numbers recorded for whenever
+  it's revisited deliberately.
 
 ## Implemented: "TA Master Class" additions
 
@@ -540,6 +620,29 @@ realized P&L in `AccountState` or `RiskManager`, add a
 the same way. (2) and (3) both become feasible once `data/journal.sqlite3`
 has enough `account_snapshots`/trade history to compute a trailing average
 or an hour-of-day win-rate breakdown from.
+
+The dip-buying transcript gives (1) a much more specific version, worth
+recording here rather than re-deferring blind if revisited: a **graduated**
+response scale rather than a single 50% trigger -- giving back 10% of
+peak daily profit as a soft caution point (reinstate a reduced-size cap
+for the rest of the session, conceptually the same lever as the existing
+`risk.starter_trade_size_multiplier`/downgrade mechanism, just keyed off
+peak-giveback instead of the first trade's outcome), 15-20% as a stronger
+caution point (voluntary stop or further size cut), and 50% as the
+existing hard mandatory halt. Also gives a concrete starter-size-cap
+number independent of the giveback rule itself: cap new positions at
+roughly 10-20% of full size until the day is up some threshold (the
+transcript's own example: 5,000 shares of a 30-50k max, unlocking after
+$1,000 of realized profit) -- **this specific piece is already fully
+supported by the existing `risk.daily_profit_goal_usd` +
+`risk.cushion_profit_fraction`/`cushion_size_fraction` mechanism**, just
+not enabled by default (`daily_profit_goal_usd: null`) since a meaningful
+dollar unlock threshold is inherently account-size-specific and isn't
+something to default to an invented number for someone else's account.
+Still deferred: the maintainer's explicit request to hold off stands: this
+is additional detail for the *next* time this circuit breaker is revisited
+deliberately, not a signal to implement it now off the back of a second
+transcript restating the same idea with more precision.
 
 ## Deferred: candlestick shape as entry confirmation (not just exit)
 

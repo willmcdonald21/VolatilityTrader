@@ -127,6 +127,12 @@ class PullbackQualityConfig(BaseModel):
     # which can still pass while one individual red bar in a multi-bar
     # pullback outweighs the anchor green candle alone.
     require_pullback_lighter_than_prior_green_bar: bool = True
+    # "Price and volume should be positively correlated as the stock
+    # climbs" -- a stock advancing on declining volume is a divergence
+    # warning even though price is still rising. Distinct from the volume
+    # checks above, which compare the pullback against the up-move; this
+    # checks whether the up-move itself was volume-confirmed.
+    require_rising_volume_on_advance: bool = True
 
 
 class BullFlagConfig(BaseModel):

@@ -49,6 +49,7 @@ pullback_quality:
   require_5m_macd_confirmation: true
   reject_5m_topping_tail: true
   require_pullback_lighter_than_prior_green_bar: true  # each pullback bar's volume < the specific green candle right before the pullback
+  require_rising_volume_on_advance: true  # volume should trend up alongside price during the up-move -- declining volume on the advance is a divergence warning
 
 strategies:
   gap_and_go:

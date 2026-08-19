@@ -281,6 +281,28 @@ def is_high_volume_red_bar(bar: Bar, avg_recent_volume: float, multiple: float =
     return bar.close < bar.open and bar.volume >= avg_recent_volume * multiple
 
 
+def has_rising_volume_on_advance(up_move_bars: list[Bar]) -> bool:
+    """True if volume trended upward alongside price during the up-move
+    that preceded a pullback -- source material's explicit price/volume
+    correlation check ("price and volume should be positively correlated
+    as the stock climbs"), distinct from the aggregate "pullback lighter
+    than the up-move" volume comparison elsewhere. A stock climbing on
+    declining volume is a divergence warning even though price is still
+    rising. Compares average volume in the second half of the up-move
+    against the first half (not strict bar-by-bar monotonicity, which
+    would be too brittle against normal noise) -- returns True
+    (permissive, "unknown, not invalid") when there's too little data to
+    judge, same as every other soft gate in this module."""
+    if len(up_move_bars) < 2:
+        return True
+    midpoint = len(up_move_bars) // 2
+    first_half = up_move_bars[:midpoint]
+    second_half = up_move_bars[midpoint:]
+    first_avg = sum(b.volume for b in first_half) / len(first_half)
+    second_avg = sum(b.volume for b in second_half) / len(second_half)
+    return second_avg >= first_avg
+
+
 def trailing_candidate(
     last_price: float | None,
     ema_9: float | None,

@@ -7,6 +7,7 @@ from warrior_bot.strategies.indicators import (
     crossed_round_number,
     ema,
     gap_pct,
+    has_rising_volume_on_advance,
     is_bottoming_tail,
     is_high_volume_red_bar,
     is_lower_low,
@@ -309,6 +310,26 @@ def test_crossed_round_number_false_when_price_unchanged():
 def test_crossed_round_number_uses_prior_price_granularity():
     # starts under $10 (half-dollar grid) even though it ends above $10
     assert crossed_round_number(prior_price=9.8, current_price=10.2) is True
+
+
+def test_has_rising_volume_on_advance_true_when_volume_expands():
+    bars = make_bars([(10.0, 10.1, 9.9, 10.05, 500), (10.05, 10.3, 10.0, 10.25, 1000), (10.25, 10.6, 10.2, 10.55, 1500)])
+    assert has_rising_volume_on_advance(bars) is True
+
+
+def test_has_rising_volume_on_advance_false_when_volume_declines():
+    bars = make_bars([(10.0, 10.1, 9.9, 10.05, 1500), (10.05, 10.3, 10.0, 10.25, 1000), (10.25, 10.6, 10.2, 10.55, 500)])
+    assert has_rising_volume_on_advance(bars) is False
+
+
+def test_has_rising_volume_on_advance_true_with_insufficient_bars():
+    bars = make_bars([(10.0, 10.1, 9.9, 10.05, 500)])
+    assert has_rising_volume_on_advance(bars) is True
+
+
+def test_has_rising_volume_on_advance_true_when_second_half_ties_first():
+    bars = make_bars([(10.0, 10.1, 9.9, 10.05, 1000), (10.05, 10.3, 10.0, 10.25, 1000)])
+    assert has_rising_volume_on_advance(bars) is True
 
 
 def test_resample_bars_empty_returns_empty():

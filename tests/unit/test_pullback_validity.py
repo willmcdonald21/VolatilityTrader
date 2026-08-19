@@ -29,6 +29,28 @@ def test_passes_when_pullback_or_up_move_bars_empty():
     assert validate_pullback([], [], ctx).valid
 
 
+def test_rejects_when_volume_declines_on_the_advance():
+    ctx = make_ctx([(10.0, 10.5, 10.0, 10.4, 1000), (10.4, 10.45, 10.35, 10.4, 200)])
+    up_move = make_bars([(10.0, 10.2, 10.0, 10.15, 2000), (10.15, 10.4, 10.1, 10.35, 1000)])  # declining volume
+    pullback = make_bars([(10.35, 10.4, 10.3, 10.35, 50)])
+
+    result = validate_pullback(pullback, up_move, ctx)
+
+    assert not result.valid
+    assert result.reason == "volume declining on the preceding advance"
+
+
+def test_rising_volume_gate_disabled_via_config():
+    ctx = make_ctx([(10.0, 10.5, 10.0, 10.4, 1000), (10.4, 10.45, 10.35, 10.4, 200)])
+    up_move = make_bars([(10.0, 10.2, 10.0, 10.15, 2000), (10.15, 10.4, 10.1, 10.35, 1000)])
+    pullback = make_bars([(10.35, 10.4, 10.33, 10.35, 50)])  # low clears ctx's vwap (~10.317)
+    config = PullbackQualityConfig(require_rising_volume_on_advance=False)
+
+    result = validate_pullback(pullback, up_move, ctx, config=config)
+
+    assert result.valid
+
+
 def test_rejects_when_pullback_volume_not_lighter_than_up_move():
     ctx = make_ctx([(10.0, 10.5, 10.0, 10.4, 500), (10.4, 10.45, 10.3, 10.35, 800)])
     up_move = make_bars([(10.0, 10.5, 10.0, 10.4, 500)])
@@ -79,6 +101,37 @@ def test_rejects_when_pullback_breaks_9_ema():
 
     assert not result.valid
     assert "EMA" in result.reason
+
+
+def test_passes_when_pullback_wick_dips_below_9_ema_but_closes_above_it():
+    # Same 9-bar ctx shape as test_rejects_when_pullback_breaks_9_ema, but
+    # the pullback bar's LOW wicks below the 9 EMA while its CLOSE
+    # reclaims above it -- source material's explicit "a brief
+    # single-candle wick... that immediately reclaims" tolerance. A
+    # single-bar up_move makes has_rising_volume_on_advance() a
+    # no-op (insufficient data), isolating this to the 9 EMA gate.
+    ctx = make_ctx(
+        [
+            (9.0, 9.0, 9.0, 9.0, 5000),
+            (10.0, 10.0, 10.0, 10.0, 100),
+            (10.0, 10.0, 10.0, 10.0, 100),
+            (10.0, 10.0, 10.0, 10.0, 100),
+            (10.0, 10.0, 10.0, 10.0, 100),
+            (10.0, 10.0, 10.0, 10.0, 100),
+            (10.0, 10.0, 10.0, 10.0, 100),
+            (10.0, 10.0, 10.0, 10.0, 100),
+            (10.0, 10.0, 10.0, 10.0, 100),
+        ]
+    )
+    assert ctx.vwap < 9.2
+    assert 9.7 < ctx.ema_9 < 9.95
+
+    up_move = make_bars([(9.4, 9.6, 9.4, 9.5, 1000)])
+    pullback = make_bars([(9.75, 10.0, 9.5, 9.97, 10)])  # low 9.5 (below ema_9), close 9.97 (above it)
+
+    result = validate_pullback(pullback, up_move, ctx)
+
+    assert result.valid
 
 
 def test_rejects_when_macd_not_bullish():
@@ -186,6 +239,7 @@ def test_dump_checklist_gates_disabled_via_config():
         require_5m_macd_confirmation=False,
         reject_5m_topping_tail=False,
         require_pullback_lighter_than_prior_green_bar=False,
+        require_rising_volume_on_advance=False,
     )
 
     result = validate_pullback(pullback, up_move, ctx, config=config)
