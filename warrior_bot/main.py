@@ -21,6 +21,7 @@ from warrior_bot.risk.account_state import AccountState
 from warrior_bot.risk.risk_manager import RiskManager
 from warrior_bot.scanner.catalyst import classify_headlines
 from warrior_bot.scanner.float_provider import FloatProvider
+from warrior_bot.scanner.regime import count_extreme_gainers
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.abcd_pattern import AbcdStrategy
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
@@ -85,6 +86,7 @@ class WarriorBot:
         self._risk_task: asyncio.Task | None = None
         self._flattened_today = False
         self._news_provider_codes = config.news.provider_codes
+        self._last_logged_breadth: int | None = None
 
     async def start(self) -> None:
         await self.ib_client.connect()
@@ -121,6 +123,13 @@ class WarriorBot:
                 for rank, symbol in enumerate(symbols, start=1):
                     if symbol not in self.contexts:
                         await self._onboard_symbol(symbol, scanner_rank=rank)
+                breadth = count_extreme_gainers(self.contexts.values())
+                if breadth != self._last_logged_breadth:
+                    self.logger.info(
+                        "Market breadth: %d onboarded symbol(s) gapped >=100%% -- regime signal only, not sized on",
+                        breadth,
+                    )
+                    self._last_logged_breadth = breadth
             except Exception:
                 self.logger.exception("Scan loop iteration failed")
             await asyncio.sleep(self.config.scanner.refresh_seconds)
@@ -283,6 +292,7 @@ class WarriorBot:
         self.risk_manager.mark_start_of_day(snapshot.net_liquidation)
         self.position_manager.clear()
         self._flattened_today = False
+        self._last_logged_breadth = None
         self.logger.info("Daily state reset. Start-of-day equity=%.2f", snapshot.net_liquidation)
 
 

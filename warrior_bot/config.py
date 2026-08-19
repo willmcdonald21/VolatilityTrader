@@ -71,6 +71,13 @@ class RiskConfig(BaseModel):
     # obviousness boosts above.
     shallow_pullback_threshold_pct: float = Field(default=25.0, ge=0)
     shallow_pullback_size_multiplier: float = Field(default=1.25, ge=1.0)
+    # Daily "starter position" regime protocol: take smaller-than-normal
+    # size on the day's first trade; if it loses, treat that as a cold-
+    # market caution flag and cap size for the rest of the session (an
+    # automated, unemotional version of the size-reduction a human trader
+    # is prone to skip exactly when it matters most).
+    starter_trade_size_multiplier: float = Field(default=0.5, gt=0, le=1.0)
+    starter_trade_downgrade_multiplier: float = Field(default=0.5, gt=0, le=1.0)
 
 
 class GapAndGoConfig(BaseModel):

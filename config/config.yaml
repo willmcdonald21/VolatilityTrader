@@ -29,6 +29,8 @@ risk:
   obvious_size_multiplier: 1.25    # position-size boost when the signal's symbol was top-N ranked at onboarding time
   shallow_pullback_threshold_pct: 25.0  # "top 25% of the move" -- ideal/high-confidence retracement depth
   shallow_pullback_size_multiplier: 1.25 # position-size boost when a bull_flag pullback retraces <= the threshold above
+  starter_trade_size_multiplier: 0.5     # smaller-than-normal size on the day's first trade ("starter position" regime test)
+  starter_trade_downgrade_multiplier: 0.5 # applied to all trades for the rest of the session if the starter trade lost
 
 pullback_quality:
   # Entry-time "dip or dump" dump-avoidance checks, shared by bull_flag/abcd's

@@ -4,7 +4,8 @@ Source material: Warrior Trading transcripts in the maintainer's local
 notes folder (`warrior_trading_strategy_notes.md`, `warrior_trading_roadmap_notes.md`,
 `warrior_trading_full_course_notes.md`, `warrior_trading_candlestick_pattern_notes.md`,
 `warrior_trading_execution_risk_notes.md`, `warrior_trading_dip_or_dump_notes.md`,
-`warrior_trading_candlestick_deep_dive_notes.md`, `warrior_trading_three_concepts_notes.md`).
+`warrior_trading_candlestick_deep_dive_notes.md`, `warrior_trading_three_concepts_notes.md`,
+`warrior_trading_5_failure_causes_notes.md`).
 This file tracks findings from that material that were considered but
 **not** implemented, and why, so the reasoning isn't lost. Implemented
 findings are just... implemented; see `bull_flag.py`/`abcd_pattern.py`
@@ -15,6 +16,77 @@ stock-level 9/20 MACD disengagement gate; `SymbolContext.scanner_rank`),
 `position_manager.py` (reversal exit, stop-limit price tracking),
 `bracket_builder.py` (stop-limit order type), `risk_manager.py` (catalyst,
 time-of-day, and "obviousness" size boosts), and `config.yaml`.
+
+## Implemented: "5 Leading Causes of Trader Failure" additions
+
+Psychology/risk-management focused, but two of its five causes give
+concrete, mechanically implementable rules (unlike file 8's vaguer
+"regime" concept, which explicitly had no formula given):
+
+- **Daily "starter position" regime protocol (Cause #2).** Fully
+  mechanical rule: take smaller size on the day's first trade; if it
+  loses, treat that as a cold-market caution flag and cap size for the
+  rest of the session. Implemented in `RiskManager`:
+  `risk.starter_trade_size_multiplier` (default 0.5) shrinks the very
+  first accepted trade of the day (`_trades_accepted_today == 0`);
+  `risk.starter_trade_downgrade_multiplier` (default 0.5) applies to every
+  subsequent trade for the rest of the session if
+  `AccountState.first_closing_trade_pnl()` (new method -- the realized
+  P&L of the session's earliest closing fill) comes back `<= 0`. Both
+  reset via the existing `mark_start_of_day`/`reset_daily_state` path.
+  This is also the mechanical fix for Cause #3 (discipline decay): the
+  transcript's own framing is that a human's natural response to an early
+  loss is to *increase* size to make it back, exactly backwards from the
+  regime-reading logic -- an automated system has no emotional override
+  problem, so encoding the rule mechanically was the direct ask, not an
+  extrapolation.
+  `first_closing_trade_pnl()` is an approximation, not exact trade
+  grouping: a position closed via a scale-out then a later stop-out
+  produces two closing fills, and only the earlier one's sign is used.
+  Matches the source material's own binary framing ("did the starter
+  trade work or not") closely enough without needing full round-trip
+  grouping logic.
+- **Market breadth as a regime signal (Cause #2).** "Count of stocks up
+  >100% on the daily leading-gainers scan" -- added
+  `warrior_bot/scanner/regime.py::count_extreme_gainers()`, logged once
+  per scan cycle (only when it changes, to avoid log spam at the
+  5-second scan cadence) in `WarriorBot._scan_loop`. **Deliberately
+  logged only, not wired into sizing**: this bot's own scanner
+  (`scanner.above_price`/`below_price`) only ever sees onboarded
+  candidates within the configured price band, so a genuinely hot day
+  with big moves concentrated in higher-priced names could still read as
+  "zero extreme gainers" here -- a systematic undercount bias that would
+  make an automatic sizing lever actively wrong on some genuinely strong
+  days. Kept as a loggable number for the maintainer to eyeball each
+  morning instead.
+- **Tail-risk / worst-single-trade-R as a distinct tracked metric
+  (Cause #4).** `scripts/daily_report.py` now prints a "Worst R" column
+  per strategy alongside the existing average R -- directly encodes the
+  transcript's point that an average P/L ratio can look fine while still
+  masking an occasional 10-20x-normal loss that did real account damage
+  the average alone wouldn't reveal.
+
+**Confirmed already correct, no change needed:**
+- **Cause #5 (maintain multiple pre-validated strategy variants)**
+  reinforces the same "momentum trading as overarching framework with
+  pluggable sub-strategies" confirmation already made for file 8 --
+  `strategies.{gap_and_go,bull_flag,abcd,vwap_reversion}.enabled` already
+  provides this. No new confirmation needed beyond noting the
+  reinforcement.
+
+**Deferred:**
+- **Cause #1's diminishing-returns/slippage modeling** (position size
+  scaling into 1,000s-10,000s of shares eventually hits liquidity/slippage
+  limits relative to a stock's own volume) is not applicable at this
+  bot's current configured scale -- `risk.max_shares_per_trade` (2,000)
+  and `risk.max_position_notional_usd` ($5,000) already keep it well
+  inside "no meaningful slippage" territory for a small account, and
+  there's no backtesting engine in this codebase to model diminishing
+  returns against in the first place (per the README: the SQLite journal,
+  not a backtest, is the primary feedback loop). Worth revisiting only if
+  the account ever scales enough for this to become a real constraint --
+  would need either historical execution-quality data (fill price vs.
+  quote at signal time) or a backtest engine, neither of which exist yet.
 
 ## Implemented: "Dip or Dump" entry-time dump checklist
 

@@ -9,11 +9,15 @@ from warrior_bot.signals.signal import Signal
 
 
 class FakeAccountState:
-    def __init__(self, snapshot: AccountSnapshot):
+    def __init__(self, snapshot: AccountSnapshot, first_closing_trade_pnl: float | None = None):
         self._snapshot = snapshot
+        self._first_closing_trade_pnl = first_closing_trade_pnl
 
     def snapshot(self) -> AccountSnapshot:
         return self._snapshot
+
+    def first_closing_trade_pnl(self) -> float | None:
+        return self._first_closing_trade_pnl
 
 
 def make_signal(entry=10.0, stop=9.0, target=12.0, context=None) -> Signal:
@@ -44,8 +48,17 @@ def make_risk_manager(tmp_path, snapshot, **risk_overrides) -> RiskManager:
         obvious_size_multiplier=risk_overrides.get("obvious_size_multiplier", 1.25),
         shallow_pullback_threshold_pct=risk_overrides.get("shallow_pullback_threshold_pct", 25.0),
         shallow_pullback_size_multiplier=risk_overrides.get("shallow_pullback_size_multiplier", 1.25),
+        # Unlike every other multiplier above, the starter-trade ones are
+        # gated on RiskManager's own internal state (this being the day's
+        # first trade), not on something present/absent in the signal's
+        # context -- so unless a test opts in, every other test in this
+        # file's first `evaluate()` call would otherwise silently hit the
+        # starter-trade-size branch. Default to a no-op (1.0) here; real
+        # production default (0.5) lives in RiskConfig itself.
+        starter_trade_size_multiplier=risk_overrides.get("starter_trade_size_multiplier", 1.0),
+        starter_trade_downgrade_multiplier=risk_overrides.get("starter_trade_downgrade_multiplier", 1.0),
     )
-    account_state = FakeAccountState(snapshot)
+    account_state = FakeAccountState(snapshot, first_closing_trade_pnl=risk_overrides.get("first_closing_trade_pnl"))
     return RiskManager(config, account_state, kill_switch_path=tmp_path / "KILL_SWITCH")
 
 
@@ -234,6 +247,91 @@ def test_no_pullback_pct_no_size_boost(tmp_path):
 
     assert decision.accepted
     assert decision.sized_qty == 100
+
+
+def test_first_trade_of_day_gets_starter_size_reduction(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, starter_trade_size_multiplier=0.5)
+    signal = make_signal(entry=10.0, stop=9.0)
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 50  # raw_shares(100) * 0.5
+
+
+def test_second_trade_of_day_not_starter_sized(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, starter_trade_size_multiplier=0.5)
+    rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #1 -- consumes the starter-size branch
+
+    decision = rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #2
+
+    assert decision.accepted
+    assert decision.sized_qty == 100  # full size -- starter trade hasn't resolved (still open) yet
+
+
+def test_regime_downgrade_applied_after_starter_trade_loses(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(
+        tmp_path,
+        snapshot,
+        risk_per_trade_pct=0.01,
+        starter_trade_downgrade_multiplier=0.5,
+        first_closing_trade_pnl=-50.0,  # the starter trade already closed at a loss
+    )
+    rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #1 -- the (now-resolved) starter trade
+
+    decision = rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #2
+
+    assert decision.accepted
+    assert decision.sized_qty == 50  # raw_shares(100) * 0.5 -- cold-market caution flag
+
+
+def test_no_regime_downgrade_after_starter_trade_wins(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(
+        tmp_path,
+        snapshot,
+        risk_per_trade_pct=0.01,
+        starter_trade_downgrade_multiplier=0.5,
+        first_closing_trade_pnl=50.0,  # the starter trade closed profitably
+    )
+    rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #1
+
+    decision = rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #2
+
+    assert decision.accepted
+    assert decision.sized_qty == 100  # unboosted, unreduced -- starter trade worked
+
+
+def test_no_regime_downgrade_while_starter_trade_still_open(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(
+        tmp_path,
+        snapshot,
+        risk_per_trade_pct=0.01,
+        starter_trade_downgrade_multiplier=0.5,
+        first_closing_trade_pnl=None,  # nothing has closed yet
+    )
+    rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #1
+
+    decision = rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #2
+
+    assert decision.accepted
+    assert decision.sized_qty == 100
+
+
+def test_starter_trade_state_resets_on_mark_start_of_day(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, starter_trade_size_multiplier=0.5)
+    rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #1 consumes the starter slot
+
+    rm.mark_start_of_day(10_000)  # new day
+    decision = rm.evaluate(make_signal(entry=10.0, stop=9.0))
+
+    assert decision.accepted
+    assert decision.sized_qty == 50  # starter-size branch applies again on the new day's trade #1
 
 
 def test_time_of_day_boost_applied_within_window(tmp_path):

@@ -41,15 +41,15 @@ class AccountState:
                     return 0.0
         return 0.0
 
-    def daily_realized_pnl(self) -> float:
-        """Sum of realized PnL across today's fills.
+    def _closing_fills(self) -> list[tuple[datetime, float]]:
+        """(fill_time, realized_pnl) for today's closing fills only.
 
         IB's CommissionReport.realizedPNL carries a sentinel value
         (UNSET_DOUBLE, i.e. sys.float_info.max) for the opening leg of a
         round trip rather than 0 — those must be excluded or they blow up
         the total, not just skipped via a falsy check.
         """
-        total = 0.0
+        closing: list[tuple[datetime, float]] = []
         for fill in self.ib.fills():
             fill_time = fill.time
             if fill_time.tzinfo is None:
@@ -59,8 +59,28 @@ class AccountState:
             pnl = fill.commissionReport.realizedPNL
             if pnl is None or abs(pnl) >= UNSET_DOUBLE / 2:
                 continue
-            total += pnl
-        return total
+            closing.append((fill_time, pnl))
+        return closing
+
+    def daily_realized_pnl(self) -> float:
+        return sum(pnl for _, pnl in self._closing_fills())
+
+    def first_closing_trade_pnl(self) -> float | None:
+        """Realized P&L of the session's earliest closing fill, or None if
+        nothing has closed yet -- the "did today's starter trade work"
+        regime signal (source material: take reduced size on the day's
+        first trade; if it fails, treat that as a cold-market caution flag
+        and scale back for the rest of the session).
+
+        An approximation of "the first trade's outcome," not exact trade
+        grouping: a trade closed via a scale-out followed by a later
+        stop-out produces two closing fills, and this reports only the
+        earlier one's sign. That matches the source material's own binary
+        framing (did the starter trade work or not) closely enough without
+        needing full round-trip trade-grouping logic.
+        """
+        closing = sorted(self._closing_fills(), key=lambda item: item[0])
+        return closing[0][1] if closing else None
 
     def snapshot(self) -> AccountSnapshot:
         return AccountSnapshot(

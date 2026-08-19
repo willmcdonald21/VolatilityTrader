@@ -34,6 +34,7 @@ class RiskManager:
         self.kill_switch_path = kill_switch_path
         self._manual_kill_switch = False
         self._start_of_day_equity: float | None = None
+        self._trades_accepted_today = 0
 
     def activate_kill_switch(self) -> None:
         self._manual_kill_switch = True
@@ -46,6 +47,7 @@ class RiskManager:
 
     def mark_start_of_day(self, equity: float) -> None:
         self._start_of_day_equity = equity
+        self._trades_accepted_today = 0
 
     @property
     def start_of_day_equity(self) -> float | None:
@@ -91,6 +93,7 @@ class RiskManager:
             alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
             return RiskDecision(False, 0, reason, snapshot)
 
+        self._trades_accepted_today += 1
         return RiskDecision(True, sized_qty, "accepted", snapshot)
 
     def _size_position(self, signal: Signal, snapshot: AccountSnapshot, now: datetime | None = None) -> int:
@@ -100,6 +103,24 @@ class RiskManager:
 
         dollar_risk_budget = snapshot.net_liquidation * self.config.risk_per_trade_pct
         raw_shares = math.floor(dollar_risk_budget / risk_per_share)
+
+        if self._trades_accepted_today == 0:
+            # Daily "starter position" test: the day's first trade is taken
+            # deliberately smaller, regardless of setup quality, as a live
+            # read on today's market regime -- not a confidence judgment
+            # about this specific signal.
+            raw_shares = math.floor(raw_shares * self.config.starter_trade_size_multiplier)
+        else:
+            starter_pnl = self.account_state.first_closing_trade_pnl()
+            if starter_pnl is not None and starter_pnl <= 0:
+                # The starter trade lost -- source material's "caution
+                # flag": a valid, five-pillars-passing setup failing on the
+                # very first attempt of the day is read as a cold-market
+                # signal, not evidence the pattern itself is broken. Cap
+                # size for every trade for the rest of the session rather
+                # than relying on the human tendency to do the opposite
+                # (increase size trying to make the loss back quickly).
+                raw_shares = math.floor(raw_shares * self.config.starter_trade_downgrade_multiplier)
 
         if signal.context.get("catalyst_category"):
             # Boost applied to the raw, uncapped share count -- so it can
