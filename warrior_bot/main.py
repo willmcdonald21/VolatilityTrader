@@ -50,6 +50,7 @@ class WarriorBot:
         self.contexts: dict[str, SymbolContext] = {}
         self.contracts: dict[str, Contract] = {}
         self._subscriptions: dict[str, object] = {}
+        self.ib.connectedEvent += self._on_connected
 
         conn = get_connection(config.resolve_path(config.journal.db_path))
         self.journal = Journal(conn)
@@ -112,6 +113,30 @@ class WarriorBot:
         if self._risk_task:
             self._risk_task.cancel()
         self.ib_client.disconnect()
+
+    def _on_connected(self) -> None:
+        """Fires on every successful (re)connect, including reconnects --
+        ib_async's own disconnect() docs state it "will clear all session
+        state", which silently kills every symbol's live bar subscription
+        without raising anything. A no-op on the very first connect (there's
+        nothing tracked yet); on a reconnect, drops already-tracked symbols
+        so `_scan_loop` treats them as new again and re-onboards them --
+        fresh contract qualification, warmup bars, and a live bar
+        subscription on the new session. Never touches `position_manager`:
+        already-open bracket orders are standing orders IBKR keeps working
+        server-side independent of our API session."""
+        if not self.contexts:
+            return
+        orphaned = list(self.contexts.keys())
+        self.logger.warning(
+            "Reconnected -- dropping bar subscriptions for %d already-tracked symbol(s) "
+            "(disconnect clears all session state); will re-onboard on next scan: %s",
+            len(orphaned),
+            orphaned,
+        )
+        self.contexts.clear()
+        self.contracts.clear()
+        self._subscriptions.clear()
 
     async def _scan_loop(self) -> None:
         while True:

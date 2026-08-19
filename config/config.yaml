@@ -93,7 +93,7 @@ strategies:
     target_r_multiple: 1.5
 
 news:
-  enabled: false
+  enabled: true
   lookback_hours: 48          # how far back to check for a catalyst headline when a symbol is onboarded
   provider_codes: ""          # e.g. "BRFG+DJNL"; empty = auto-discover entitled providers via reqNewsProviders()
 

@@ -115,18 +115,14 @@ class BaseStrategy(ABC):
 
     def _check_engaged(self, ctx: SymbolContext) -> bool:
         """Stock-level engagement gate, distinct from any per-signal MACD
-        check: once the 9/20 EMA MACD crosses bearish for a symbol, this
-        strategy permanently stops considering new entries on it for the
-        rest of the session ("should I even be looking at trades on this
-        name right now"), until reset_daily(). Uses (9, 20) specifically --
-        Ross Cameron's own chart MACD setup -- not the textbook (12, 26)
-        used elsewhere."""
-        state = self.state_for(ctx.symbol)
-        if state.get("disengaged"):
-            return False
+        check: "should I even be looking at trades on this name right now."
+        Re-evaluated on every bar from the current 9/20 EMA MACD only --
+        a symbol that goes bearish and later turns bullish again is
+        reconsidered, not excluded for the rest of the session. Uses
+        (9, 20) specifically -- Ross Cameron's own chart MACD setup -- not
+        the textbook (12, 26) used elsewhere."""
         macd_result = ctx.macd(fast=9, slow=20)
         if macd_result is not None and macd_result[0] <= macd_result[1]:
-            state["disengaged"] = True
             return False
         return True
 
