@@ -40,11 +40,11 @@ class BullFlagStrategy(BaseStrategy):
         if state.get("triggered"):
             return None
         if not self._check_engaged(ctx):
-            return None
+            return self._reject(ctx, "macd_bearish")
 
         rel_vol = ctx.relative_volume(session_elapsed_fraction(now))
         if rel_vol is None or rel_vol < cfg.min_rel_volume:
-            return None
+            return self._reject(ctx, "relative_volume")
 
         prior_bars = ctx.bars[:-1]
         # minimum viable window: 1 baseline bar + 1 spike bar + the shortest allowed consolidation
@@ -58,40 +58,40 @@ class BullFlagStrategy(BaseStrategy):
         pre_spike = window[: spike_idx + 1]
         baseline_low = min(b.low for b in pre_spike)
         if baseline_low <= 0:
-            return None
+            return self._reject(ctx, "invalid_baseline")
         spike_pct = (spike_high - baseline_low) / baseline_low * 100.0
         if spike_pct < cfg.min_spike_pct:
-            return None
+            return self._reject(ctx, "spike_pct")
 
         consolidation = window[spike_idx + 1 :]
         if not (cfg.min_consolidation_bars <= len(consolidation) <= cfg.max_consolidation_bars):
-            return None
+            return self._reject(ctx, "consolidation_bars")
 
         pullback_low_bar = min(consolidation, key=lambda b: b.low)
         pullback_low = pullback_low_bar.low
         spike_range = spike_high - baseline_low
         pullback_pct = (spike_high - pullback_low) / spike_range * 100.0 if spike_range > 0 else 100.0
         if pullback_pct > cfg.max_pullback_pct:
-            return None
+            return self._reject(ctx, "pullback_pct")
 
         validity = validate_pullback(
             pullback_bars=consolidation, up_move_bars=pre_spike, ctx=ctx, config=self.pullback_quality_config
         )
         if not validity.valid:
-            return None
+            return self._reject(ctx, f"pullback_quality:{validity.reason}")
 
         flag_high = max(b.high for b in consolidation)
         current_bar = ctx.bars[-1]
         if current_bar.close <= flag_high:
-            return None
+            return self._reject(ctx, "no_breakout")
 
         if candle_strength(current_bar) < cfg.min_breakout_candle_strength:
-            return None
+            return self._reject(ctx, "weak_breakout_candle")
 
         entry_price = current_bar.close
         stop_price = pullback_low * (1 - cfg.stop_buffer_pct / 100.0)
         if stop_price >= entry_price:
-            return None
+            return self._reject(ctx, "invalid_stop")
 
         prior_bar = ctx.bars[-2]
         state["triggered"] = True

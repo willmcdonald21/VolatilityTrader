@@ -398,8 +398,8 @@ concrete, mechanically implementable rules (unlike file 8's vaguer
 - **Cause #1's diminishing-returns/slippage modeling** (position size
   scaling into 1,000s-10,000s of shares eventually hits liquidity/slippage
   limits relative to a stock's own volume) is not applicable at this
-  bot's current configured scale -- `risk.max_shares_per_trade` (2,000)
-  and `risk.max_position_notional_usd` ($5,000) already keep it well
+  bot's current configured scale -- `risk.max_position_pct_of_buying_power`
+  (0.25) already keeps position size proportional to the account and well
   inside "no meaningful slippage" territory for a small account, and
   there's no backtesting engine in this codebase to model diminishing
   returns against in the first place (per the README: the SQLite journal,
@@ -530,9 +530,11 @@ existing design:
   describes exactly how `RiskManager._size_position` already works:
   `dollar_risk_budget = net_liquidation * risk_per_trade_pct`, shares
   sized from *that* divided by stop distance, with position notional
-  capped only by the separate hard ceilings
-  (`max_position_notional_usd`/`max_shares_per_trade`/buying power) --
-  never as a fixed fraction of equity tied to risk-per-trade. No tension
+  capped by `risk.max_position_pct_of_buying_power` (a ceiling relative to
+  *current* buying power, not a fixed dollar/share count -- replaced the
+  old fixed `max_position_notional_usd`/`max_shares_per_trade` pair so the
+  cap scales correctly across account sizes, from a ~$1,000 live account
+  up) -- never as a fixed fraction of equity tied to risk-per-trade. No tension
   with file 5's starter-size ramp either: that's a *daily* ramp
   (`risk.cushion_size_fraction`, already implemented), a different,
   independently-configurable layer from per-trade stop-distance sizing.

@@ -31,50 +31,50 @@ class GapAndGoStrategy(BaseStrategy):
         if state.get("triggered"):
             return None
         if not self._check_engaged(ctx):
-            return None
+            return self._reject(ctx, "macd_bearish")
 
         price = ctx.last_price
         if price is None or not (cfg.min_price <= price <= cfg.max_price):
-            return None
+            return self._reject(ctx, "price_out_of_range")
 
         if cfg.enable_float_filter and self.float_provider is not None:
             if not self.float_provider.passes_filter(ctx.symbol, cfg.max_float_shares):
-                return None
+                return self._reject(ctx, "float_filter")
 
         if cfg.min_float_rotation > 0 and self.float_provider is not None:
             float_shares = self.float_provider.get_float_shares(ctx.symbol)
             if float_shares is not None and float_shares > 0:
                 rotation = ctx.cumulative_volume / float_shares
                 if rotation < cfg.min_float_rotation:
-                    return None
+                    return self._reject(ctx, "float_rotation")
 
         gap = ctx.gap_pct
         if gap is None or gap < cfg.min_gap_pct:
-            return None
+            return self._reject(ctx, "gap_pct")
 
         rel_vol = ctx.relative_volume(session_elapsed_fraction(now))
         if rel_vol is None or rel_vol < cfg.min_rel_volume:
-            return None
+            return self._reject(ctx, "relative_volume")
 
         # Breakout level is computed from bars *before* the current one, so
         # the current bar is judged against a level it couldn't itself set.
         prior_bars = ctx.bars[:-1]
         range_ = opening_range(prior_bars, cfg.breakout_lookback_bars)
         if range_ is None:
-            return None
+            return self._reject(ctx, "no_opening_range")
         breakout_high, _ = range_
 
         current_bar = ctx.bars[-1]
         if current_bar.close <= breakout_high:
-            return None
+            return self._reject(ctx, "no_breakout")
 
         if candle_strength(current_bar) < cfg.min_breakout_candle_strength:
-            return None
+            return self._reject(ctx, "weak_breakout_candle")
 
         entry_price = current_bar.close
         stop_price = breakout_high * (1 - cfg.stop_buffer_pct / 100.0)
         if stop_price >= entry_price:
-            return None
+            return self._reject(ctx, "invalid_stop")
 
         prior_bar = ctx.bars[-2]
         state["triggered"] = True

@@ -32,11 +32,11 @@ class AbcdStrategy(BaseStrategy):
         if state.get("triggered"):
             return None
         if not self._check_engaged(ctx):
-            return None
+            return self._reject(ctx, "macd_bearish")
 
         rel_vol = ctx.relative_volume(session_elapsed_fraction(now))
         if rel_vol is None or rel_vol < cfg.min_rel_volume:
-            return None
+            return self._reject(ctx, "relative_volume")
 
         prior_bars = ctx.bars[:-1]
         # minimum viable window: 1 baseline (A) bar + 1 spike (B) bar + at least 1 pullback (C) bar
@@ -50,38 +50,38 @@ class AbcdStrategy(BaseStrategy):
         pre_b = window[: b_idx + 1]
         a_low = min(b.low for b in pre_b)
         if a_low <= 0:
-            return None
+            return self._reject(ctx, "invalid_baseline")
         ab_move_pct = (b_high - a_low) / a_low * 100.0
         if ab_move_pct < cfg.min_ab_move_pct:
-            return None
+            return self._reject(ctx, "ab_move_pct")
 
         post_b = window[b_idx + 1 :]
         if not post_b:
-            return None
+            return self._reject(ctx, "no_pullback_bars")
         c_low_bar = min(post_b, key=lambda b: b.low)
         c_low = c_low_bar.low
         ab_range = b_high - a_low
         bc_pullback_pct = (b_high - c_low) / ab_range * 100.0 if ab_range > 0 else 100.0
         if not (cfg.min_bc_pullback_pct <= bc_pullback_pct <= cfg.max_bc_pullback_pct):
-            return None
+            return self._reject(ctx, "bc_pullback_pct")
 
         validity = validate_pullback(
             pullback_bars=post_b, up_move_bars=pre_b, ctx=ctx, config=self.pullback_quality_config
         )
         if not validity.valid:
-            return None
+            return self._reject(ctx, f"pullback_quality:{validity.reason}")
 
         current_bar = ctx.bars[-1]
         if current_bar.close <= b_high:
-            return None
+            return self._reject(ctx, "no_breakout")
 
         if candle_strength(current_bar) < cfg.min_breakout_candle_strength:
-            return None
+            return self._reject(ctx, "weak_breakout_candle")
 
         entry_price = current_bar.close
         stop_price = c_low * (1 - cfg.stop_buffer_pct / 100.0)
         if stop_price >= entry_price:
-            return None
+            return self._reject(ctx, "invalid_stop")
 
         prior_bar = ctx.bars[-2]
         state["triggered"] = True

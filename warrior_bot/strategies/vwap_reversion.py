@@ -22,54 +22,78 @@ class VwapReversionStrategy(BaseStrategy):
     config: VwapReversionConfig
 
     def evaluate(self, ctx: SymbolContext, now: datetime) -> Signal | None:
-        cfg = self.config
         state = self.state_for(ctx.symbol)
         if state.get("triggered"):
             return None
         if not self._check_engaged(ctx):
-            return None
+            return self._reject(ctx, "macd_bearish")
         if len(ctx.bars) < 3:
             return None
 
+        signal = self._check_red_to_green(ctx, now, state)
+        if signal is not None:
+            return signal
+        return self._check_vwap_bounce(ctx, now, state)
+
+    def _check_red_to_green(self, ctx: SymbolContext, now: datetime, state: dict) -> Signal | None:
+        cfg = self.config
+        current_bar = ctx.bars[-1]
+        prev_bar = ctx.bars[-2]
+
+        if ctx.prior_close is None or not is_red_to_green(ctx.prior_close, current_bar.close, prev_bar.close):
+            return None
+
+        rel_vol = ctx.relative_volume(session_elapsed_fraction(now))
+        if rel_vol is None or rel_vol < cfg.red_to_green_volume_multiple:
+            return self._reject(ctx, "red_to_green_relative_volume")
+
+        entry_price = current_bar.close
+        lookback_low = min(b.low for b in ctx.bars[-3:])
+        stop_price = lookback_low * (1 - cfg.stop_buffer_pct / 100.0)
+        if stop_price >= entry_price:
+            return self._reject(ctx, "red_to_green_invalid_stop")
+
+        state["triggered"] = True
+        return self._build_signal(
+            ctx,
+            now,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            target_r_multiple=cfg.target_r_multiple,
+            context={"setup": "red_to_green", "relative_volume": rel_vol},
+        )
+
+    def _check_vwap_bounce(self, ctx: SymbolContext, now: datetime, state: dict) -> Signal | None:
+        cfg = self.config
         vwap_price = ctx.vwap
         current_bar = ctx.bars[-1]
         prev_bar = ctx.bars[-2]
 
-        if ctx.prior_close is not None and is_red_to_green(ctx.prior_close, current_bar.close, prev_bar.close):
-            rel_vol = ctx.relative_volume(session_elapsed_fraction(now))
-            if rel_vol is not None and rel_vol >= cfg.red_to_green_volume_multiple:
-                entry_price = current_bar.close
-                lookback_low = min(b.low for b in ctx.bars[-3:])
-                stop_price = lookback_low * (1 - cfg.stop_buffer_pct / 100.0)
-                if stop_price < entry_price:
-                    state["triggered"] = True
-                    return self._build_signal(
-                        ctx,
-                        now,
-                        entry_price=entry_price,
-                        stop_price=stop_price,
-                        target_r_multiple=cfg.target_r_multiple,
-                        context={"setup": "red_to_green", "relative_volume": rel_vol},
-                    )
+        if vwap_price is None or vwap_price <= 0:
+            return self._reject(ctx, "vwap_unavailable")
 
-        if vwap_price is not None and vwap_price > 0:
-            distance_pct = abs(prev_bar.low - vwap_price) / vwap_price * 100.0
-            touched_vwap = distance_pct <= cfg.max_vwap_distance_pct
-            bounced = current_bar.close > prev_bar.high and current_bar.close > vwap_price
-            if touched_vwap and bounced:
-                rel_vol = ctx.relative_volume(session_elapsed_fraction(now))
-                if rel_vol is not None and rel_vol >= cfg.min_rel_volume:
-                    entry_price = current_bar.close
-                    stop_price = min(prev_bar.low, current_bar.low) * (1 - cfg.stop_buffer_pct / 100.0)
-                    if stop_price < entry_price:
-                        state["triggered"] = True
-                        return self._build_signal(
-                            ctx,
-                            now,
-                            entry_price=entry_price,
-                            stop_price=stop_price,
-                            target_r_multiple=cfg.target_r_multiple,
-                            context={"setup": "vwap_bounce", "vwap": vwap_price, "relative_volume": rel_vol},
-                        )
+        distance_pct = abs(prev_bar.low - vwap_price) / vwap_price * 100.0
+        if distance_pct > cfg.max_vwap_distance_pct:
+            return self._reject(ctx, "vwap_distance")
 
-        return None
+        if not (current_bar.close > prev_bar.high and current_bar.close > vwap_price):
+            return self._reject(ctx, "vwap_no_bounce")
+
+        rel_vol = ctx.relative_volume(session_elapsed_fraction(now))
+        if rel_vol is None or rel_vol < cfg.min_rel_volume:
+            return self._reject(ctx, "vwap_bounce_relative_volume")
+
+        entry_price = current_bar.close
+        stop_price = min(prev_bar.low, current_bar.low) * (1 - cfg.stop_buffer_pct / 100.0)
+        if stop_price >= entry_price:
+            return self._reject(ctx, "vwap_bounce_invalid_stop")
+
+        state["triggered"] = True
+        return self._build_signal(
+            ctx,
+            now,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            target_r_multiple=cfg.target_r_multiple,
+            context={"setup": "vwap_bounce", "vwap": vwap_price, "relative_volume": rel_vol},
+        )

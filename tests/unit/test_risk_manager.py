@@ -38,8 +38,10 @@ def make_risk_manager(tmp_path, snapshot, **risk_overrides) -> RiskManager:
         risk_per_trade_pct=risk_overrides.get("risk_per_trade_pct", 0.01),
         daily_loss_limit_pct=risk_overrides.get("daily_loss_limit_pct", 0.02),
         max_concurrent_positions=risk_overrides.get("max_concurrent_positions", 3),
-        max_position_notional_usd=risk_overrides.get("max_position_notional_usd", 5000),
-        max_shares_per_trade=risk_overrides.get("max_shares_per_trade", 2000),
+        # 0.25 * default_snapshot()'s buying_power(20_000) = 5_000 -- reproduces
+        # the same effective cap as the old fixed max_position_notional_usd(5000)
+        # default, so existing sized_qty expectations below stay unchanged.
+        max_position_pct_of_buying_power=risk_overrides.get("max_position_pct_of_buying_power", 0.25),
         daily_profit_goal_usd=risk_overrides.get("daily_profit_goal_usd"),
         cushion_profit_fraction=risk_overrides.get("cushion_profit_fraction", 0.25),
         cushion_size_fraction=risk_overrides.get("cushion_size_fraction", 0.25),
@@ -68,7 +70,7 @@ def default_snapshot(**overrides) -> AccountSnapshot:
     return AccountSnapshot(
         net_liquidation=overrides.get("net_liquidation", 100_000),
         available_funds=overrides.get("available_funds", 100_000),
-        buying_power=overrides.get("buying_power", 200_000),
+        buying_power=overrides.get("buying_power", 20_000),
         open_positions_count=overrides.get("open_positions_count", 0),
         daily_realized_pnl=overrides.get("daily_realized_pnl", 0.0),
     )
@@ -82,8 +84,8 @@ def test_accepts_signal_and_sizes_by_risk_pct(tmp_path):
     decision = rm.evaluate(signal)
 
     assert decision.accepted
-    # dollar_risk_budget = 100_000 * 0.01 = 1000 -> 1000 shares, capped by notional/shares caps below
-    assert decision.sized_qty == 500  # capped by max_position_notional_usd(5000)/entry(10) = 500
+    # dollar_risk_budget = 100_000 * 0.01 = 1000 -> 1000 shares, capped below
+    assert decision.sized_qty == 500  # capped by 0.25 * buying_power(20_000) / entry(10) = 500
 
 
 def test_rejects_when_kill_switch_flag_file_present(tmp_path):
@@ -142,7 +144,9 @@ def test_rejects_when_sized_qty_rounds_to_zero(tmp_path):
 
 def test_sizing_capped_by_buying_power(tmp_path):
     snapshot = default_snapshot(net_liquidation=1_000_000, buying_power=100)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.05, max_position_notional_usd=1_000_000, max_shares_per_trade=100_000)
+    # pct=1.0 isolates the raw buying-power ceiling itself (the cap can
+    # never exceed 100% of buying power regardless of how high the pct is set)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.05, max_position_pct_of_buying_power=1.0)
     signal = make_signal(entry=10.0, stop=9.0)
 
     decision = rm.evaluate(signal)
@@ -181,7 +185,7 @@ def test_catalyst_boost_still_capped_by_hard_limits(tmp_path):
     decision = rm.evaluate(signal)
 
     assert decision.accepted
-    # raw_shares(100) * 100 = 10,000 -- but still clamped to max_position_notional_usd(5000)/entry(10)
+    # raw_shares(100) * 100 = 10,000 -- but still clamped to 0.25 * buying_power(20_000) / entry(10)
     assert decision.sized_qty == 500
 
 
@@ -437,7 +441,7 @@ def test_profit_cushion_reduces_size_before_goal_progress(tmp_path):
     decision = rm.evaluate(signal)
 
     assert decision.accepted
-    # full size would be 500 (capped by max_position_notional_usd); cushion not yet met -> 25%
+    # full size would be 500 (capped by max_position_pct_of_buying_power); cushion not yet met -> 25%
     assert decision.sized_qty == 125
 
 
@@ -471,8 +475,7 @@ def _make_risk_manager_with_flag(tmp_path, snapshot, flatten_flag: bool, daily_l
         daily_loss_limit_pct=daily_loss_limit_pct,
         flatten_on_daily_loss_limit=flatten_flag,
         max_concurrent_positions=3,
-        max_position_notional_usd=5000,
-        max_shares_per_trade=2000,
+        max_position_pct_of_buying_power=0.25,
     )
     return RiskManager(config, FakeAccountState(snapshot), kill_switch_path=tmp_path / "KILL_SWITCH")
 

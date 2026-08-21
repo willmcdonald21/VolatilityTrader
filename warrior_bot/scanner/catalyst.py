@@ -16,6 +16,11 @@ CATALYST_KEYWORDS: dict[str, tuple[str, ...]] = {
     "contract": ("contract award", "wins contract", "new contract", "partnership", "collaboration agreement"),
     "insider_buying": ("insider buying", "director buys", "ceo buys", "insider purchase", "10b5-1"),
     "upgrade": ("upgraded", "price target raised", "initiates coverage", "outperform"),
+    # A recent reverse split is itself treated as a soft bullish factor in
+    # the source material (artificially shrinks float, "bonus points" per
+    # Ross's own five-pillars framing) -- distinct from the other
+    # categories above, which are fundamental/analyst events.
+    "reverse_split": ("reverse split", "reverse stock split"),
 }
 
 

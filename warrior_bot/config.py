@@ -51,8 +51,13 @@ class RiskConfig(BaseModel):
     daily_loss_limit_pct: float = Field(gt=0, le=0.5)
     flatten_on_daily_loss_limit: bool = False
     max_concurrent_positions: int = Field(gt=0)
-    max_position_notional_usd: float = Field(gt=0)
-    max_shares_per_trade: int = Field(gt=0)
+    # Single-trade ceiling expressed relative to *current* buying power,
+    # not a fixed dollar or share count -- a fixed number is meaningless
+    # across account sizes (2,000 shares is nothing on a $1M account and
+    # more than the whole account on a $1,000 one). Paired with
+    # max_concurrent_positions above: at the default 0.25 and 3 positions,
+    # at most ~75% of buying power is deployable at once, leaving headroom.
+    max_position_pct_of_buying_power: float = Field(gt=0, le=1.0)
     daily_profit_goal_usd: float | None = None
     cushion_profit_fraction: float = Field(default=0.25, gt=0, le=1)
     cushion_size_fraction: float = Field(default=0.25, gt=0, le=1)
@@ -167,11 +172,31 @@ class VwapReversionConfig(BaseModel):
     target_r_multiple: float = 1.5
 
 
+class InvertedHeadAndShouldersConfig(BaseModel):
+    # Secondary/non-primary pattern in the source material (a live example
+    # from a trade recap, not one of the four core taught setups) -- off by
+    # default until validated against real sessions, unlike the four
+    # strategies above which are the source material's core taught setups.
+    enabled: bool = False
+    min_rel_volume: float = 5.0  # same blanket five-pillars floor as the other strategies
+    # How far apart the two shoulder lows may sit, relative to the head low,
+    # before the shape stops reading as a head-and-shoulders (shoulders
+    # roughly comparable depth, not required to match exactly).
+    max_shoulder_asymmetry_pct: float = Field(default=40.0, gt=0)
+    # Head must dip meaningfully below the neckline -- guards against
+    # noise-level 1-minute-bar wiggles registering as a "head."
+    min_head_depth_pct: float = Field(default=3.0, gt=0)
+    stop_buffer_pct: float = 0.5
+    target_r_multiple: float = 2.0
+    min_breakout_candle_strength: float = Field(default=0.0, ge=-1.0, le=1.0)
+
+
 class StrategiesConfig(BaseModel):
     gap_and_go: GapAndGoConfig = GapAndGoConfig()
     bull_flag: BullFlagConfig = BullFlagConfig()
     abcd: AbcdConfig = AbcdConfig()
     vwap_reversion: VwapReversionConfig = VwapReversionConfig()
+    inverted_head_and_shoulders: InvertedHeadAndShouldersConfig = InvertedHeadAndShouldersConfig()
 
 
 class ScaleOutConfig(BaseModel):

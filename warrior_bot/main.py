@@ -28,6 +28,7 @@ from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
 from warrior_bot.strategies.bull_flag import BullFlagStrategy
 from warrior_bot.strategies.gap_and_go import GapAndGoStrategy
 from warrior_bot.strategies.indicators import Bar
+from warrior_bot.strategies.inverted_head_and_shoulders import InvertedHeadAndShouldersStrategy
 from warrior_bot.strategies.vwap_reversion import VwapReversionStrategy
 from warrior_bot.utils.panic import panic_stop
 from warrior_bot.utils.time_utils import to_eastern
@@ -82,6 +83,10 @@ class WarriorBot:
             self.strategies.append(AbcdStrategy(config.strategies.abcd, config.pullback_quality))
         if config.strategies.vwap_reversion.enabled:
             self.strategies.append(VwapReversionStrategy(config.strategies.vwap_reversion))
+        if config.strategies.inverted_head_and_shoulders.enabled:
+            self.strategies.append(
+                InvertedHeadAndShouldersStrategy(config.strategies.inverted_head_and_shoulders)
+            )
 
         self._scan_task: asyncio.Task | None = None
         self._risk_task: asyncio.Task | None = None

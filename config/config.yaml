@@ -16,8 +16,7 @@ risk:
   daily_loss_limit_pct: 0.02     # halt new entries once daily realized loss exceeds this fraction of start-of-day equity
   flatten_on_daily_loss_limit: true  # force-close open positions when the daily halt triggers -- enabled for the unattended overnight test since no one can intervene manually
   max_concurrent_positions: 3
-  max_position_notional_usd: 5000
-  max_shares_per_trade: 2000
+  max_position_pct_of_buying_power: 0.25  # single-trade ceiling as a fraction of current buying power, not a fixed $ or share count -- scales with account size (paper today, ~$1,000 live to start)
   daily_profit_goal_usd: null      # set to enable "profit cushion" sizing; null = feature off, always full size
   cushion_profit_fraction: 0.25    # trade at reduced size until this fraction of the daily goal is realized
   cushion_size_fraction: 0.25      # size multiplier applied while under the cushion threshold
@@ -91,6 +90,14 @@ strategies:
     min_rel_volume: 5.0           # applies to the vwap_bounce setup, which previously had no relative-volume gate at all
     stop_buffer_pct: 0.5
     target_r_multiple: 1.5
+  inverted_head_and_shoulders:
+    enabled: false                 # secondary/non-primary pattern from a live trade recap, not one of the four core taught setups -- off until validated against real sessions
+    min_rel_volume: 5.0            # same hard floor -- blanket five-pillars criterion
+    max_shoulder_asymmetry_pct: 40.0  # how far apart the two shoulder lows may sit, relative to the head low, before the shape stops reading as a head-and-shoulders
+    min_head_depth_pct: 3.0        # head must dip meaningfully below the neckline, not a noise-level 1-minute-bar wiggle
+    stop_buffer_pct: 0.5
+    target_r_multiple: 2.0
+    min_breakout_candle_strength: 0.0
 
 news:
   enabled: true
@@ -146,5 +153,5 @@ kill_switch:
   flag_file: data/KILL_SWITCH
 
 logging:
-  level: INFO
+  level: DEBUG
   file: data/warrior_bot.log

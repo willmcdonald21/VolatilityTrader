@@ -19,12 +19,28 @@ class IBClient:
     subscribing to data, etc.) — this class only owns lifecycle.
     """
 
+    # IBKR sends these through errorEvent even though they're routine status
+    # notices, not real errors (market data farm connection established/OK,
+    # HMDS farm connection established/OK) -- downgraded to DEBUG so a
+    # normal session doesn't spam WARNING on every symbol subscription.
+    _INFORMATIONAL_ERROR_CODES = {2104, 2106, 2107, 2108, 2119, 2158}
+
     def __init__(self, config: AppConfig):
         self.config = config
         self.ib = IB()
         self._contract_cache: dict[str, Contract] = {}
         self.ib.disconnectedEvent += self._on_disconnected
+        self.ib.errorEvent += self._on_error
         self._reconnecting = False
+
+    def _on_error(self, reqId: int, errorCode: int, errorString: str, contract) -> None:
+        # ib_async's own error channel -- e.g. historical-data pacing
+        # violations (162, 366) or subscription failures never surface
+        # anywhere else, since nothing else in this codebase listens to
+        # errorEvent. Without this hook, that whole class of failure is
+        # invisible in data/warrior_bot.log no matter the log level.
+        level = logging.DEBUG if errorCode in self._INFORMATIONAL_ERROR_CODES else logging.WARNING
+        logger.log(level, "IBKR errorEvent reqId=%s code=%s: %s (%s)", reqId, errorCode, errorString, contract)
 
     async def connect(self) -> None:
         t = self.config.trading

@@ -171,11 +171,14 @@ class RiskManager:
             if self.config.time_of_day_boost_start <= now_et.time() < self.config.time_of_day_boost_end:
                 raw_shares = math.floor(raw_shares * self.config.time_of_day_size_multiplier)
 
-        cap_by_notional = math.floor(self.config.max_position_notional_usd / signal.entry_price)
-        cap_by_buying_power = math.floor(snapshot.buying_power / signal.entry_price)
-        cap_by_abs_shares = self.config.max_shares_per_trade
+        # Relative to current buying power, not a fixed dollar/share count --
+        # this is the whole cap now, since max_position_pct_of_buying_power
+        # <= 1.0 already guarantees it never exceeds buying power itself.
+        cap_by_pct_of_buying_power = math.floor(
+            (snapshot.buying_power * self.config.max_position_pct_of_buying_power) / signal.entry_price
+        )
 
-        sized_qty = max(0, min(raw_shares, cap_by_notional, cap_by_buying_power, cap_by_abs_shares))
+        sized_qty = max(0, min(raw_shares, cap_by_pct_of_buying_power))
 
         if self.config.daily_profit_goal_usd and not self._cushion_met(snapshot):
             sized_qty = math.floor(sized_qty * self.config.cushion_size_fraction)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -102,6 +103,7 @@ class BaseStrategy(ABC):
     def __init__(self, config: Any):
         self.config = config
         self._state: dict[str, dict] = {}
+        self.logger = logging.getLogger(f"warrior_bot.strategies.{self.name}")
 
     @property
     def enabled(self) -> bool:
@@ -112,6 +114,16 @@ class BaseStrategy(ABC):
 
     def reset_daily(self) -> None:
         self._state.clear()
+
+    def _reject(self, ctx: SymbolContext, reason: str) -> None:
+        """Breadcrumb for why a candidate didn't produce a signal on this
+        bar -- silent at the default INFO log level, opt in via
+        `logging.level: DEBUG` in config.yaml to see live gate misses.
+        Only called for genuine criteria misses (a threshold or pattern
+        check that failed), not for transient states like "not enough
+        bars yet" or "already traded this symbol today"."""
+        self.logger.debug("%s: no signal (%s)", ctx.symbol, reason)
+        return None
 
     def _check_engaged(self, ctx: SymbolContext) -> bool:
         """Stock-level engagement gate, distinct from any per-signal MACD

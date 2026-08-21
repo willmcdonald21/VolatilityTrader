@@ -34,6 +34,11 @@ def test_classifies_upgrade_headline():
     assert result.category == "upgrade"
 
 
+def test_classifies_reverse_split_headline():
+    result = classify_headlines(["XYZ Announces 1-for-10 Reverse Stock Split"])
+    assert result.category == "reverse_split"
+
+
 def test_no_match_returns_empty_catalyst_info():
     result = classify_headlines(["XYZ Stock Moves in Active Trading"])
     assert result.category is None
