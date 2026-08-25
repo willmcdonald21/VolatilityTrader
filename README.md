@@ -4,7 +4,9 @@ Automated IBKR day-trading bot modeled on Warrior Trading / Ross Cameron momentu
 
 ## Status
 
-Environment, core infrastructure (broker connectivity, risk manager, order manager, bracket orders, SQLite trade journal), and all four strategies are built and unit-tested (`pytest tests/unit` — 50 passing). **Not yet connected to a live IB Gateway paper session** — that's the next step, and it requires your own IBKR login, so it isn't automated here.
+Environment, core infrastructure (broker connectivity, risk manager, order manager, bracket orders, SQLite trade journal), and all four strategies are built and unit-tested (`pytest tests/unit` — 50 passing). Connected to a live IB Gateway paper session and running unattended (screen session + auto-restart supervisor) since 2026-08-17 — no trades placed yet.
+
+**Real-time market data (as of 2026-08-25):** subscribed to IBKR's NYSE (Network A/CTA), NASDAQ (Network C/UTP), and NYSE American/BATS/ARCA/IEX (Network B) Level I bundles — $4.50/month total. Before this, the account only had free non-consolidated streaming quotes (Cboe BZX/BYX/EDGX/EDGA + IEX) and no NYSE/NASDAQ/full-ARCA coverage, which is the suspected root cause of the scanner's `code 492` "imprecise results" warning and of zero strategy signals ever firing across a full week of runtime — the live 1-minute bar stream each onboarded symbol depends on may not have been receiving genuine live updates without this entitlement. Unverified until confirmed against a live session with these subscriptions active.
 
 ## One-time setup
 
