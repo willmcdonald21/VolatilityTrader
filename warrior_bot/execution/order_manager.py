@@ -99,6 +99,7 @@ class OrderManager:
         self.position_manager.track(
             contract,
             signal,
+            signal_id=signal_id,
             stop_trade=stop_trade,
             stop_row_id=stop_row_id,
             target_trade=target_trade,

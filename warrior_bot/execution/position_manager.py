@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from ib_async import IB, Contract, MarketOrder, Order, Trade
+from ib_async import IB, Contract, MarketOrder, Order, StopLimitOrder, StopOrder, Trade
 
 from warrior_bot.config import ExitsConfig
 from warrior_bot.persistence.journal import Journal
@@ -17,6 +17,7 @@ from warrior_bot.strategies.indicators import (
     is_topping_tail,
     trailing_candidate,
 )
+from warrior_bot.utils.rounding import round_to_tick
 
 logger = logging.getLogger("warrior_bot.execution.position_manager")
 
@@ -26,9 +27,11 @@ class ManagedPosition:
     symbol: str
     contract: Contract
     signal: Signal
+    signal_id: int
     remaining_qty: int
     stop_order: Order
     stop_row_id: int
+    current_stop_price: float
     target_order: Order | None
     target_role: str
     breakeven_done: bool = False
@@ -58,6 +61,7 @@ class PositionManager:
         self,
         contract: Contract,
         signal: Signal,
+        signal_id: int,
         stop_trade: Trade,
         stop_row_id: int,
         target_trade: Trade,
@@ -67,9 +71,11 @@ class PositionManager:
             symbol=signal.symbol,
             contract=contract,
             signal=signal,
+            signal_id=signal_id,
             remaining_qty=int(stop_trade.order.totalQuantity),
             stop_order=stop_trade.order,
             stop_row_id=stop_row_id,
+            current_stop_price=signal.stop_price,
             target_order=target_trade.order,
             target_role=target_role,
         )
@@ -78,11 +84,20 @@ class PositionManager:
         def on_target_fill(t: Trade, fill) -> None:
             self._on_target_fill(pos, fill)
 
+        target_trade.fillEvent += on_target_fill
+        self._wire_stop_fill(pos, stop_trade)
+
+    def _wire_stop_fill(self, pos: ManagedPosition, trade: Trade) -> None:
+        """Shared by track() (initial stop) and _replace_stop_order() (every
+        replacement stop) -- cancel-and-replace swaps pos.stop_order for a
+        brand-new Trade/Order, so its fillEvent has to be re-wired the same
+        way each time or a fill on the replacement stop would never be
+        noticed."""
+
         def on_stop_fill(t: Trade, fill) -> None:
             self._on_stop_fill(pos, fill)
 
-        target_trade.fillEvent += on_target_fill
-        stop_trade.fillEvent += on_stop_fill
+        trade.fillEvent += on_stop_fill
 
     def on_bar(self, ctx: SymbolContext) -> None:
         pos = self._positions.get(ctx.symbol)
@@ -119,8 +134,8 @@ class PositionManager:
         if self._current_r(pos, last_price) < self.config.breakeven.trigger_r_multiple:
             return
         entry = pos.signal.entry_price
-        if entry > pos.stop_order.auxPrice:
-            self._modify_stop_price(pos, entry)
+        if entry > pos.current_stop_price:
+            self._replace_stop_order(pos, entry)
             logger.info("Breakeven: moved stop for %s to entry %.4f", pos.symbol, entry)
         pos.breakeven_done = True
 
@@ -134,7 +149,7 @@ class PositionManager:
         )
         if candidate is None:
             return
-        current_stop = pos.stop_order.auxPrice
+        current_stop = pos.current_stop_price
         new_stop = max(current_stop, candidate)
         if new_stop <= current_stop or new_stop >= last_price:
             # not tighter, or would be marketable/trigger immediately -- skip
@@ -147,7 +162,7 @@ class PositionManager:
             pos.target_order = None
             logger.info("Trailing activated for %s: cancelled static target", pos.symbol)
 
-        self._modify_stop_price(pos, new_stop)
+        self._replace_stop_order(pos, new_stop)
         logger.info("Trailing: moved stop for %s to %.4f", pos.symbol, new_stop)
 
     def _check_reversal_exit(self, pos: ManagedPosition, ctx: SymbolContext) -> bool:
@@ -212,20 +227,85 @@ class PositionManager:
         )
         self._positions.pop(pos.symbol, None)
 
-    def _modify_stop_price(self, pos: ManagedPosition, new_price: float) -> None:
-        pos.stop_order.auxPrice = new_price
+    def _replace_stop_order(self, pos: ManagedPosition, new_stop_price: float) -> None:
+        """Cancel-and-replace instead of in-place price revision: IBKR
+        rejects in-place revisions on OCA-grouped and/or partially-filled
+        orders with error 10326 ("OCA group revision is not allowed"), and
+        ib_async's own openOrder callback overwrites trade.order.auxPrice/
+        .lmtPrice in place on any broadcast (including IBKR's own
+        anti-crossing repricing on error 399), so pos.stop_order can never
+        be trusted as a read-back source of truth -- pos.current_stop_price
+        is the only value this class treats as authoritative for the
+        monotonic "stop only tightens" invariant.
+
+        Re-links OCA with pos.target_order if it's still live (breakeven
+        case, pre-trailing-activation) using target_order.ocaGroup. If
+        target_order is None (trailing already cancelled it) or was never
+        OCA-linked (scale_out target_role -- bracket_builder deliberately
+        never OCA-links a scale-out leg with the stop), ocaGroup is falsy
+        and no relink is attempted, so the replacement stop is correctly
+        standalone.
+        """
+        new_stop_price = round_to_tick(new_stop_price)
+        action = pos.stop_order.action
+        is_stop_limit = getattr(pos.stop_order, "orderType", None) == "STP LMT"
+
         limit_price = None
-        if getattr(pos.stop_order, "orderType", None) == "STP LMT":
+        if is_stop_limit:
             # keep the limit offset in the same direction bracket_builder
             # used when the order was first built, so trailing/breakeven
             # moves don't drift the limit's protective distance
-            if pos.stop_order.action == "SELL":
-                limit_price = new_price * (1 - self.stop_limit_offset_pct / 100.0)
+            if action == "SELL":
+                limit_price = round_to_tick(new_stop_price * (1 - self.stop_limit_offset_pct / 100.0))
             else:
-                limit_price = new_price * (1 + self.stop_limit_offset_pct / 100.0)
-            pos.stop_order.lmtPrice = limit_price
-        self.ib.placeOrder(pos.contract, pos.stop_order)
-        self.journal.update_order_price(pos.stop_row_id, stop_price=new_price, limit_price=limit_price)
+                limit_price = round_to_tick(new_stop_price * (1 + self.stop_limit_offset_pct / 100.0))
+            new_order = StopLimitOrder(
+                action,
+                pos.remaining_qty,
+                lmtPrice=limit_price,
+                stopPrice=new_stop_price,
+                orderId=self.ib.client.getReqId(),
+                transmit=True,
+                outsideRth=True,
+                tif="DAY",
+            )
+        else:
+            # not hit in production today (bracket_builder only ever builds
+            # StopLimitOrder) -- kept for parity with the branch this replaced
+            new_order = StopOrder(
+                action,
+                pos.remaining_qty,
+                stopPrice=new_stop_price,
+                orderId=self.ib.client.getReqId(),
+                transmit=True,
+                outsideRth=True,
+                tif="DAY",
+            )
+
+        if pos.target_order is not None and pos.target_order.ocaGroup:
+            IB.oneCancelsAll([new_order], pos.target_order.ocaGroup, ocaType=1)
+
+        self.ib.cancelOrder(pos.stop_order)
+        new_trade = self.ib.placeOrder(pos.contract, new_order)
+
+        new_row_id = self.journal.record_order(
+            signal_id=pos.signal_id,
+            ib_order_id=new_order.orderId,
+            role="stop",
+            action=new_order.action,
+            qty=new_order.totalQuantity,
+            order_type=new_order.orderType,
+            limit_price=limit_price,
+            stop_price=new_stop_price,
+            oca_group=new_order.ocaGroup or None,
+            status=new_trade.orderStatus.status,
+        )
+        self.journal.update_order_status(pos.stop_row_id, "Cancelled")
+
+        pos.stop_order = new_order
+        pos.stop_row_id = new_row_id
+        pos.current_stop_price = new_stop_price
+        self._wire_stop_fill(pos, new_trade)
 
     def _resize_stop_qty(self, pos: ManagedPosition, new_qty: int) -> None:
         pos.stop_order.totalQuantity = new_qty
