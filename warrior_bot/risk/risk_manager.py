@@ -122,6 +122,13 @@ class RiskManager:
                 # (increase size trying to make the loss back quickly).
                 raw_shares = math.floor(raw_shares * self.config.starter_trade_downgrade_multiplier)
 
+        if self.account_state.has_open_position(signal.symbol):
+            # Re-entry into a symbol we already hold -- not blocked outright
+            # (a fresh signal can be a legitimate new setup), but sized down
+            # rather than treated as a fresh full-size entry. See
+            # RiskConfig.existing_position_size_multiplier.
+            raw_shares = math.floor(raw_shares * self.config.existing_position_size_multiplier)
+
         if signal.context.get("catalyst_category"):
             # Boost applied to the raw, uncapped share count -- so it can
             # use more of the room within the hard caps below, but can never

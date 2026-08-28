@@ -32,6 +32,7 @@ risk:
   starter_trade_downgrade_multiplier: 0.5 # applied to all trades for the rest of the session if the starter trade lost
   bottoming_tail_size_multiplier: 1.25   # boost when the pullback low bar is a bottoming tail ("hammering out the base")
   round_number_size_multiplier: 1.25     # boost when the breakout candle crosses a psychological round-number level
+  existing_position_size_multiplier: 0.5 # size reduction applied when a signal fires for a symbol we already hold an open position in (re-entry guard)
 
 pullback_quality:
   # Entry-time "dip or dump" dump-avoidance checks, shared by bull_flag/abcd's

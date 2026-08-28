@@ -9,15 +9,24 @@ from warrior_bot.signals.signal import Signal
 
 
 class FakeAccountState:
-    def __init__(self, snapshot: AccountSnapshot, first_closing_trade_pnl: float | None = None):
+    def __init__(
+        self,
+        snapshot: AccountSnapshot,
+        first_closing_trade_pnl: float | None = None,
+        open_position_symbols: set[str] | None = None,
+    ):
         self._snapshot = snapshot
         self._first_closing_trade_pnl = first_closing_trade_pnl
+        self._open_position_symbols = open_position_symbols or set()
 
     def snapshot(self) -> AccountSnapshot:
         return self._snapshot
 
     def first_closing_trade_pnl(self) -> float | None:
         return self._first_closing_trade_pnl
+
+    def has_open_position(self, symbol: str) -> bool:
+        return symbol in self._open_position_symbols
 
 
 def make_signal(entry=10.0, stop=9.0, target=12.0, context=None) -> Signal:
@@ -61,8 +70,13 @@ def make_risk_manager(tmp_path, snapshot, **risk_overrides) -> RiskManager:
         # production default (0.5) lives in RiskConfig itself.
         starter_trade_size_multiplier=risk_overrides.get("starter_trade_size_multiplier", 1.0),
         starter_trade_downgrade_multiplier=risk_overrides.get("starter_trade_downgrade_multiplier", 1.0),
+        existing_position_size_multiplier=risk_overrides.get("existing_position_size_multiplier", 0.5),
     )
-    account_state = FakeAccountState(snapshot, first_closing_trade_pnl=risk_overrides.get("first_closing_trade_pnl"))
+    account_state = FakeAccountState(
+        snapshot,
+        first_closing_trade_pnl=risk_overrides.get("first_closing_trade_pnl"),
+        open_position_symbols=risk_overrides.get("open_position_symbols"),
+    )
     return RiskManager(config, account_state, kill_switch_path=tmp_path / "KILL_SWITCH")
 
 
@@ -253,6 +267,64 @@ def test_no_pullback_pct_no_size_boost(tmp_path):
 
     assert decision.accepted
     assert decision.sized_qty == 100
+
+
+def test_signal_for_already_held_symbol_gets_size_reduction(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(
+        tmp_path, snapshot, risk_per_trade_pct=0.01, existing_position_size_multiplier=0.5, open_position_symbols={"TEST"}
+    )
+    signal = make_signal(entry=10.0, stop=9.0)
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 50  # raw_shares(100) * 0.5 -- already hold TEST, not a fresh full-size entry
+
+
+def test_signal_for_symbol_not_held_no_size_reduction(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(
+        tmp_path, snapshot, risk_per_trade_pct=0.01, existing_position_size_multiplier=0.5, open_position_symbols={"OTHER"}
+    )
+    signal = make_signal(entry=10.0, stop=9.0)  # signal is for TEST, not OTHER
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 100  # unreduced -- held position is a different symbol
+
+
+def test_existing_position_reduction_not_blocking_just_downsized(tmp_path):
+    # Explicitly not a hard reject -- a new signal for an already-held
+    # symbol is still a legitimate trade, just smaller.
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(
+        tmp_path, snapshot, risk_per_trade_pct=0.01, existing_position_size_multiplier=0.5, open_position_symbols={"TEST"}
+    )
+
+    decision = rm.evaluate(make_signal(entry=10.0, stop=9.0))
+
+    assert decision.accepted
+    assert decision.reason == "accepted"
+
+
+def test_existing_position_reduction_stacks_with_catalyst_boost(tmp_path):
+    snapshot = default_snapshot(net_liquidation=10_000)
+    rm = make_risk_manager(
+        tmp_path,
+        snapshot,
+        risk_per_trade_pct=0.01,
+        existing_position_size_multiplier=0.5,
+        catalyst_size_multiplier=1.25,
+        open_position_symbols={"TEST"},
+    )
+    signal = make_signal(entry=10.0, stop=9.0, context={"catalyst_category": "earnings"})
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 62  # floor(floor(100*0.5)*1.25) = floor(50*1.25) = 62
 
 
 def test_first_trade_of_day_gets_starter_size_reduction(tmp_path):

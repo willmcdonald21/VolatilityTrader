@@ -82,6 +82,17 @@ class AccountState:
         closing = sorted(self._closing_fills(), key=lambda item: item[0])
         return closing[0][1] if closing else None
 
+    def has_open_position(self, symbol: str) -> bool:
+        """True if IBKR currently reports a nonzero position in `symbol`.
+
+        Broker truth, not the bot's own in-memory tracking -- the latter is
+        wiped on every reconnect (see main.py's `_on_connected` handler),
+        which is exactly what let repeated post-reconnect signals stack
+        full-size entries on top of a position IBKR still held (the Aug 27
+        BIRD/BMRA runaway-sizing incident).
+        """
+        return any(p.contract.symbol == symbol and p.position != 0 for p in self.ib.positions(self.account))
+
     def snapshot(self) -> AccountSnapshot:
         return AccountSnapshot(
             net_liquidation=self._account_value("NetLiquidation"),

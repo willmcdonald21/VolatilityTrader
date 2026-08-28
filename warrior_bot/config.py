@@ -91,6 +91,15 @@ class RiskConfig(BaseModel):
     # is prone to skip exactly when it matters most).
     starter_trade_size_multiplier: float = Field(default=0.5, gt=0, le=1.0)
     starter_trade_downgrade_multiplier: float = Field(default=0.5, gt=0, le=1.0)
+    # Re-entry risk control: a signal for a symbol the bot already holds an
+    # open position in is not blocked outright (a new signal can be a
+    # legitimate additional setup, not just noise), but is sized down
+    # rather than treated as a fresh full-size entry -- guards against
+    # unbounded same-symbol re-accumulation across repeated signals/
+    # reconnects (root cause of the Aug 27 BIRD/BMRA runaway-sizing
+    # incident, where reconnects wiped in-memory tracking and let full-size
+    # entries stack on a position IBKR still held).
+    existing_position_size_multiplier: float = Field(default=0.5, gt=0, le=1.0)
 
 
 class GapAndGoConfig(BaseModel):

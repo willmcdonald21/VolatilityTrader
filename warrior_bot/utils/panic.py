@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import logging
 
 from ib_async import IB, MarketOrder
@@ -31,7 +32,15 @@ def flatten_all_positions(ib: IB, channel: str = "kill_switch") -> None:
         action = "SELL" if pos.position > 0 else "BUY"
         qty = abs(pos.position)
         order = MarketOrder(action, qty)
-        ib.placeOrder(pos.contract, order)
+        # ib.positions() reports each position's actual trading exchange
+        # (e.g. NASDAQ) rather than SMART -- routing a market order
+        # directly to it triggers IBKR's precautionary direct-routing
+        # rejection (error 201/10311, hit during the Aug 27 BIRD/BMRA
+        # flatten attempt). Route through SMART instead, on a copy so the
+        # shared Contract object from positions() isn't mutated.
+        contract = copy.copy(pos.contract)
+        contract.exchange = "SMART"
+        ib.placeOrder(contract, order)
         alert(f"Flattening {pos.contract.symbol} qty={qty} via market {action}", channel=channel)
     logger.warning("Flatten requested for %d position(s)", len(positions))
 
