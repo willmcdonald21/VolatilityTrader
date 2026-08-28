@@ -47,7 +47,6 @@ class ExecutionConfig(BaseModel):
 
 
 class RiskConfig(BaseModel):
-    risk_per_trade_pct: float = Field(gt=0, le=0.05)
     daily_loss_limit_pct: float = Field(gt=0, le=0.5)
     flatten_on_daily_loss_limit: bool = False
     max_concurrent_positions: int = Field(gt=0)
@@ -61,36 +60,18 @@ class RiskConfig(BaseModel):
     daily_profit_goal_usd: float | None = None
     cushion_profit_fraction: float = Field(default=0.25, gt=0, le=1)
     cushion_size_fraction: float = Field(default=0.25, gt=0, le=1)
-    catalyst_size_multiplier: float = Field(default=1.25, ge=1.0)
-    time_of_day_boost_start: time = time(7, 0)
-    time_of_day_boost_end: time = time(10, 0)
-    time_of_day_size_multiplier: float = Field(default=1.25, ge=1.0)
-    obvious_rank_threshold: int = Field(default=3, gt=0)  # "obvious" = top-N leading % gainers on the scanner
-    obvious_size_multiplier: float = Field(default=1.25, ge=1.0)
-    # Graduated retracement confidence: a bull_flag pullback retracing no
-    # more than this % of the spike is "ideal" per the source material
-    # ("I'd rather see it hovering in the top 25% of the move"), distinct
-    # from the hard 50% invalidation ceiling already enforced by
-    # bull_flag.max_pullback_pct -- a shallow pullback earns a size boost
-    # on top of the base size, same treatment as the catalyst/time-of-day/
-    # obviousness boosts above.
-    shallow_pullback_threshold_pct: float = Field(default=25.0, ge=0)
-    shallow_pullback_size_multiplier: float = Field(default=1.25, ge=1.0)
-    # A bottoming tail (long lower wick, "hammering out the base") on the
-    # pullback's low bar -- soft bullish confirmation, same boost treatment
-    # as the other soft signals above.
-    bottoming_tail_size_multiplier: float = Field(default=1.25, ge=1.0)
-    # Breaking above a psychological round-number level (half-dollar below
-    # $10, whole-dollar at/above) on the breakout candle itself -- source
-    # material's strongest example is $1.00 for low-priced stocks.
-    round_number_size_multiplier: float = Field(default=1.25, ge=1.0)
-    # Daily "starter position" regime protocol: take smaller-than-normal
-    # size on the day's first trade; if it loses, treat that as a cold-
-    # market caution flag and cap size for the rest of the session (an
-    # automated, unemotional version of the size-reduction a human trader
-    # is prone to skip exactly when it matters most).
-    starter_trade_size_multiplier: float = Field(default=0.5, gt=0, le=1.0)
-    starter_trade_downgrade_multiplier: float = Field(default=0.5, gt=0, le=1.0)
+    # First entry into a symbol: this fraction of AvailableFunds. A second
+    # signal on a symbol already holding one lot may add on at
+    # addon_pct_of_funds; a third signal on the same symbol is rejected
+    # (RiskManager._size_position enforces the 2-lot cap via
+    # PositionManager.open_lot_count).
+    first_entry_pct_of_funds: float = Field(default=0.10, gt=0, le=1.0)
+    addon_pct_of_funds: float = Field(default=0.05, gt=0, le=1.0)
+    # Global conservative stop-loss cap, applied uniformly in
+    # WarriorBot._handle_signal regardless of which strategy produced the
+    # signal -- tightens (never loosens) each strategy's own structural
+    # stop if that stop would risk more than this % of entry price.
+    max_stop_distance_pct: float = Field(default=2.0, gt=0)
 
 
 class GapAndGoConfig(BaseModel):
@@ -199,10 +180,9 @@ class StrategiesConfig(BaseModel):
     inverted_head_and_shoulders: InvertedHeadAndShouldersConfig = InvertedHeadAndShouldersConfig()
 
 
-class ScaleOutConfig(BaseModel):
-    enabled: bool = False
-    pct: float = Field(default=0.5, gt=0, lt=1)  # fraction of the position closed at the scale-out price
-    r_multiple: float = Field(default=1.0, gt=0)  # R-multiple at which the scale-out limit order sits
+class ProfitTierConfig(BaseModel):
+    r_multiple: float = Field(gt=0)  # R-multiple at which this tier's limit order sits
+    pct: float = Field(gt=0, lt=1)  # fraction of the *original* position size closed at this tier
 
 
 class BreakevenConfig(BaseModel):
@@ -226,12 +206,32 @@ class ReversalExitConfig(BaseModel):
 
 
 class ExitsConfig(BaseModel):
-    scale_out: ScaleOutConfig = ScaleOutConfig()
+    # Ordered list of partial take-profit legs, each closing `pct` of the
+    # *original* position size once price reaches `r_multiple`. Whatever
+    # fraction remains after all tiers (1 - sum(pct)) rides on the
+    # breakeven/trailing-stop logic below rather than a fixed final target.
+    profit_tiers: list[ProfitTierConfig] = [
+        ProfitTierConfig(r_multiple=1.0, pct=0.34),
+        ProfitTierConfig(r_multiple=2.0, pct=0.33),
+    ]
     breakeven: BreakevenConfig = BreakevenConfig()
     trailing: TrailingConfig = TrailingConfig()
     reversal_exit: ReversalExitConfig = ReversalExitConfig()
     eod_flatten_time: time = time(15, 55)  # 5 min before RTH_CLOSE; force-flatten at/after this ET time
     risk_loop_interval_seconds: int = Field(default=15, gt=0)
+
+    @model_validator(mode="after")
+    def _guard_profit_tiers(self) -> "ExitsConfig":
+        total_pct = sum(tier.pct for tier in self.profit_tiers)
+        if total_pct >= 1.0:
+            raise ValueError(
+                f"exits.profit_tiers percentages sum to {total_pct}, must be < 1.0 "
+                "so some quantity remains for the stop/trailing logic to manage"
+            )
+        r_multiples = [tier.r_multiple for tier in self.profit_tiers]
+        if r_multiples != sorted(r_multiples):
+            raise ValueError("exits.profit_tiers must be ordered by ascending r_multiple")
+        return self
 
 
 class NewsConfig(BaseModel):

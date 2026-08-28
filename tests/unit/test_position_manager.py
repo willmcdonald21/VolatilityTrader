@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from tests.unit.fixtures import make_bars
-from warrior_bot.config import BreakevenConfig, ExitsConfig, ReversalExitConfig, ScaleOutConfig, TrailingConfig
+from warrior_bot.config import BreakevenConfig, ExitsConfig, ReversalExitConfig, TrailingConfig
 from warrior_bot.execution.position_manager import PositionManager
 from warrior_bot.signals.signal import Signal
 
@@ -109,7 +109,6 @@ def make_exits_config(
     reversal_exit_enabled=False,
 ) -> ExitsConfig:
     return ExitsConfig(
-        scale_out=ScaleOutConfig(),
         breakeven=BreakevenConfig(enabled=breakeven_enabled, trigger_r_multiple=breakeven_r),
         trailing=TrailingConfig(enabled=trailing_enabled, method=trailing_method, atr_multiple=atr_multiple),
         reversal_exit=ReversalExitConfig(enabled=reversal_exit_enabled),
@@ -117,20 +116,28 @@ def make_exits_config(
 
 
 def track_position(
-    pm: PositionManager, signal: Signal, quantity=100, target_role="target", target_qty=None, stop_order_type=None
+    pm: PositionManager,
+    signal: Signal,
+    quantity=100,
+    target_role="target",
+    target_qty=None,
+    stop_order_type=None,
+    order_id_offset=0,
 ):
-    stop_order = FakeOrder("SELL", quantity, auxPrice=signal.stop_price, orderId=2, orderType=stop_order_type)
+    stop_order = FakeOrder(
+        "SELL", quantity, auxPrice=signal.stop_price, orderId=2 + order_id_offset, orderType=stop_order_type
+    )
     stop_trade = FakeTrade(stop_order)
     tq = target_qty if target_qty is not None else quantity
-    target_order = FakeOrder("SELL", tq, lmtPrice=signal.target_price, orderId=3)
+    target_order = FakeOrder("SELL", tq, lmtPrice=signal.target_price, orderId=3 + order_id_offset)
     target_trade = FakeTrade(target_order)
     pm.track(
         contract=object(),
         signal=signal,
         stop_trade=stop_trade,
         stop_row_id=1,
-        target_trade=target_trade,
-        target_role=target_role,
+        target_trades=[target_trade],
+        target_roles=[target_role],
     )
     return stop_trade, target_trade
 
@@ -422,6 +429,48 @@ def test_reversal_exit_on_lower_low_after_breakeven_triggers_market_exit():
     market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
     assert len(market_orders) == 1
     assert "TEST" not in pm._positions
+
+
+def test_open_lot_count_zero_for_untracked_symbol():
+    pm = PositionManager(FakeIB(), FakeJournal(), make_exits_config())
+    assert pm.open_lot_count("TEST") == 0
+
+
+def test_open_lot_count_reflects_tracked_and_closed_lots():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config())
+    signal = make_signal(entry=10.0, stop=9.0)
+    stop_trade, _ = track_position(pm, signal, quantity=100, target_role="target", target_qty=100)
+    assert pm.open_lot_count("TEST") == 1
+
+    stop_trade.fillEvent.emit(stop_trade, make_fill(100))
+    assert pm.open_lot_count("TEST") == 0
+
+
+def test_two_lots_on_same_symbol_are_tracked_and_managed_independently():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    first_signal = make_signal(entry=10.0, stop=9.0)  # risk_per_share = 1.0
+    second_signal = make_signal(entry=11.0, stop=10.5)  # risk_per_share = 0.5, added later at a worse price
+    first_stop, _ = track_position(pm, first_signal, quantity=100, target_qty=100)
+    second_stop, _ = track_position(pm, second_signal, quantity=50, target_qty=50, order_id_offset=10)
+
+    assert pm.open_lot_count("TEST") == 2
+
+    # 11.5 is +1.5R for the first lot (entry 10, stop 9, risk_per_share 1.0)
+    # and exactly +1.0R for the second lot (entry 11, stop 10.5,
+    # risk_per_share 0.5) -- both cross their own breakeven trigger on the
+    # same bar, independently, moving each stop to its own entry price.
+    pm.on_bar(FakeCtx("TEST", last_price=11.5))
+
+    assert first_stop.order.auxPrice == 10.0
+    assert second_stop.order.auxPrice == 11.0
+    assert pm.open_lot_count("TEST") == 2
+
+    first_stop.fillEvent.emit(first_stop, make_fill(100))
+    assert pm.open_lot_count("TEST") == 1  # only the first lot closed
+    second_stop.fillEvent.emit(second_stop, make_fill(50))
+    assert pm.open_lot_count("TEST") == 0
 
 
 def test_reversal_exit_lower_low_does_not_fire_before_breakeven():

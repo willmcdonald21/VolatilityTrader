@@ -19,7 +19,6 @@ def make_config(tmp_path, **notification_overrides) -> AppConfig:
     return AppConfig(
         trading=TradingConfig(),
         risk=RiskConfig(
-            risk_per_trade_pct=0.01,
             daily_loss_limit_pct=0.02,
             max_concurrent_positions=3,
             max_position_pct_of_buying_power=0.25,

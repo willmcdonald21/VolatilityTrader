@@ -12,26 +12,16 @@ execution:
   stop_limit_offset_pct: 0.5     # stop-loss is a stop-limit order; limit sits this % beyond the trigger (IBKR rejects plain market/stop orders outside RTH)
 
 risk:
-  risk_per_trade_pct: 0.005      # fraction of NetLiquidation risked per trade
   daily_loss_limit_pct: 0.02     # halt new entries once daily realized loss exceeds this fraction of start-of-day equity
   flatten_on_daily_loss_limit: true  # force-close open positions when the daily halt triggers -- enabled for the unattended overnight test since no one can intervene manually
   max_concurrent_positions: 3
-  max_position_pct_of_buying_power: 0.25  # single-trade ceiling as a fraction of current buying power, not a fixed $ or share count -- scales with account size (paper today, ~$1,000 live to start)
+  max_position_pct_of_buying_power: 0.25  # outer safety ceiling as a fraction of current buying power -- backstop, not the primary sizing rule below
   daily_profit_goal_usd: null      # set to enable "profit cushion" sizing; null = feature off, always full size
   cushion_profit_fraction: 0.25    # trade at reduced size until this fraction of the daily goal is realized
   cushion_size_fraction: 0.25      # size multiplier applied while under the cushion threshold
-  catalyst_size_multiplier: 1.25   # position-size boost applied when a news catalyst is detected (requires news.enabled)
-  time_of_day_boost_start: "07:00" # historically highest-edge window (Ross Cameron: 7-10am ET, EU/US session overlap)
-  time_of_day_boost_end: "10:00"
-  time_of_day_size_multiplier: 1.25 # position-size boost applied to signals firing within the above window
-  obvious_rank_threshold: 3        # "obvious" = one of the top-N leading % gainers on the scanner ("Dip or Dump" checklist)
-  obvious_size_multiplier: 1.25    # position-size boost when the signal's symbol was top-N ranked at onboarding time
-  shallow_pullback_threshold_pct: 25.0  # "top 25% of the move" -- ideal/high-confidence retracement depth
-  shallow_pullback_size_multiplier: 1.25 # position-size boost when a bull_flag pullback retraces <= the threshold above
-  starter_trade_size_multiplier: 0.5     # smaller-than-normal size on the day's first trade ("starter position" regime test)
-  starter_trade_downgrade_multiplier: 0.5 # applied to all trades for the rest of the session if the starter trade lost
-  bottoming_tail_size_multiplier: 1.25   # boost when the pullback low bar is a bottoming tail ("hammering out the base")
-  round_number_size_multiplier: 1.25     # boost when the breakout candle crosses a psychological round-number level
+  first_entry_pct_of_funds: 0.10   # first entry into a symbol: this fraction of AvailableFunds
+  addon_pct_of_funds: 0.05         # one add-on lot allowed if a second signal fires on a symbol already held; a third signal is rejected
+  max_stop_distance_pct: 2.0       # conservative stop-loss cap (% of entry price), enforced on every signal regardless of strategy
 
 pullback_quality:
   # Entry-time "dip or dump" dump-avoidance checks, shared by bull_flag/abcd's
@@ -113,10 +103,11 @@ notifications:
   notify_on_pnl: true          # -> pnl channel: per-trade + running daily realized P&L on every closing/trim fill
 
 exits:
-  scale_out:
-    enabled: false
-    pct: 0.5              # fraction of the position closed at the scale-out price
-    r_multiple: 1.0        # R-multiple at which the scale-out limit order sits
+  profit_tiers:            # partial take-profit legs, closing `pct` of the original size at each `r_multiple`; whatever remains rides the breakeven/trailing logic below
+    - r_multiple: 1.0
+      pct: 0.34
+    - r_multiple: 2.0
+      pct: 0.33
   breakeven:
     enabled: true
     trigger_r_multiple: 1.0   # once price reaches this many R, move the stop to entry

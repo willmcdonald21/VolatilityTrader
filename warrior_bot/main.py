@@ -56,11 +56,11 @@ class WarriorBot:
         conn = get_connection(config.resolve_path(config.journal.db_path))
         self.journal = Journal(conn)
         self.account_state = AccountState(self.ib)
-        self.risk_manager = RiskManager(
-            config.risk, self.account_state, config.resolve_path(config.kill_switch.flag_file)
-        )
         self.position_manager = PositionManager(
             self.ib, self.journal, config.exits, stop_limit_offset_pct=config.execution.stop_limit_offset_pct
+        )
+        self.risk_manager = RiskManager(
+            config.risk, self.account_state, self.position_manager, config.resolve_path(config.kill_switch.flag_file)
         )
         self.order_manager = OrderManager(
             self.ib,
@@ -283,11 +283,12 @@ class WarriorBot:
                 self.logger.exception("Strategy %s failed evaluating %s", strategy.name, ctx.symbol)
                 continue
             if signal is not None:
-                self._handle_signal(contract, signal, now)
+                self._handle_signal(contract, signal)
 
-    def _handle_signal(self, contract: Contract, signal: Signal, now: datetime) -> None:
+    def _handle_signal(self, contract: Contract, signal: Signal) -> None:
+        self._clamp_stop_to_conservative_max(signal)
         signal_id = self.journal.record_signal(signal)
-        decision = self.risk_manager.evaluate(signal, now=now)
+        decision = self.risk_manager.evaluate(signal)
         self.journal.record_risk_decision(signal_id, decision)
         if not decision.accepted:
             self.journal.record_rejection(signal, decision.reason)
@@ -313,6 +314,16 @@ class WarriorBot:
         if self.dry_run:
             return
         self.order_manager.submit_signal(contract, signal, decision.sized_qty, signal_id)
+
+    def _clamp_stop_to_conservative_max(self, signal: Signal) -> None:
+        """Every accepted signal gets a conservative stop, regardless of
+        which strategy produced it -- tightens (never loosens) whatever
+        structural stop the strategy computed if it would risk more than
+        max_stop_distance_pct of entry price. Long-only, per Signal's own
+        docstring, so the conservative stop always sits below entry."""
+        max_risk = signal.entry_price * self.config.risk.max_stop_distance_pct / 100.0
+        if signal.risk_per_share > max_risk:
+            signal.stop_price = signal.entry_price - max_risk
 
     def reset_daily_state(self) -> None:
         for strategy in self.strategies:
