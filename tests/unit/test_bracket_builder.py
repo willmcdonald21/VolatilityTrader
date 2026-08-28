@@ -132,4 +132,24 @@ def test_stop_loss_limit_sits_below_trigger_by_configured_offset():
 
 def test_stop_loss_offset_defaults_to_half_percent():
     bracket = build_bracket(FakeIB(), make_signal(), quantity=100)
-    assert bracket.stop_loss.lmtPrice == 9.0 * 0.995
+    # 9.0 * 0.995 == 8.955 raw -- not a valid $0.01 tick, would be rejected
+    # by IBKR with error 110. round_to_tick rounds it to the nearest tick.
+    assert bracket.stop_loss.lmtPrice == 8.96
+
+
+def test_stop_loss_limit_price_is_always_tick_conformant():
+    # A deliberately "dirty" offset/stop combination that would produce a
+    # many-decimal raw product -- confirms build_bracket rounds its own
+    # offset arithmetic regardless of how clean signal.stop_price already is.
+    signal = Signal(
+        symbol="TEST",
+        strategy="gap_and_go",
+        side="BUY",
+        entry_price=13.47,
+        stop_price=13.2832,
+        target_price=13.9,
+        ts=datetime.now(timezone.utc),
+    )
+    bracket = build_bracket(FakeIB(), signal, quantity=100, stop_limit_offset_pct=0.37)
+    price = bracket.stop_loss.lmtPrice
+    assert round(price, 2) == price

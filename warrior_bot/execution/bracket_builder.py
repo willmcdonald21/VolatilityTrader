@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from ib_async import IB, LimitOrder, Order, StopLimitOrder
 
 from warrior_bot.signals.signal import Signal
+from warrior_bot.utils.rounding import round_to_tick
 
 
 @dataclass
@@ -88,9 +89,9 @@ def build_bracket(
     # so the limit sits below the trigger to still be fillable on further
     # downside; a BUY stop (protecting a short) is the mirror image.
     if reverse_action == "SELL":
-        stop_limit_price = signal.stop_price * (1 - stop_limit_offset_pct / 100.0)
+        stop_limit_price = round_to_tick(signal.stop_price * (1 - stop_limit_offset_pct / 100.0))
     else:
-        stop_limit_price = signal.stop_price * (1 + stop_limit_offset_pct / 100.0)
+        stop_limit_price = round_to_tick(signal.stop_price * (1 + stop_limit_offset_pct / 100.0))
 
     stop_loss = StopLimitOrder(
         reverse_action,

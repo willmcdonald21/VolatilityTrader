@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from warrior_bot.config import NotificationsConfig
+from warrior_bot.config import ExitsConfig, NotificationsConfig, ScaleOutConfig
 from warrior_bot.execution.order_manager import OrderManager
+from warrior_bot.signals.signal import Signal
 
 
 class FakeEvent:
@@ -224,3 +226,27 @@ def test_fill_always_journaled_regardless_of_notifications(monkeypatch):
 
     assert len(om.journal.fills) == 1
     assert om.journal.fills[0]["order_row_id"] == 7
+
+
+def test_scale_out_price_is_tick_conformant():
+    # entry + risk_per_share * r_multiple is raw float arithmetic -- pick
+    # values that produce a many-decimal result and confirm it comes out
+    # rounded to a valid $0.01 tick before it would reach IBKR.
+    om = OrderManager(
+        ib=None,
+        journal=FakeJournal(),
+        exits_config=ExitsConfig(scale_out=ScaleOutConfig(enabled=True, pct=0.5, r_multiple=1.37)),
+        position_manager=None,
+    )
+    signal = Signal(
+        symbol="TEST",
+        strategy="gap_and_go",
+        side="BUY",
+        entry_price=13.47,
+        stop_price=13.2832,
+        target_price=13.9,
+        ts=datetime.now(timezone.utc),
+    )
+    scale_out_qty, scale_out_price = om._scale_out_params(signal, quantity=100)
+    assert scale_out_qty == 50
+    assert scale_out_price == round(scale_out_price, 2)

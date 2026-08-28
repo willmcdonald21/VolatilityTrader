@@ -11,6 +11,7 @@ from warrior_bot.notify.discord import build_pnl_message, send_discord_message
 from warrior_bot.persistence.journal import Journal
 from warrior_bot.risk.account_state import AccountState
 from warrior_bot.signals.signal import Signal
+from warrior_bot.utils.rounding import round_to_tick
 
 logger = logging.getLogger("warrior_bot.execution.order_manager")
 
@@ -112,7 +113,7 @@ class OrderManager:
         scale_out_qty = round(quantity * cfg.pct)
         if scale_out_qty <= 0 or scale_out_qty >= quantity:
             return None, None
-        scale_out_price = signal.entry_price + signal.risk_per_share * cfg.r_multiple
+        scale_out_price = round_to_tick(signal.entry_price + signal.risk_per_share * cfg.r_multiple)
         return scale_out_qty, scale_out_price
 
     def _attach_tracking(self, trade: Trade, row_id: int, role: str, entry_price: float | None = None) -> None:
