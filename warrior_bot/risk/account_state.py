@@ -65,34 +65,6 @@ class AccountState:
     def daily_realized_pnl(self) -> float:
         return sum(pnl for _, pnl in self._closing_fills())
 
-    def first_closing_trade_pnl(self) -> float | None:
-        """Realized P&L of the session's earliest closing fill, or None if
-        nothing has closed yet -- the "did today's starter trade work"
-        regime signal (source material: take reduced size on the day's
-        first trade; if it fails, treat that as a cold-market caution flag
-        and scale back for the rest of the session).
-
-        An approximation of "the first trade's outcome," not exact trade
-        grouping: a trade closed via a scale-out followed by a later
-        stop-out produces two closing fills, and this reports only the
-        earlier one's sign. That matches the source material's own binary
-        framing (did the starter trade work or not) closely enough without
-        needing full round-trip trade-grouping logic.
-        """
-        closing = sorted(self._closing_fills(), key=lambda item: item[0])
-        return closing[0][1] if closing else None
-
-    def has_open_position(self, symbol: str) -> bool:
-        """True if IBKR currently reports a nonzero position in `symbol`.
-
-        Broker truth, not the bot's own in-memory tracking -- the latter is
-        wiped on every reconnect (see main.py's `_on_connected` handler),
-        which is exactly what let repeated post-reconnect signals stack
-        full-size entries on top of a position IBKR still held (the Aug 27
-        BIRD/BMRA runaway-sizing incident).
-        """
-        return any(p.contract.symbol == symbol and p.position != 0 for p in self.ib.positions(self.account))
-
     def snapshot(self) -> AccountSnapshot:
         return AccountSnapshot(
             net_liquidation=self._account_value("NetLiquidation"),

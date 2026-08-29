@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 from ib_async import IB, Contract, Trade
 
@@ -50,22 +51,21 @@ class OrderManager:
         self._order_row_ids: dict[int, int] = {}  # ib order id -> journal orders.id
 
     def submit_signal(self, contract: Contract, signal: Signal, quantity: int, signal_id: int) -> Bracket:
-        scale_out_qty, scale_out_price = self._scale_out_params(signal, quantity)
+        profit_tiers = self._profit_tier_specs(signal, quantity)
         bracket = build_bracket(
             self.ib,
             signal,
             quantity,
-            scale_out_qty=scale_out_qty,
-            scale_out_price=scale_out_price,
+            profit_tiers=profit_tiers,
             stop_limit_offset_pct=self.execution_config.stop_limit_offset_pct,
         )
-        role_by_order_id = {
-            bracket.parent.orderId: "parent",
-            bracket.take_profit.orderId: bracket.target_role,
-            bracket.stop_loss.orderId: "stop",
-        }
+        role_by_order_id = {bracket.parent.orderId: "parent", bracket.stop_loss.orderId: "stop"}
+        for take_profit, role in zip(bracket.take_profits, bracket.target_roles):
+            role_by_order_id[take_profit.orderId] = role
 
-        trades_by_role: dict[str, tuple[Trade, int]] = {}
+        stop_trade: Trade | None = None
+        stop_row_id: int | None = None
+        target_trades: list[Trade] = []
         for order in bracket.orders:
             trade = self.ib.placeOrder(contract, order)
             role = role_by_order_id[order.orderId]
@@ -83,39 +83,46 @@ class OrderManager:
             )
             self._order_row_ids[order.orderId] = row_id
             self._attach_tracking(trade, row_id, role, signal.entry_price)
-            trades_by_role[role] = (trade, row_id)
+            if role == "stop":
+                stop_trade, stop_row_id = trade, row_id
+            else:
+                target_trades.append(trade)
 
         logger.info(
-            "Submitted bracket for %s: qty=%s entry=%.4f stop=%.4f target=%.4f",
+            "Submitted bracket for %s: qty=%s entry=%.4f stop=%.4f tiers=%s",
             signal.symbol,
             quantity,
             signal.entry_price,
             signal.stop_price,
-            signal.target_price,
+            profit_tiers or [(quantity, signal.target_price)],
         )
 
-        stop_trade, stop_row_id = trades_by_role["stop"]
-        target_trade, _ = trades_by_role[bracket.target_role]
+        assert stop_trade is not None and stop_row_id is not None
         self.position_manager.track(
             contract,
             signal,
             signal_id=signal_id,
             stop_trade=stop_trade,
             stop_row_id=stop_row_id,
-            target_trade=target_trade,
-            target_role=bracket.target_role,
+            target_trades=target_trades,
+            target_roles=bracket.target_roles,
         )
         return bracket
 
-    def _scale_out_params(self, signal: Signal, quantity: int) -> tuple[int | None, float | None]:
-        cfg = self.exits_config.scale_out
-        if not cfg.enabled:
-            return None, None
-        scale_out_qty = round(quantity * cfg.pct)
-        if scale_out_qty <= 0 or scale_out_qty >= quantity:
-            return None, None
-        scale_out_price = round_to_tick(signal.entry_price + signal.risk_per_share * cfg.r_multiple)
-        return scale_out_qty, scale_out_price
+    def _profit_tier_specs(self, signal: Signal, quantity: int) -> list[tuple[int, float]]:
+        """(qty, price) per configured profit tier, each qty a floor of `pct`
+        of the *original* position size. Skips any tier that floors to zero
+        (e.g. a very small position) -- build_bracket falls back to a single
+        full-quantity target at signal.target_price if the resulting list
+        ends up empty."""
+        specs = []
+        for tier in self.exits_config.profit_tiers:
+            qty = math.floor(quantity * tier.pct)
+            if qty <= 0:
+                continue
+            price = round_to_tick(signal.entry_price + signal.risk_per_share * tier.r_multiple)
+            specs.append((qty, price))
+        return specs
 
     def _attach_tracking(self, trade: Trade, row_id: int, role: str, entry_price: float | None = None) -> None:
         def on_status(t: Trade) -> None:

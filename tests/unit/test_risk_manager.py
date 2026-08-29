@@ -9,24 +9,22 @@ from warrior_bot.signals.signal import Signal
 
 
 class FakeAccountState:
-    def __init__(
-        self,
-        snapshot: AccountSnapshot,
-        first_closing_trade_pnl: float | None = None,
-        open_position_symbols: set[str] | None = None,
-    ):
+    def __init__(self, snapshot: AccountSnapshot):
         self._snapshot = snapshot
-        self._first_closing_trade_pnl = first_closing_trade_pnl
-        self._open_position_symbols = open_position_symbols or set()
 
     def snapshot(self) -> AccountSnapshot:
         return self._snapshot
 
-    def first_closing_trade_pnl(self) -> float | None:
-        return self._first_closing_trade_pnl
 
-    def has_open_position(self, symbol: str) -> bool:
-        return symbol in self._open_position_symbols
+class FakePositionManager:
+    """Stands in for PositionManager.open_lot_count -- the number of
+    already-open lots RiskManager should treat this symbol as holding."""
+
+    def __init__(self, open_lots: int = 0):
+        self._open_lots = open_lots
+
+    def open_lot_count(self, symbol: str) -> int:
+        return self._open_lots
 
 
 def make_signal(entry=10.0, stop=9.0, target=12.0, context=None) -> Signal:
@@ -42,64 +40,68 @@ def make_signal(entry=10.0, stop=9.0, target=12.0, context=None) -> Signal:
     )
 
 
-def make_risk_manager(tmp_path, snapshot, **risk_overrides) -> RiskManager:
+def make_risk_manager(tmp_path, snapshot, open_lots: int = 0, **risk_overrides) -> RiskManager:
     config = RiskConfig(
-        risk_per_trade_pct=risk_overrides.get("risk_per_trade_pct", 0.01),
         daily_loss_limit_pct=risk_overrides.get("daily_loss_limit_pct", 0.02),
         max_concurrent_positions=risk_overrides.get("max_concurrent_positions", 3),
-        # 0.25 * default_snapshot()'s buying_power(20_000) = 5_000 -- reproduces
-        # the same effective cap as the old fixed max_position_notional_usd(5000)
-        # default, so existing sized_qty expectations below stay unchanged.
         max_position_pct_of_buying_power=risk_overrides.get("max_position_pct_of_buying_power", 0.25),
         daily_profit_goal_usd=risk_overrides.get("daily_profit_goal_usd"),
         cushion_profit_fraction=risk_overrides.get("cushion_profit_fraction", 0.25),
         cushion_size_fraction=risk_overrides.get("cushion_size_fraction", 0.25),
-        catalyst_size_multiplier=risk_overrides.get("catalyst_size_multiplier", 1.25),
-        obvious_rank_threshold=risk_overrides.get("obvious_rank_threshold", 3),
-        obvious_size_multiplier=risk_overrides.get("obvious_size_multiplier", 1.25),
-        shallow_pullback_threshold_pct=risk_overrides.get("shallow_pullback_threshold_pct", 25.0),
-        shallow_pullback_size_multiplier=risk_overrides.get("shallow_pullback_size_multiplier", 1.25),
-        bottoming_tail_size_multiplier=risk_overrides.get("bottoming_tail_size_multiplier", 1.25),
-        round_number_size_multiplier=risk_overrides.get("round_number_size_multiplier", 1.25),
-        # Unlike every other multiplier above, the starter-trade ones are
-        # gated on RiskManager's own internal state (this being the day's
-        # first trade), not on something present/absent in the signal's
-        # context -- so unless a test opts in, every other test in this
-        # file's first `evaluate()` call would otherwise silently hit the
-        # starter-trade-size branch. Default to a no-op (1.0) here; real
-        # production default (0.5) lives in RiskConfig itself.
-        starter_trade_size_multiplier=risk_overrides.get("starter_trade_size_multiplier", 1.0),
-        starter_trade_downgrade_multiplier=risk_overrides.get("starter_trade_downgrade_multiplier", 1.0),
-        existing_position_size_multiplier=risk_overrides.get("existing_position_size_multiplier", 0.5),
+        first_entry_pct_of_funds=risk_overrides.get("first_entry_pct_of_funds", 0.10),
+        addon_pct_of_funds=risk_overrides.get("addon_pct_of_funds", 0.05),
     )
-    account_state = FakeAccountState(
-        snapshot,
-        first_closing_trade_pnl=risk_overrides.get("first_closing_trade_pnl"),
-        open_position_symbols=risk_overrides.get("open_position_symbols"),
-    )
-    return RiskManager(config, account_state, kill_switch_path=tmp_path / "KILL_SWITCH")
+    account_state = FakeAccountState(snapshot)
+    position_manager = FakePositionManager(open_lots)
+    return RiskManager(config, account_state, position_manager, kill_switch_path=tmp_path / "KILL_SWITCH")
 
 
 def default_snapshot(**overrides) -> AccountSnapshot:
     return AccountSnapshot(
         net_liquidation=overrides.get("net_liquidation", 100_000),
         available_funds=overrides.get("available_funds", 100_000),
-        buying_power=overrides.get("buying_power", 20_000),
+        # Large enough by default that max_position_pct_of_buying_power
+        # never binds unless a test deliberately sets it low to isolate
+        # that cap.
+        buying_power=overrides.get("buying_power", 1_000_000),
         open_positions_count=overrides.get("open_positions_count", 0),
         daily_realized_pnl=overrides.get("daily_realized_pnl", 0.0),
     )
 
 
-def test_accepts_signal_and_sizes_by_risk_pct(tmp_path):
-    snapshot = default_snapshot(net_liquidation=100_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01)
-    signal = make_signal(entry=10.0, stop=9.0)  # risk_per_share=1.0
+def test_first_entry_sized_by_first_entry_pct_of_funds(tmp_path):
+    snapshot = default_snapshot(available_funds=100_000)
+    rm = make_risk_manager(tmp_path, snapshot, open_lots=0, first_entry_pct_of_funds=0.10)
+    signal = make_signal(entry=10.0)
 
     decision = rm.evaluate(signal)
 
     assert decision.accepted
-    # dollar_risk_budget = 100_000 * 0.01 = 1000 -> 1000 shares, capped below
-    assert decision.sized_qty == 500  # capped by 0.25 * buying_power(20_000) / entry(10) = 500
+    assert decision.sized_qty == 1000  # floor(100_000 * 0.10 / 10)
+
+
+def test_addon_entry_sized_by_smaller_addon_pct_of_funds(tmp_path):
+    snapshot = default_snapshot(available_funds=100_000)
+    rm = make_risk_manager(tmp_path, snapshot, open_lots=1, addon_pct_of_funds=0.05)
+    signal = make_signal(entry=10.0)
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+    assert decision.sized_qty == 500  # floor(100_000 * 0.05 / 10)
+
+
+def test_third_signal_on_same_symbol_rejected(tmp_path):
+    snapshot = default_snapshot(available_funds=100_000)
+    rm = make_risk_manager(tmp_path, snapshot, open_lots=2)
+    signal = make_signal(entry=10.0)
+
+    decision = rm.evaluate(signal)
+
+    assert not decision.accepted
+    assert decision.sized_qty == 0
+    assert "already at max lots" in decision.reason
+    assert "TEST" in decision.reason
 
 
 def test_rejects_when_kill_switch_flag_file_present(tmp_path):
@@ -144,11 +146,22 @@ def test_rejects_when_max_concurrent_positions_reached(tmp_path):
     assert "max concurrent positions" in decision.reason
 
 
+def test_max_concurrent_positions_checked_before_lot_count(tmp_path):
+    # Even a symbol with zero open lots of its own is rejected once the
+    # account-wide concurrent-position cap is hit -- that check runs first.
+    snapshot = default_snapshot(open_positions_count=3)
+    rm = make_risk_manager(tmp_path, snapshot, open_lots=0, max_concurrent_positions=3)
+
+    decision = rm.evaluate(make_signal())
+
+    assert not decision.accepted
+    assert "max concurrent positions" in decision.reason
+
+
 def test_rejects_when_sized_qty_rounds_to_zero(tmp_path):
-    snapshot = default_snapshot(net_liquidation=100_000, buying_power=200_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.00001)
-    # dollar_risk_budget=1.0, risk_per_share=9.0 -> raw_shares floors to 0
-    signal = make_signal(entry=10.0, stop=1.0)
+    snapshot = default_snapshot(available_funds=1)
+    rm = make_risk_manager(tmp_path, snapshot, first_entry_pct_of_funds=0.10)
+    signal = make_signal(entry=10.0)  # floor(1 * 0.10 / 10) = 0
 
     decision = rm.evaluate(signal)
 
@@ -157,399 +170,74 @@ def test_rejects_when_sized_qty_rounds_to_zero(tmp_path):
 
 
 def test_sizing_capped_by_buying_power(tmp_path):
-    snapshot = default_snapshot(net_liquidation=1_000_000, buying_power=100)
-    # pct=1.0 isolates the raw buying-power ceiling itself (the cap can
-    # never exceed 100% of buying power regardless of how high the pct is set)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.05, max_position_pct_of_buying_power=1.0)
-    signal = make_signal(entry=10.0, stop=9.0)
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 10  # buying_power(100) / entry(10)
-
-
-def test_catalyst_signal_gets_size_boost(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, catalyst_size_multiplier=1.25)
-    signal = make_signal(entry=10.0, stop=9.0, context={"catalyst_category": "earnings"})
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 125  # raw_shares(100) * 1.25
-
-
-def test_no_catalyst_no_size_boost(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, catalyst_size_multiplier=1.25)
-    signal = make_signal(entry=10.0, stop=9.0)  # no catalyst in context
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 100  # unboosted
-
-
-def test_catalyst_boost_still_capped_by_hard_limits(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, catalyst_size_multiplier=100)
-    signal = make_signal(entry=10.0, stop=9.0, context={"catalyst_category": "merger"})
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    # raw_shares(100) * 100 = 10,000 -- but still clamped to 0.25 * buying_power(20_000) / entry(10)
-    assert decision.sized_qty == 500
-
-
-def test_obvious_rank_signal_gets_size_boost(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, obvious_rank_threshold=3, obvious_size_multiplier=1.25)
-    signal = make_signal(entry=10.0, stop=9.0, context={"scanner_rank": 1})
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 125  # raw_shares(100) * 1.25
-
-
-def test_rank_outside_obvious_threshold_no_size_boost(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, obvious_rank_threshold=3, obvious_size_multiplier=1.25)
-    signal = make_signal(entry=10.0, stop=9.0, context={"scanner_rank": 10})
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 100  # unboosted -- rank 10 is outside the top-3 threshold
-
-
-def test_no_scanner_rank_no_size_boost(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01)
-    signal = make_signal(entry=10.0, stop=9.0)  # no scanner_rank in context
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 100
-
-
-def test_shallow_pullback_signal_gets_size_boost(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, shallow_pullback_threshold_pct=25.0, shallow_pullback_size_multiplier=1.25)
-    signal = make_signal(entry=10.0, stop=9.0, context={"pullback_pct": 10.0})  # well within the top-25% band
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 125  # raw_shares(100) * 1.25
-
-
-def test_deep_but_valid_pullback_no_size_boost(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, shallow_pullback_threshold_pct=25.0, shallow_pullback_size_multiplier=1.25)
-    signal = make_signal(entry=10.0, stop=9.0, context={"pullback_pct": 40.0})  # valid but deeper than the shallow threshold
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 100  # unboosted
-
-
-def test_no_pullback_pct_no_size_boost(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01)
-    signal = make_signal(entry=10.0, stop=9.0)  # no pullback_pct in context (e.g. a gap_and_go signal)
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 100
-
-
-def test_signal_for_already_held_symbol_gets_size_reduction(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
+    snapshot = default_snapshot(available_funds=10_000_000, buying_power=100)
     rm = make_risk_manager(
-        tmp_path, snapshot, risk_per_trade_pct=0.01, existing_position_size_multiplier=0.5, open_position_symbols={"TEST"}
+        tmp_path, snapshot, first_entry_pct_of_funds=0.10, max_position_pct_of_buying_power=1.0
     )
-    signal = make_signal(entry=10.0, stop=9.0)
+    signal = make_signal(entry=10.0)
 
     decision = rm.evaluate(signal)
 
     assert decision.accepted
-    assert decision.sized_qty == 50  # raw_shares(100) * 0.5 -- already hold TEST, not a fresh full-size entry
-
-
-def test_signal_for_symbol_not_held_no_size_reduction(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(
-        tmp_path, snapshot, risk_per_trade_pct=0.01, existing_position_size_multiplier=0.5, open_position_symbols={"OTHER"}
-    )
-    signal = make_signal(entry=10.0, stop=9.0)  # signal is for TEST, not OTHER
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 100  # unreduced -- held position is a different symbol
-
-
-def test_existing_position_reduction_not_blocking_just_downsized(tmp_path):
-    # Explicitly not a hard reject -- a new signal for an already-held
-    # symbol is still a legitimate trade, just smaller.
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(
-        tmp_path, snapshot, risk_per_trade_pct=0.01, existing_position_size_multiplier=0.5, open_position_symbols={"TEST"}
-    )
-
-    decision = rm.evaluate(make_signal(entry=10.0, stop=9.0))
-
-    assert decision.accepted
-    assert decision.reason == "accepted"
-
-
-def test_existing_position_reduction_stacks_with_catalyst_boost(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(
-        tmp_path,
-        snapshot,
-        risk_per_trade_pct=0.01,
-        existing_position_size_multiplier=0.5,
-        catalyst_size_multiplier=1.25,
-        open_position_symbols={"TEST"},
-    )
-    signal = make_signal(entry=10.0, stop=9.0, context={"catalyst_category": "earnings"})
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 62  # floor(floor(100*0.5)*1.25) = floor(50*1.25) = 62
-
-
-def test_first_trade_of_day_gets_starter_size_reduction(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, starter_trade_size_multiplier=0.5)
-    signal = make_signal(entry=10.0, stop=9.0)
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 50  # raw_shares(100) * 0.5
-
-
-def test_second_trade_of_day_not_starter_sized(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, starter_trade_size_multiplier=0.5)
-    rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #1 -- consumes the starter-size branch
-
-    decision = rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #2
-
-    assert decision.accepted
-    assert decision.sized_qty == 100  # full size -- starter trade hasn't resolved (still open) yet
-
-
-def test_regime_downgrade_applied_after_starter_trade_loses(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(
-        tmp_path,
-        snapshot,
-        risk_per_trade_pct=0.01,
-        starter_trade_downgrade_multiplier=0.5,
-        first_closing_trade_pnl=-50.0,  # the starter trade already closed at a loss
-    )
-    rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #1 -- the (now-resolved) starter trade
-
-    decision = rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #2
-
-    assert decision.accepted
-    assert decision.sized_qty == 50  # raw_shares(100) * 0.5 -- cold-market caution flag
-
-
-def test_no_regime_downgrade_after_starter_trade_wins(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(
-        tmp_path,
-        snapshot,
-        risk_per_trade_pct=0.01,
-        starter_trade_downgrade_multiplier=0.5,
-        first_closing_trade_pnl=50.0,  # the starter trade closed profitably
-    )
-    rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #1
-
-    decision = rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #2
-
-    assert decision.accepted
-    assert decision.sized_qty == 100  # unboosted, unreduced -- starter trade worked
-
-
-def test_no_regime_downgrade_while_starter_trade_still_open(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(
-        tmp_path,
-        snapshot,
-        risk_per_trade_pct=0.01,
-        starter_trade_downgrade_multiplier=0.5,
-        first_closing_trade_pnl=None,  # nothing has closed yet
-    )
-    rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #1
-
-    decision = rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #2
-
-    assert decision.accepted
-    assert decision.sized_qty == 100
-
-
-def test_starter_trade_state_resets_on_mark_start_of_day(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, starter_trade_size_multiplier=0.5)
-    rm.evaluate(make_signal(entry=10.0, stop=9.0))  # trade #1 consumes the starter slot
-
-    rm.mark_start_of_day(10_000)  # new day
-    decision = rm.evaluate(make_signal(entry=10.0, stop=9.0))
-
-    assert decision.accepted
-    assert decision.sized_qty == 50  # starter-size branch applies again on the new day's trade #1
-
-
-def test_bottoming_tail_confirmation_gets_size_boost(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, bottoming_tail_size_multiplier=1.25)
-    signal = make_signal(entry=10.0, stop=9.0, context={"bottoming_tail_confirmation": True})
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 125  # raw_shares(100) * 1.25
-
-
-def test_no_bottoming_tail_no_size_boost(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, bottoming_tail_size_multiplier=1.25)
-    signal = make_signal(entry=10.0, stop=9.0, context={"bottoming_tail_confirmation": False})
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 100  # unboosted
-
-
-def test_round_number_breakout_gets_size_boost(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, round_number_size_multiplier=1.25)
-    signal = make_signal(entry=10.0, stop=9.0, context={"round_number_breakout": True})
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 125  # raw_shares(100) * 1.25
-
-
-def test_no_round_number_breakout_no_size_boost(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, round_number_size_multiplier=1.25)
-    signal = make_signal(entry=10.0, stop=9.0, context={"round_number_breakout": False})
-
-    decision = rm.evaluate(signal)
-
-    assert decision.accepted
-    assert decision.sized_qty == 100  # unboosted
-
-
-def test_time_of_day_boost_applied_within_window(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01)
-    signal = make_signal(entry=10.0, stop=9.0)
-    now = datetime(2026, 1, 5, 12, 30, tzinfo=timezone.utc)  # 07:30 ET (EST, UTC-5) -- inside 07:00-10:00
-
-    decision = rm.evaluate(signal, now=now)
-
-    assert decision.accepted
-    assert decision.sized_qty == 125  # raw_shares(100) * 1.25
-
-
-def test_time_of_day_boost_not_applied_outside_window(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01)
-    signal = make_signal(entry=10.0, stop=9.0)
-    now = datetime(2026, 1, 5, 20, 0, tzinfo=timezone.utc)  # 15:00 ET -- outside the window
-
-    decision = rm.evaluate(signal, now=now)
-
-    assert decision.accepted
-    assert decision.sized_qty == 100  # unboosted
-
-
-def test_time_of_day_boost_not_applied_when_now_not_supplied(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01)
-    signal = make_signal(entry=10.0, stop=9.0)
-
-    decision = rm.evaluate(signal)  # no `now` -- must never guess from wall-clock time
-
-    assert decision.accepted
-    assert decision.sized_qty == 100
-
-
-def test_time_of_day_and_catalyst_boosts_stack(tmp_path):
-    snapshot = default_snapshot(net_liquidation=10_000)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, catalyst_size_multiplier=1.25)
-    signal = make_signal(entry=10.0, stop=9.0, context={"catalyst_category": "earnings"})
-    now = datetime(2026, 1, 5, 12, 30, tzinfo=timezone.utc)  # inside the boost window
-
-    decision = rm.evaluate(signal, now=now)
-
-    assert decision.accepted
-    assert decision.sized_qty == 156  # floor(floor(100*1.25)*1.25) = floor(125*1.25) = floor(156.25) = 156
+    assert decision.sized_qty == 10  # buying_power(100) / entry(10) -- the binding cap
 
 
 def test_profit_cushion_reduces_size_before_goal_progress(tmp_path):
-    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=0.0)
+    snapshot = default_snapshot(available_funds=100_000, daily_realized_pnl=0.0)
     rm = make_risk_manager(
-        tmp_path, snapshot, risk_per_trade_pct=0.01, daily_profit_goal_usd=1000, cushion_profit_fraction=0.25, cushion_size_fraction=0.25
+        tmp_path,
+        snapshot,
+        first_entry_pct_of_funds=0.10,
+        daily_profit_goal_usd=1000,
+        cushion_profit_fraction=0.25,
+        cushion_size_fraction=0.25,
     )
-    signal = make_signal(entry=10.0, stop=9.0)
+    signal = make_signal(entry=10.0)
 
     decision = rm.evaluate(signal)
 
     assert decision.accepted
-    # full size would be 500 (capped by max_position_pct_of_buying_power); cushion not yet met -> 25%
-    assert decision.sized_qty == 125
+    # full size would be 1000; cushion not yet met (0 < 25% of 1000) -> 25%
+    assert decision.sized_qty == 250
 
 
 def test_profit_cushion_lifts_once_goal_fraction_realized(tmp_path):
-    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=300.0)  # >= 25% of 1000
+    snapshot = default_snapshot(available_funds=100_000, daily_realized_pnl=300.0)  # >= 25% of 1000
     rm = make_risk_manager(
-        tmp_path, snapshot, risk_per_trade_pct=0.01, daily_profit_goal_usd=1000, cushion_profit_fraction=0.25, cushion_size_fraction=0.25
+        tmp_path,
+        snapshot,
+        first_entry_pct_of_funds=0.10,
+        daily_profit_goal_usd=1000,
+        cushion_profit_fraction=0.25,
+        cushion_size_fraction=0.25,
     )
-    signal = make_signal(entry=10.0, stop=9.0)
+    signal = make_signal(entry=10.0)
 
     decision = rm.evaluate(signal)
 
     assert decision.accepted
-    assert decision.sized_qty == 500
+    assert decision.sized_qty == 1000
 
 
 def test_profit_cushion_disabled_when_no_daily_goal_set(tmp_path):
-    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=0.0)
-    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.01, daily_profit_goal_usd=None)
-    signal = make_signal(entry=10.0, stop=9.0)
+    snapshot = default_snapshot(available_funds=100_000, daily_realized_pnl=0.0)
+    rm = make_risk_manager(tmp_path, snapshot, first_entry_pct_of_funds=0.10, daily_profit_goal_usd=None)
+    signal = make_signal(entry=10.0)
 
     decision = rm.evaluate(signal)
 
     assert decision.accepted
-    assert decision.sized_qty == 500
+    assert decision.sized_qty == 1000
 
 
 def _make_risk_manager_with_flag(tmp_path, snapshot, flatten_flag: bool, daily_loss_limit_pct=0.02) -> RiskManager:
     config = RiskConfig(
-        risk_per_trade_pct=0.01,
         daily_loss_limit_pct=daily_loss_limit_pct,
         flatten_on_daily_loss_limit=flatten_flag,
         max_concurrent_positions=3,
         max_position_pct_of_buying_power=0.25,
     )
-    return RiskManager(config, FakeAccountState(snapshot), kill_switch_path=tmp_path / "KILL_SWITCH")
+    return RiskManager(config, FakeAccountState(snapshot), FakePositionManager(), kill_switch_path=tmp_path / "KILL_SWITCH")
 
 
 def test_should_flatten_for_loss_limit_false_when_flag_disabled(tmp_path):

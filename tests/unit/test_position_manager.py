@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from tests.unit.fixtures import make_bars
-from warrior_bot.config import BreakevenConfig, ExitsConfig, ReversalExitConfig, ScaleOutConfig, TrailingConfig
+from warrior_bot.config import BreakevenConfig, ExitsConfig, ReversalExitConfig, TrailingConfig
 from warrior_bot.execution.position_manager import PositionManager
 from warrior_bot.signals.signal import Signal
 
@@ -27,9 +27,7 @@ class FakeEvent:
 
 
 class FakeOrder:
-    def __init__(
-        self, action, totalQuantity, auxPrice=None, lmtPrice=None, orderId=1, orderType=None, ocaGroup=""
-    ):
+    def __init__(self, action, totalQuantity, auxPrice=None, lmtPrice=None, orderId=1, orderType=None, ocaGroup=""):
         self.action = action
         self.totalQuantity = totalQuantity
         self.auxPrice = auxPrice
@@ -48,13 +46,16 @@ class FakeTrade:
 
 
 class FakeClient:
+    """getReqId() incrementing from a base clearly outside the 1-10 range
+    tests hand-assign to their own FakeOrders, so replacement orderIds
+    never collide with a test's own fixture orderIds."""
+
     def __init__(self):
         self._next_id = 100
 
     def getReqId(self) -> int:
-        rid = self._next_id
         self._next_id += 1
-        return rid
+        return self._next_id
 
 
 class FakeIB:
@@ -74,6 +75,13 @@ class FakeIB:
         self.cancelled.append(order)
 
 
+def find_trade(ib: FakeIB, order: FakeOrder) -> FakeTrade:
+    """Looks up the FakeTrade wrapping `order` -- used to reach the fresh
+    Trade a cancel-and-replace stop revision created, since PositionManager
+    re-wires its fill listener onto that new object, not the original."""
+    return next(t for t in ib.trades if t.order is order)
+
+
 class FakeJournal:
     def __init__(self):
         self.price_updates = []
@@ -85,33 +93,16 @@ class FakeJournal:
     def update_order_price(self, order_row_id, limit_price=None, stop_price=None, qty=None):
         self.price_updates.append((order_row_id, limit_price, stop_price, qty))
 
-    def record_order(
-        self, signal_id, ib_order_id, role, action, qty, order_type, limit_price, stop_price, oca_group, status
-    ):
-        row_id = self._next_row_id
+    def record_kill_switch_event(self, triggered_by, action_taken):
+        self.kill_switch_events.append((triggered_by, action_taken))
+
+    def record_order(self, **kwargs):
+        self.orders_recorded.append(kwargs)
         self._next_row_id += 1
-        self.orders_recorded.append(
-            {
-                "row_id": row_id,
-                "signal_id": signal_id,
-                "ib_order_id": ib_order_id,
-                "role": role,
-                "action": action,
-                "qty": qty,
-                "order_type": order_type,
-                "limit_price": limit_price,
-                "stop_price": stop_price,
-                "oca_group": oca_group,
-                "status": status,
-            }
-        )
-        return row_id
+        return self._next_row_id
 
     def update_order_status(self, order_row_id, status):
         self.order_statuses.append((order_row_id, status))
-
-    def record_kill_switch_event(self, triggered_by, action_taken):
-        self.kill_switch_events.append((triggered_by, action_taken))
 
 
 class FakeCtx:
@@ -155,7 +146,6 @@ def make_exits_config(
     reversal_exit_enabled=False,
 ) -> ExitsConfig:
     return ExitsConfig(
-        scale_out=ScaleOutConfig(),
         breakeven=BreakevenConfig(enabled=breakeven_enabled, trigger_r_multiple=breakeven_r),
         trailing=TrailingConfig(enabled=trailing_enabled, method=trailing_method, atr_multiple=atr_multiple),
         reversal_exit=ReversalExitConfig(enabled=reversal_exit_enabled),
@@ -169,17 +159,17 @@ def track_position(
     target_role="target",
     target_qty=None,
     stop_order_type=None,
+    order_id_offset=0,
     signal_id=1,
 ):
-    stop_order = FakeOrder("SELL", quantity, auxPrice=signal.stop_price, orderId=2, orderType=stop_order_type)
+    stop_order = FakeOrder(
+        "SELL", quantity, auxPrice=signal.stop_price, orderId=2 + order_id_offset, orderType=stop_order_type
+    )
     stop_trade = FakeTrade(stop_order)
     tq = target_qty if target_qty is not None else quantity
-    # bracket_builder only OCA-links the target/stop pair for a static
-    # target -- a scale_out leg is deliberately never OCA'd (see its own
-    # docstring), so the fixture mirrors that: non-empty ocaGroup only
-    # for target_role="target".
-    target_oca_group = f"{signal.symbol}-OCA" if target_role == "target" else ""
-    target_order = FakeOrder("SELL", tq, lmtPrice=signal.target_price, orderId=3, ocaGroup=target_oca_group)
+    target_order = FakeOrder("SELL", tq, lmtPrice=signal.target_price, orderId=3 + order_id_offset)
+    if target_role == "target":
+        target_order.ocaGroup = f"TEST-{order_id_offset}-OCA"
     target_trade = FakeTrade(target_order)
     pm.track(
         contract=object(),
@@ -187,8 +177,8 @@ def track_position(
         signal_id=signal_id,
         stop_trade=stop_trade,
         stop_row_id=1,
-        target_trade=target_trade,
-        target_role=target_role,
+        target_trades=[target_trade],
+        target_roles=[target_role],
     )
     return stop_trade, target_trade
 
@@ -200,15 +190,15 @@ def test_breakeven_moves_stop_to_entry_once_r_multiple_reached():
     stop_trade, _ = track_position(pm, signal)
 
     pm.on_bar(FakeCtx("TEST", last_price=10.5))  # +0.5R, not yet triggered
-    assert pm._positions["TEST"].current_stop_price == 9.0
+    assert pm._positions["TEST"][0].current_stop_price == 9.0
+    assert stop_trade.order not in ib.cancelled
 
     pm.on_bar(FakeCtx("TEST", last_price=11.0))  # +1.0R, triggers breakeven
-    assert pm._positions["TEST"].current_stop_price == 10.0
-    # cancel-and-replace: the original stop_trade.order is cancelled, a
-    # brand-new order object is what actually got placed
-    assert stop_trade.order in ib.cancelled
-    assert pm._positions["TEST"].stop_order is not stop_trade.order
-    assert any(order is pm._positions["TEST"].stop_order for _, order in ib.placed)
+    pos = pm._positions["TEST"][0]
+    assert pos.current_stop_price == 10.0
+    assert pos.stop_order.auxPrice == 10.0
+    assert stop_trade.order in ib.cancelled  # cancel-and-replace, not in-place modify
+    assert any(order is pos.stop_order for _, order in ib.placed)
 
 
 def test_breakeven_is_idempotent_no_duplicate_modify_calls():
@@ -223,7 +213,7 @@ def test_breakeven_is_idempotent_no_duplicate_modify_calls():
 
     pm.on_bar(FakeCtx("TEST", last_price=11.0))
     assert len(ib.placed) == calls_after_trigger
-    assert pm._positions["TEST"].current_stop_price == 10.0
+    assert pm._positions["TEST"][0].current_stop_price == 10.0
 
 
 def test_trailing_only_moves_stop_up_never_down():
@@ -235,15 +225,15 @@ def test_trailing_only_moves_stop_up_never_down():
     # +1.0R triggers breakeven (stop -> 10.0) then, same bar, trailing
     # ratchets it further to the EMA candidate (10.5).
     pm.on_bar(FakeCtx("TEST", last_price=11.0, ema_9=10.5))
-    assert pm._positions["TEST"].current_stop_price == 10.5
+    assert pm._positions["TEST"][0].current_stop_price == 10.5
 
     # price and EMA keep rising -- stop trails up to 11.0
     pm.on_bar(FakeCtx("TEST", last_price=12.0, ema_9=11.0))
-    assert pm._positions["TEST"].current_stop_price == 11.0
+    assert pm._positions["TEST"][0].current_stop_price == 11.0
 
     # price pulls back and EMA drops below the current stop -- must NOT loosen
     pm.on_bar(FakeCtx("TEST", last_price=11.5, ema_9=10.8))
-    assert pm._positions["TEST"].current_stop_price == 11.0
+    assert pm._positions["TEST"][0].current_stop_price == 11.0
 
 
 def test_trailing_cancels_static_target_once_activated():
@@ -436,7 +426,7 @@ def test_reversal_exit_no_pattern_leaves_position_untouched_and_runs_breakeven()
     market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
     assert len(market_orders) == 0
     assert "TEST" in pm._positions
-    assert pm._positions["TEST"].current_stop_price == 10.0  # breakeven still ran since no reversal fired
+    assert pm._positions["TEST"][0].current_stop_price == 10.0  # breakeven still ran since no reversal fired
 
 
 def test_breakeven_updates_stop_limit_price_when_order_is_stop_limit():
@@ -447,9 +437,11 @@ def test_breakeven_updates_stop_limit_price_when_order_is_stop_limit():
 
     pm.on_bar(FakeCtx("TEST", last_price=11.0))  # +1.0R triggers breakeven -> stop moves to entry (10.0)
 
-    pos = pm._positions["TEST"]
+    pos = pm._positions["TEST"][0]
     assert pos.current_stop_price == 10.0
+    assert pos.stop_order.auxPrice == 10.0
     assert pos.stop_order.lmtPrice == 10.0 * 0.99  # 1% below the new trigger, same offset direction as entry
+    assert stop_trade.order in ib.cancelled
 
 
 def test_trailing_updates_stop_limit_price_when_order_is_stop_limit():
@@ -460,8 +452,9 @@ def test_trailing_updates_stop_limit_price_when_order_is_stop_limit():
 
     pm.on_bar(FakeCtx("TEST", last_price=12.0, ema_9=11.0))  # breakeven then trailing ratchets to 11.0
 
-    pos = pm._positions["TEST"]
+    pos = pm._positions["TEST"][0]
     assert pos.current_stop_price == 11.0
+    assert pos.stop_order.auxPrice == 11.0
     assert pos.stop_order.lmtPrice == 11.0 * 0.99
 
 
@@ -475,7 +468,7 @@ def test_reversal_exit_on_lower_low_after_breakeven_triggers_market_exit():
     bars = make_bars([(10.0, 10.5, 9.9, 10.4, 1000), (10.4, 11.1, 10.35, 11.0, 1000)])
     pm.on_bar(FakeCtx("TEST", last_price=11.0, bars=bars))
     assert "TEST" in pm._positions
-    assert pm._positions["TEST"].current_stop_price == 10.0  # breakeven fired
+    assert pm._positions["TEST"][0].current_stop_price == 10.0  # breakeven fired
 
     # second bar: a lower low than the prior bar, isolated from the other
     # reversal signals (prior bar is red, not green, so red_after_green
@@ -488,145 +481,55 @@ def test_reversal_exit_on_lower_low_after_breakeven_triggers_market_exit():
     assert "TEST" not in pm._positions
 
 
-def test_trailing_replace_issues_cancel_and_new_placeOrder_not_in_place_mutation():
+def test_open_lot_count_zero_for_untracked_symbol():
+    pm = PositionManager(FakeIB(), FakeJournal(), make_exits_config())
+    assert pm.open_lot_count("TEST") == 0
+
+
+def test_open_lot_count_reflects_tracked_and_closed_lots():
     ib = FakeIB()
-    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_method="ema"))
+    pm = PositionManager(ib, FakeJournal(), make_exits_config())
     signal = make_signal(entry=10.0, stop=9.0)
-    stop_trade, _ = track_position(pm, signal)
+    stop_trade, _ = track_position(pm, signal, quantity=100, target_role="target", target_qty=100)
+    assert pm.open_lot_count("TEST") == 1
 
-    pm.on_bar(FakeCtx("TEST", last_price=11.0, ema_9=10.5))  # breakeven then trailing
-
-    assert stop_trade.order in ib.cancelled
-    new_order = pm._positions["TEST"].stop_order
-    assert new_order is not stop_trade.order
-    assert new_order.orderId != stop_trade.order.orderId
-    assert any(order is new_order for _, order in ib.placed)
+    stop_trade.fillEvent.emit(stop_trade, make_fill(100))
+    assert pm.open_lot_count("TEST") == 0
 
 
-def test_replacement_stop_fill_closes_out_position():
-    ib = FakeIB()
-    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
-    signal = make_signal(entry=10.0, stop=9.0)
-    track_position(pm, signal, quantity=100, target_role="target", target_qty=100)
-
-    pm.on_bar(FakeCtx("TEST", last_price=11.0))  # breakeven -> cancel-and-replace
-
-    new_trade = ib.trades[-1]
-    assert new_trade.order is pm._positions["TEST"].stop_order
-
-    new_trade.fillEvent.emit(new_trade, make_fill(100))
-
-    assert "TEST" not in pm._positions  # proves the REPLACEMENT stop's fill was actually wired up
-
-
-def test_trailing_immune_to_external_auxprice_corruption():
-    # Regression test for the corrupted-read-back bug: ib_async's openOrder
-    # callback can silently overwrite pos.stop_order.auxPrice in place
-    # (e.g. after IBKR's own error-399 anti-crossing repricing) with no
-    # relationship to PositionManager's own trailing state. This must not
-    # be able to fool the monotonic "stop only tightens" invariant, since
-    # current_stop_price -- not pos.stop_order.auxPrice -- is authoritative.
-    ib = FakeIB()
-    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_method="ema"))
-    signal = make_signal(entry=10.0, stop=9.0)
-    track_position(pm, signal)
-
-    # +1.0R triggers breakeven (stop -> 10.0) then, same bar, trailing
-    # ratchets it further to the EMA candidate (10.5) -- same as
-    # test_trailing_only_moves_stop_up_never_down.
-    pm.on_bar(FakeCtx("TEST", last_price=11.0, ema_9=10.5))
-    assert pm._positions["TEST"].current_stop_price == 10.5
-    placed_before = len(ib.placed)
-
-    # simulate ib_async's openOrder callback corrupting the shared Order
-    # object between two _check_trailing calls
-    pm._positions["TEST"].stop_order.auxPrice = 9.5
-
-    # a candidate that's a real regression from 10.5 but would look like
-    # tightening if current_stop were (wrongly) read from the corrupted 9.5
-    pm.on_bar(FakeCtx("TEST", last_price=11.5, ema_9=9.8))
-
-    assert pm._positions["TEST"].current_stop_price == 10.5  # unchanged -- not fooled
-    assert len(ib.placed) == placed_before  # no bogus replace was attempted
-
-
-def test_breakeven_replace_relinks_oca_with_live_target():
+def test_two_lots_on_same_symbol_are_tracked_and_managed_independently():
     ib = FakeIB()
     pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
-    signal = make_signal(entry=10.0, stop=9.0)
-    _, target_trade = track_position(pm, signal, target_role="target")
+    first_signal = make_signal(entry=10.0, stop=9.0)  # risk_per_share = 1.0
+    second_signal = make_signal(entry=11.0, stop=10.5)  # risk_per_share = 0.5, added later at a worse price
+    first_stop, _ = track_position(pm, first_signal, quantity=100, target_qty=100)
+    second_stop, _ = track_position(pm, second_signal, quantity=50, target_qty=50, order_id_offset=10)
 
-    pm.on_bar(FakeCtx("TEST", last_price=11.0))  # breakeven fires
+    assert pm.open_lot_count("TEST") == 2
 
-    new_stop = pm._positions["TEST"].stop_order
-    assert new_stop.ocaGroup == target_trade.order.ocaGroup
-    assert new_stop.ocaGroup != ""
+    # 11.5 is +1.5R for the first lot (entry 10, stop 9, risk_per_share 1.0)
+    # and exactly +1.0R for the second lot (entry 11, stop 10.5,
+    # risk_per_share 0.5) -- both cross their own breakeven trigger on the
+    # same bar, independently, moving each stop to its own entry price.
+    pm.on_bar(FakeCtx("TEST", last_price=11.5))
 
+    lots = pm._positions["TEST"]
+    first_lot = next(p for p in lots if p.signal is first_signal)
+    second_lot = next(p for p in lots if p.signal is second_signal)
+    assert first_lot.current_stop_price == 10.0
+    assert second_lot.current_stop_price == 11.0
+    assert pm.open_lot_count("TEST") == 2
 
-def test_trailing_replace_is_standalone_after_target_cancelled():
-    ib = FakeIB()
-    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_method="ema"))
-    signal = make_signal(entry=10.0, stop=9.0)
-    track_position(pm, signal, target_role="target")
+    # Each breakeven move cancelled-and-replaced its stop -- the fill
+    # listener now lives on the fresh Trade PositionManager created, not
+    # the original one this test holds a reference to.
+    first_stop_now = find_trade(ib, first_lot.stop_order)
+    second_stop_now = find_trade(ib, second_lot.stop_order)
 
-    # +1.0R triggers breakeven (OCA-relinked to the still-live target),
-    # then same bar trailing activates -- cancels the target, and its own
-    # replacement stop must come out standalone (no OCA group)
-    pm.on_bar(FakeCtx("TEST", last_price=11.0, ema_9=10.5))
-
-    final_stop = pm._positions["TEST"].stop_order
-    assert final_stop.ocaGroup == ""
-
-
-def test_scale_out_target_never_relinks_oca_on_breakeven_replace():
-    ib = FakeIB()
-    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
-    signal = make_signal(entry=10.0, stop=9.0)
-    track_position(pm, signal, target_role="scale_out", target_qty=40)
-
-    pm.on_bar(FakeCtx("TEST", last_price=11.0))  # breakeven fires
-
-    new_stop = pm._positions["TEST"].stop_order
-    assert new_stop.ocaGroup == ""
-
-
-def test_replace_journals_new_row_and_marks_old_cancelled():
-    ib = FakeIB()
-    journal = FakeJournal()
-    pm = PositionManager(ib, journal, make_exits_config(trailing_enabled=False))
-    signal = make_signal(entry=10.0, stop=9.0)
-    track_position(pm, signal, signal_id=42)
-
-    pm.on_bar(FakeCtx("TEST", last_price=11.0))  # breakeven fires -> one replace
-
-    assert journal.order_statuses == [(1, "Cancelled")]
-    assert len(journal.orders_recorded) == 1
-    recorded = journal.orders_recorded[0]
-    assert recorded["signal_id"] == 42
-    assert recorded["role"] == "stop"
-    assert recorded["stop_price"] == 10.0
-    assert pm._positions["TEST"].stop_row_id == recorded["row_id"]
-
-
-def test_atr_trailing_stop_price_is_tick_conformant():
-    # A deliberately "dirty" ATR value (last_price - atr*atr_multiple
-    # produces a many-decimal raw candidate) confirms _replace_stop_order
-    # rounds both the trigger (auxPrice) and the STP LMT limit price
-    # before submitting the replacement order to IBKR.
-    ib = FakeIB()
-    pm = PositionManager(
-        ib, FakeJournal(), make_exits_config(trailing_method="atr"), stop_limit_offset_pct=1.0
-    )
-    signal = make_signal(entry=10.0, stop=9.0)
-    stop_trade, _ = track_position(pm, signal, stop_order_type="STP LMT")
-
-    # last_price=11.0 triggers breakeven (+1.0R) then, same bar, trailing
-    # ratchets to the ATR candidate: 11.0 - 0.223456 * 1.5 = 10.664816 raw
-    pm.on_bar(FakeCtx("TEST", last_price=11.0, atr_value=0.223456))
-
-    pos = pm._positions["TEST"]
-    assert pos.current_stop_price == 10.66
-    assert pos.stop_order.lmtPrice == 10.55
+    first_stop_now.fillEvent.emit(first_stop_now, make_fill(100))
+    assert pm.open_lot_count("TEST") == 1  # only the first lot closed
+    second_stop_now.fillEvent.emit(second_stop_now, make_fill(50))
+    assert pm.open_lot_count("TEST") == 0
 
 
 def test_reversal_exit_lower_low_does_not_fire_before_breakeven():
@@ -643,3 +546,63 @@ def test_reversal_exit_lower_low_does_not_fire_before_breakeven():
     market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
     assert len(market_orders) == 0
     assert "TEST" in pm._positions
+
+
+def test_breakeven_replace_journals_new_order_and_cancels_old_row():
+    ib = FakeIB()
+    journal = FakeJournal()
+    pm = PositionManager(ib, journal, make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, signal_id=42)
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.0))  # triggers breakeven
+
+    assert len(journal.orders_recorded) == 1
+    recorded = journal.orders_recorded[0]
+    assert recorded["signal_id"] == 42
+    assert recorded["role"] == "stop"
+    assert recorded["stop_price"] == 10.0
+    assert (1, "Cancelled") in journal.order_statuses  # original stop_row_id=1 marked cancelled
+
+
+def test_breakeven_replace_relinks_oca_for_single_target_case():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, target_role="target")
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.0))
+
+    new_stop = pm._positions["TEST"][0].stop_order
+    assert new_stop.ocaGroup == "TEST-0-OCA"  # matches the target's ocaGroup set by track_position
+
+
+def test_breakeven_replace_does_not_oca_link_scale_out_tiers():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, target_role="scale_out", target_qty=40)
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.0))
+
+    new_stop = pm._positions["TEST"][0].stop_order
+    assert new_stop.ocaGroup == ""  # scale_out tiers are never OCA'd with the stop
+
+
+def test_trailing_immune_to_external_auxprice_corruption_on_stale_order():
+    # Simulates ib_async's own openOrder callback overwriting the ORIGINAL
+    # (now-cancelled) order's auxPrice in place after a broker broadcast --
+    # PositionManager must keep reading current_stop_price, not the stale
+    # object, so this corruption has no effect on trailing decisions.
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_method="ema"))
+    signal = make_signal(entry=10.0, stop=9.0)
+    stop_trade, _ = track_position(pm, signal)
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.0, ema_9=10.5))  # breakeven + trailing -> stop replaced to 10.5
+    assert pm._positions["TEST"][0].current_stop_price == 10.5
+
+    stop_trade.order.auxPrice = 999.0  # corrupt the stale, cancelled order
+
+    pm.on_bar(FakeCtx("TEST", last_price=12.0, ema_9=11.0))
+    assert pm._positions["TEST"][0].current_stop_price == 11.0  # unaffected by the corrupted stale object

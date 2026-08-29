@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from warrior_bot.config import ExitsConfig, NotificationsConfig, ScaleOutConfig
+from warrior_bot.config import ExitsConfig, NotificationsConfig, ProfitTierConfig
 from warrior_bot.execution.order_manager import OrderManager
 from warrior_bot.signals.signal import Signal
 
@@ -228,14 +228,20 @@ def test_fill_always_journaled_regardless_of_notifications(monkeypatch):
     assert om.journal.fills[0]["order_row_id"] == 7
 
 
-def test_scale_out_price_is_tick_conformant():
+def test_profit_tier_prices_are_tick_conformant():
     # entry + risk_per_share * r_multiple is raw float arithmetic -- pick
-    # values that produce a many-decimal result and confirm it comes out
-    # rounded to a valid $0.01 tick before it would reach IBKR.
+    # values that produce a many-decimal result and confirm each tier's
+    # price comes out rounded to a valid $0.01 tick before it would reach
+    # IBKR.
     om = OrderManager(
         ib=None,
         journal=FakeJournal(),
-        exits_config=ExitsConfig(scale_out=ScaleOutConfig(enabled=True, pct=0.5, r_multiple=1.37)),
+        exits_config=ExitsConfig(
+            profit_tiers=[
+                ProfitTierConfig(r_multiple=1.37, pct=0.34),
+                ProfitTierConfig(r_multiple=2.53, pct=0.33),
+            ]
+        ),
         position_manager=None,
     )
     signal = Signal(
@@ -247,6 +253,7 @@ def test_scale_out_price_is_tick_conformant():
         target_price=13.9,
         ts=datetime.now(timezone.utc),
     )
-    scale_out_qty, scale_out_price = om._scale_out_params(signal, quantity=100)
-    assert scale_out_qty == 50
-    assert scale_out_price == round(scale_out_price, 2)
+    specs = om._profit_tier_specs(signal, quantity=100)
+    assert len(specs) == 2
+    for qty, price in specs:
+        assert price == round(price, 2)
