@@ -14,7 +14,9 @@ execution:
 risk:
   daily_loss_limit_pct: 0.02     # halt new entries once daily realized loss exceeds this fraction of start-of-day equity
   flatten_on_daily_loss_limit: true  # force-close open positions when the daily halt triggers -- enabled for the unattended overnight test since no one can intervene manually
-  max_concurrent_positions: 3
+  max_concurrent_positions: 5
+  reserved_top_tier_slots: 1       # slots held back exclusively for scanner_rank <= reserved_top_tier_max_rank, used only once the other slots are full
+  reserved_top_tier_max_rank: 3    # inclusive
   max_position_pct_of_buying_power: 0.25  # outer safety ceiling as a fraction of current buying power -- backstop, not the primary sizing rule below
   daily_profit_goal_usd: null      # set to enable "profit cushion" sizing; null = feature off, always full size
   cushion_profit_fraction: 0.25    # trade at reduced size until this fraction of the daily goal is realized

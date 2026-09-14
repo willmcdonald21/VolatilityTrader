@@ -27,7 +27,17 @@ class FakeEvent:
 
 
 class FakeOrder:
-    def __init__(self, action, totalQuantity, auxPrice=None, lmtPrice=None, orderId=1, orderType=None, ocaGroup=""):
+    def __init__(
+        self,
+        action,
+        totalQuantity,
+        auxPrice=None,
+        lmtPrice=None,
+        orderId=1,
+        orderType=None,
+        ocaGroup="",
+        parentId=0,
+    ):
         self.action = action
         self.totalQuantity = totalQuantity
         self.auxPrice = auxPrice
@@ -35,14 +45,19 @@ class FakeOrder:
         self.orderId = orderId
         self.orderType = orderType
         self.ocaGroup = ocaGroup
+        self.parentId = parentId
 
 
 class FakeTrade:
-    def __init__(self, order: FakeOrder):
+    def __init__(self, order: FakeOrder, remaining: float = 0):
         self.order = order
         self.fillEvent = FakeEvent()
         self.statusEvent = FakeEvent()
-        self.orderStatus = SimpleNamespace(status="Submitted")
+        # remaining=0 by default -- most fixtures build a Trade to represent
+        # an order that's already fully resolved one way or another; tests
+        # simulating a still-filling parent set this explicitly before each
+        # fillEvent.emit() (matching real IBKR orderStatus.remaining).
+        self.orderStatus = SimpleNamespace(status="Submitted", remaining=remaining)
 
 
 class FakeClient:
@@ -88,10 +103,15 @@ class FakeJournal:
         self.kill_switch_events = []
         self.orders_recorded = []
         self.order_statuses = []
+        self.fills_recorded = []
         self._next_row_id = 100
 
     def update_order_price(self, order_row_id, limit_price=None, stop_price=None, qty=None):
         self.price_updates.append((order_row_id, limit_price, stop_price, qty))
+
+    def record_fill(self, **kwargs):
+        self.fills_recorded.append(kwargs)
+        return len(self.fills_recorded)
 
     def record_kill_switch_event(self, triggered_by, action_taken):
         self.kill_switch_events.append((triggered_by, action_taken))
@@ -133,8 +153,10 @@ def make_signal(entry=10.0, stop=9.0, target=12.0) -> Signal:
     )
 
 
-def make_fill(shares: float):
-    return SimpleNamespace(execution=SimpleNamespace(shares=shares))
+def make_fill(shares: float, price: float = 0.0, commission_report=None):
+    return SimpleNamespace(
+        execution=SimpleNamespace(shares=shares, price=price), commissionReport=commission_report
+    )
 
 
 def make_exits_config(
@@ -161,9 +183,17 @@ def track_position(
     stop_order_type=None,
     order_id_offset=0,
     signal_id=1,
+    entry_filled=True,
 ):
+    parent_order = FakeOrder("BUY", quantity, lmtPrice=signal.entry_price, orderId=1 + order_id_offset)
+    parent_trade = FakeTrade(parent_order)
     stop_order = FakeOrder(
-        "SELL", quantity, auxPrice=signal.stop_price, orderId=2 + order_id_offset, orderType=stop_order_type
+        "SELL",
+        quantity,
+        auxPrice=signal.stop_price,
+        orderId=2 + order_id_offset,
+        orderType=stop_order_type,
+        parentId=parent_order.orderId,
     )
     stop_trade = FakeTrade(stop_order)
     tq = target_qty if target_qty is not None else quantity
@@ -175,11 +205,14 @@ def track_position(
         contract=object(),
         signal=signal,
         signal_id=signal_id,
+        parent_trade=parent_trade,
         stop_trade=stop_trade,
         stop_row_id=1,
         target_trades=[target_trade],
         target_roles=[target_role],
     )
+    if entry_filled:
+        parent_trade.fillEvent.emit(parent_trade, make_fill(quantity))
     return stop_trade, target_trade
 
 
@@ -187,17 +220,22 @@ def test_breakeven_moves_stop_to_entry_once_r_multiple_reached():
     ib = FakeIB()
     pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
     signal = make_signal(entry=10.0, stop=9.0)  # risk_per_share = 1.0
+    # track_position's entry_filled=True already cancel-and-replaces the
+    # original stop once (on_entry_fill), so the "current" stop at this
+    # point is already a second-generation order -- pos.stop_order, not
+    # the stale stop_trade.order this helper returns.
     stop_trade, _ = track_position(pm, signal)
+    stop_after_entry_fill = pm._positions["TEST"][0].stop_order
 
     pm.on_bar(FakeCtx("TEST", last_price=10.5))  # +0.5R, not yet triggered
     assert pm._positions["TEST"][0].current_stop_price == 9.0
-    assert stop_trade.order not in ib.cancelled
+    assert stop_after_entry_fill not in ib.cancelled
 
     pm.on_bar(FakeCtx("TEST", last_price=11.0))  # +1.0R, triggers breakeven
     pos = pm._positions["TEST"][0]
     assert pos.current_stop_price == 10.0
     assert pos.stop_order.auxPrice == 10.0
-    assert stop_trade.order in ib.cancelled  # cancel-and-replace, not in-place modify
+    assert stop_after_entry_fill in ib.cancelled  # cancel-and-replace, not in-place modify
     assert any(order is pos.stop_order for _, order in ib.placed)
 
 
@@ -205,11 +243,14 @@ def test_breakeven_is_idempotent_no_duplicate_modify_calls():
     ib = FakeIB()
     pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
     signal = make_signal(entry=10.0, stop=9.0)
+    # track_position's entry_filled=True already places 1 order (the
+    # entry-fill stop resize -- see on_entry_fill); breakeven adds one more.
     stop_trade, _ = track_position(pm, signal)
+    calls_before_trigger = len(ib.placed)
 
     pm.on_bar(FakeCtx("TEST", last_price=11.0))
     calls_after_trigger = len(ib.placed)
-    assert calls_after_trigger == 1
+    assert calls_after_trigger == calls_before_trigger + 1
 
     pm.on_bar(FakeCtx("TEST", last_price=11.0))
     assert len(ib.placed) == calls_after_trigger
@@ -262,12 +303,15 @@ def test_scale_out_fill_resizes_stop_quantity():
     ib = FakeIB()
     pm = PositionManager(ib, FakeJournal(), make_exits_config())
     signal = make_signal(entry=10.0, stop=9.0)
-    stop_trade, target_trade = track_position(pm, signal, quantity=100, target_role="scale_out", target_qty=40)
+    # entry_filled=True already cancel-and-replaces the stop once
+    # (on_entry_fill) -- the resize under test is a *second* replacement.
+    _, target_trade = track_position(pm, signal, quantity=100, target_role="scale_out", target_qty=40)
 
     target_trade.fillEvent.emit(target_trade, make_fill(40))
 
-    assert stop_trade.order.totalQuantity == 60
-    assert any(order is stop_trade.order and order.totalQuantity == 60 for _, order in ib.placed)
+    pos = pm._positions["TEST"][0]
+    assert pos.stop_order.totalQuantity == 60
+    assert any(order is pos.stop_order and order.totalQuantity == 60 for _, order in ib.placed)
     assert "TEST" in pm._positions  # remainder still tracked
 
 
@@ -553,16 +597,20 @@ def test_breakeven_replace_journals_new_order_and_cancels_old_row():
     journal = FakeJournal()
     pm = PositionManager(ib, journal, make_exits_config(trailing_enabled=False))
     signal = make_signal(entry=10.0, stop=9.0)
+    # entry_filled=True already journals one replacement (on_entry_fill,
+    # cancelling the original stop_row_id=1); breakeven below journals a
+    # second, distinct one.
     track_position(pm, signal, signal_id=42)
+    assert len(journal.orders_recorded) == 1
+    assert (1, "Cancelled") in journal.order_statuses
 
     pm.on_bar(FakeCtx("TEST", last_price=11.0))  # triggers breakeven
 
-    assert len(journal.orders_recorded) == 1
-    recorded = journal.orders_recorded[0]
+    assert len(journal.orders_recorded) == 2
+    recorded = journal.orders_recorded[-1]
     assert recorded["signal_id"] == 42
     assert recorded["role"] == "stop"
     assert recorded["stop_price"] == 10.0
-    assert (1, "Cancelled") in journal.order_statuses  # original stop_row_id=1 marked cancelled
 
 
 def test_breakeven_replace_relinks_oca_for_single_target_case():
@@ -606,3 +654,273 @@ def test_trailing_immune_to_external_auxprice_corruption_on_stale_order():
 
     pm.on_bar(FakeCtx("TEST", last_price=12.0, ema_9=11.0))
     assert pm._positions["TEST"][0].current_stop_price == 11.0  # unaffected by the corrupted stale object
+
+def test_breakeven_does_not_fire_before_entry_has_filled():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)  # risk_per_share = 1.0
+    stop_trade, _ = track_position(pm, signal, entry_filled=False)
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.0))  # would be +1.0R if the entry had filled
+
+    assert pm._positions["TEST"][0].current_stop_price == 9.0
+    assert stop_trade.order not in ib.cancelled
+    assert pm._positions["TEST"][0].breakeven_done is False
+
+
+def test_trailing_does_not_fire_before_entry_has_filled():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_method="ema"))
+    signal = make_signal(entry=10.0, stop=9.0)
+    stop_trade, _ = track_position(pm, signal, entry_filled=False)
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.0, ema_9=10.5))
+
+    assert pm._positions["TEST"][0].current_stop_price == 9.0
+    assert stop_trade.order not in ib.cancelled
+
+
+def test_reversal_exit_does_not_fire_before_entry_has_filled():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=True))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, quantity=100, entry_filled=False)
+
+    bars = make_bars(
+        [
+            (10.0, 10.5, 9.9, 10.4, 1000),
+            (10.4, 11.0, 10.35, 10.45, 1000),  # topping tail -- would fire if the entry had filled
+        ]
+    )
+    pm.on_bar(FakeCtx("TEST", last_price=10.45, bars=bars))
+
+    market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
+    assert len(market_orders) == 0
+    assert "TEST" in pm._positions
+
+
+def test_management_resumes_once_entry_fill_arrives():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    parent_trade = FakeTrade(FakeOrder("BUY", 100, lmtPrice=signal.entry_price, orderId=1))
+    stop_trade = FakeTrade(FakeOrder("SELL", 100, auxPrice=signal.stop_price, orderId=2, parentId=1))
+    target_trade = FakeTrade(FakeOrder("SELL", 100, lmtPrice=signal.target_price, orderId=3))
+    pm.track(
+        contract=object(),
+        signal=signal,
+        signal_id=1,
+        parent_trade=parent_trade,
+        stop_trade=stop_trade,
+        stop_row_id=1,
+        target_trades=[target_trade],
+        target_roles=["target"],
+    )
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.0))
+    assert pm._positions["TEST"][0].current_stop_price == 9.0  # gated, no entry fill yet
+
+    pos = pm._positions["TEST"][0]
+    # the entry fill arrives later, same as a real limit order finally filling
+    parent_trade.fillEvent.emit(parent_trade, make_fill(100))
+    assert pos.entry_filled is True
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.0))
+    assert pm._positions["TEST"][0].current_stop_price == 10.0  # breakeven now applies
+    assert stop_trade.order in ib.cancelled
+
+
+def test_replacement_stop_does_not_carry_parent_id():
+    # _replace_stop_order only ever runs once entry_filled is true (see
+    # on_bar's gate), so by the time a replacement is built, the entry
+    # order it would reference is already Filled and no longer open at
+    # the broker. A parentId referencing it makes IBKR reject the whole
+    # submission with "Can't find order with id = <parent>" (confirmed
+    # live against RAMZ on 2026-09-14 -- every breakeven/trailing move
+    # after the first failed validation, silently leaving the position
+    # with no resting stop at all). entry_filled is the real safety net
+    # against replacing protection before an entry exists, so the
+    # replacement order must not set parentId at all.
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    stop_trade, _ = track_position(pm, signal)
+    assert stop_trade.order.parentId != 0  # the original bracket leg is correctly parented
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.0))  # triggers breakeven -> cancel-and-replace
+
+    new_stop = pm._positions["TEST"][0].stop_order
+    assert new_stop is not stop_trade.order  # genuinely replaced, not modified in place
+    assert new_stop.parentId == 0
+
+
+def test_replacement_stop_fill_is_journaled():
+    ib = FakeIB()
+    journal = FakeJournal()
+    pm = PositionManager(ib, journal, make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal)
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.0))  # cancel-and-replace fires
+    new_stop_trade = find_trade(ib, pm._positions["TEST"][0].stop_order)
+
+    new_stop_trade.fillEvent.emit(new_stop_trade, make_fill(100, price=10.0))
+
+    assert len(journal.fills_recorded) == 1
+    recorded = journal.fills_recorded[0]
+    assert recorded["fill_qty"] == 100
+    assert recorded["fill_price"] == 10.0
+    assert recorded["ib_order_id"] == new_stop_trade.order.orderId
+
+
+def test_replacement_stop_sized_to_actual_fills_not_full_order_size():
+    # Confirmed live incident (2026-09-14): GVH's parent entry order (3943
+    # shares) was still only partially filled when breakeven fired. The
+    # replacement stop was built from the *original* stop order's
+    # totalQuantity (the full intended 3943), not from shares actually
+    # held -- when it triggered, it sold far more than the account owned,
+    # taking the position to -1441 (a naked short). remaining_qty must
+    # reflect only real fills, and the replacement must be sized off it.
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    quantity = 1000
+    parent_order = FakeOrder("BUY", quantity, lmtPrice=signal.entry_price, orderId=1)
+    parent_trade = FakeTrade(parent_order)
+    stop_order = FakeOrder("SELL", quantity, auxPrice=signal.stop_price, orderId=2, parentId=1)
+    stop_trade = FakeTrade(stop_order)
+    target_order = FakeOrder("SELL", quantity, lmtPrice=signal.target_price, orderId=3)
+    target_trade = FakeTrade(target_order)
+    pm.track(
+        contract=object(),
+        signal=signal,
+        signal_id=1,
+        parent_trade=parent_trade,
+        stop_trade=stop_trade,
+        stop_row_id=1,
+        target_trades=[target_trade],
+        target_roles=["target"],
+    )
+
+    # Only a quarter of the intended order has actually filled so far --
+    # the rest is still resting, exactly like GVH's slow, fragmented entry.
+    parent_trade.fillEvent.emit(parent_trade, make_fill(250))
+    assert pm._positions["TEST"][0].remaining_qty == 250
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.0))  # triggers breakeven -> cancel-and-replace
+
+    new_stop = pm._positions["TEST"][0].stop_order
+    assert new_stop.totalQuantity == 250  # sized to actual holdings, not the full 1000
+
+
+def test_remaining_qty_grows_with_each_partial_entry_fill():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    quantity = 1000
+    parent_order = FakeOrder("BUY", quantity, lmtPrice=signal.entry_price, orderId=1)
+    parent_trade = FakeTrade(parent_order)
+    stop_order = FakeOrder("SELL", quantity, auxPrice=signal.stop_price, orderId=2, parentId=1)
+    stop_trade = FakeTrade(stop_order)
+    target_order = FakeOrder("SELL", quantity, lmtPrice=signal.target_price, orderId=3)
+    target_trade = FakeTrade(target_order)
+    pm.track(
+        contract=object(),
+        signal=signal,
+        signal_id=1,
+        parent_trade=parent_trade,
+        stop_trade=stop_trade,
+        stop_row_id=1,
+        target_trades=[target_trade],
+        target_roles=["target"],
+    )
+
+    parent_trade.fillEvent.emit(parent_trade, make_fill(300))
+    assert pm._positions["TEST"][0].remaining_qty == 300
+    parent_trade.fillEvent.emit(parent_trade, make_fill(400))
+    assert pm._positions["TEST"][0].remaining_qty == 700
+    # the resting stop is kept in step with each fill as it arrives --
+    # each one is a cancel-and-replace, so the *current* stop_order is a
+    # fresh object each time, not the original fixture's stop_order.
+    assert pm._positions["TEST"][0].stop_order.totalQuantity == 700
+
+
+def test_position_stays_tracked_when_flat_but_parent_still_filling():
+    # Confirmed live incident (2026-09-14): BLSG's parent order (1059
+    # shares intended) had only filled 100 so far when a fast tier fill
+    # sold exactly those 100, hitting remaining_qty <= 0. The old
+    # _close_out unconditionally untracked the position there -- but the
+    # parent kept working and filled 959 more shares later, which then had
+    # no listener left to protect them at all (no resting stop, ever).
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    parent_order = FakeOrder("BUY", 1000, lmtPrice=signal.entry_price, orderId=1)
+    parent_trade = FakeTrade(parent_order, remaining=900)  # 100 of 1000 filled so far
+    stop_order = FakeOrder("SELL", 1000, auxPrice=signal.stop_price, orderId=2, parentId=1)
+    stop_trade = FakeTrade(stop_order)
+    target_order = FakeOrder("SELL", 1000, lmtPrice=signal.target_price, orderId=3)
+    target_trade = FakeTrade(target_order)
+    pm.track(
+        contract=object(),
+        signal=signal,
+        signal_id=1,
+        parent_trade=parent_trade,
+        stop_trade=stop_trade,
+        stop_row_id=1,
+        target_trades=[target_trade],
+        target_roles=["scale_out"],
+    )
+    parent_trade.fillEvent.emit(parent_trade, make_fill(100))  # first 100 of 1000
+    assert pm._positions["TEST"][0].remaining_qty == 100
+    assert pm._positions["TEST"][0].parent_done is False
+
+    # A tier fills exactly those 100 shares -- flat for the moment.
+    target_trade.fillEvent.emit(target_trade, make_fill(100))
+
+    # Must still be tracked: the parent isn't done, so this isn't really over.
+    assert "TEST" in pm._positions
+    pos = pm._positions["TEST"][0]
+    assert pos.remaining_qty == 0
+
+    # The parent goes on to fill the rest, much later.
+    parent_trade.orderStatus.remaining = 0  # now fully filled
+    parent_trade.fillEvent.emit(parent_trade, make_fill(900))
+
+    pos = pm._positions["TEST"][0]
+    assert pos.remaining_qty == 900
+    assert pos.parent_done is True
+    # A fresh stop now exists, correctly sized for the newly-filled shares.
+    assert pos.stop_order.totalQuantity == 900
+    assert pos.stop_order not in ib.cancelled
+
+
+def test_on_bar_skips_flat_lot_still_tracked_for_pending_parent_fills():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=True))
+    signal = make_signal(entry=10.0, stop=9.0)
+    parent_order = FakeOrder("BUY", 1000, lmtPrice=signal.entry_price, orderId=1)
+    parent_trade = FakeTrade(parent_order, remaining=900)
+    stop_order = FakeOrder("SELL", 1000, auxPrice=signal.stop_price, orderId=2, parentId=1)
+    stop_trade = FakeTrade(stop_order)
+    target_order = FakeOrder("SELL", 1000, lmtPrice=signal.target_price, orderId=3)
+    target_trade = FakeTrade(target_order)
+    pm.track(
+        contract=object(),
+        signal=signal,
+        signal_id=1,
+        parent_trade=parent_trade,
+        stop_trade=stop_trade,
+        stop_row_id=1,
+        target_trades=[target_trade],
+        target_roles=["scale_out"],
+    )
+    parent_trade.fillEvent.emit(parent_trade, make_fill(100))
+    target_trade.fillEvent.emit(target_trade, make_fill(100))  # flat for now
+
+    placed_before = len(ib.placed)
+    bars = make_bars([(10.0, 10.5, 9.9, 10.4, 1000), (10.4, 11.0, 10.35, 10.45, 1000)])  # topping tail shape
+    pm.on_bar(FakeCtx("TEST", last_price=10.45, bars=bars))  # would trigger reversal exit if not skipped
+
+    assert len(ib.placed) == placed_before  # no naked market order for 0 shares
+    assert "TEST" in pm._positions

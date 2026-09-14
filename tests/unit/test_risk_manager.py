@@ -44,6 +44,8 @@ def make_risk_manager(tmp_path, snapshot, open_lots: int = 0, **risk_overrides) 
     config = RiskConfig(
         daily_loss_limit_pct=risk_overrides.get("daily_loss_limit_pct", 0.02),
         max_concurrent_positions=risk_overrides.get("max_concurrent_positions", 3),
+        reserved_top_tier_slots=risk_overrides.get("reserved_top_tier_slots", 0),
+        reserved_top_tier_max_rank=risk_overrides.get("reserved_top_tier_max_rank", 3),
         max_position_pct_of_buying_power=risk_overrides.get("max_position_pct_of_buying_power", 0.25),
         daily_profit_goal_usd=risk_overrides.get("daily_profit_goal_usd"),
         cushion_profit_fraction=risk_overrides.get("cushion_profit_fraction", 0.25),
@@ -156,6 +158,71 @@ def test_max_concurrent_positions_checked_before_lot_count(tmp_path):
 
     assert not decision.accepted
     assert "max concurrent positions" in decision.reason
+
+
+def test_admits_top_tier_signal_into_reserved_slot_when_unrestricted_full(tmp_path):
+    # 5 total, 1 reserved -> 4 unrestricted. All 4 taken; a scanner_rank 2
+    # signal should still get the reserved 5th slot.
+    snapshot = default_snapshot(open_positions_count=4)
+    rm = make_risk_manager(
+        tmp_path, snapshot, max_concurrent_positions=5, reserved_top_tier_slots=1, reserved_top_tier_max_rank=3
+    )
+    signal = make_signal(context={"scanner_rank": 2})
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+
+
+def test_rejects_low_rank_signal_when_only_reserved_slot_remains(tmp_path):
+    snapshot = default_snapshot(open_positions_count=4)
+    rm = make_risk_manager(
+        tmp_path, snapshot, max_concurrent_positions=5, reserved_top_tier_slots=1, reserved_top_tier_max_rank=3
+    )
+    signal = make_signal(context={"scanner_rank": 10})
+
+    decision = rm.evaluate(signal)
+
+    assert not decision.accepted
+    assert "reserved for scanner_rank" in decision.reason
+
+
+def test_admits_any_rank_when_unrestricted_slots_still_open(tmp_path):
+    snapshot = default_snapshot(open_positions_count=2)
+    rm = make_risk_manager(
+        tmp_path, snapshot, max_concurrent_positions=5, reserved_top_tier_slots=1, reserved_top_tier_max_rank=3
+    )
+    signal = make_signal(context={"scanner_rank": 25})
+
+    decision = rm.evaluate(signal)
+
+    assert decision.accepted
+
+
+def test_rejects_all_when_fully_at_max_concurrent_positions_with_reserve(tmp_path):
+    snapshot = default_snapshot(open_positions_count=5)
+    rm = make_risk_manager(
+        tmp_path, snapshot, max_concurrent_positions=5, reserved_top_tier_slots=1, reserved_top_tier_max_rank=3
+    )
+    signal = make_signal(context={"scanner_rank": 1})
+
+    decision = rm.evaluate(signal)
+
+    assert not decision.accepted
+    assert "max concurrent positions reached (5)" in decision.reason
+
+
+def test_missing_scanner_rank_ineligible_for_reserved_slot(tmp_path):
+    snapshot = default_snapshot(open_positions_count=4)
+    rm = make_risk_manager(
+        tmp_path, snapshot, max_concurrent_positions=5, reserved_top_tier_slots=1, reserved_top_tier_max_rank=3
+    )
+    signal = make_signal(context={})  # no scanner_rank key at all
+
+    decision = rm.evaluate(signal)
+
+    assert not decision.accepted
+    assert "reserved for scanner_rank" in decision.reason
 
 
 def test_rejects_when_sized_qty_rounds_to_zero(tmp_path):

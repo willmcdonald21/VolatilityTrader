@@ -38,6 +38,20 @@ class ManagedPosition:
     current_stop_price: float
     target_orders: list[Order]
     target_roles: list[str]  # parallel to target_orders
+    # Set once the parent (entry) order records its first fill. Breakeven,
+    # trailing, and reversal-exit must never act before this is true --
+    # doing so would manage/replace protection for shares not actually
+    # owned yet (see _replace_stop_order's parentId note for why that's
+    # dangerous specifically for stop revisions).
+    entry_filled: bool = False
+    # True once the parent order has no shares left to fill. Until then,
+    # remaining_qty hitting 0 (e.g. a fast tier fill selling everything
+    # bought *so far*) does not mean the position is actually flat -- the
+    # still-working parent can go on to fill more shares later. Confirmed
+    # live (BLSG, 2026-09-14): closing out and untracking on remaining_qty
+    # <= 0 without checking this orphaned 959 later-filled shares with no
+    # listener left to protect them.
+    parent_done: bool = False
     breakeven_done: bool = False
     trailing_active: bool = False
 
@@ -75,6 +89,7 @@ class PositionManager:
         contract: Contract,
         signal: Signal,
         signal_id: int,
+        parent_trade: Trade,
         stop_trade: Trade,
         stop_row_id: int,
         target_trades: list[Trade],
@@ -85,7 +100,13 @@ class PositionManager:
             contract=contract,
             signal=signal,
             signal_id=signal_id,
-            remaining_qty=int(stop_trade.order.totalQuantity),
+            # Starts at 0, not the full intended order size -- this bot
+            # trades exclusively thin/low-float stocks where the parent
+            # entry order routinely takes minutes to fully fill (or never
+            # fully fills). on_entry_fill below grows this with each real
+            # partial fill, so it always reflects shares actually held,
+            # never the size we merely intended to buy.
+            remaining_qty=0,
             stop_order=stop_trade.order,
             stop_row_id=stop_row_id,
             current_stop_price=signal.stop_price,
@@ -93,6 +114,33 @@ class PositionManager:
             target_roles=list(target_roles),
         )
         self._positions.setdefault(signal.symbol, []).append(pos)
+
+        def on_entry_fill(t: Trade, fill) -> None:
+            pos.entry_filled = True
+            pos.remaining_qty += int(fill.execution.shares)
+            # t.orderStatus.remaining reflects the parent's own state as of
+            # *this* fill -- 0 means nothing is left to fill, ever. Until
+            # that's true, a remaining_qty of 0 later on just means
+            # everything bought *so far* has also been sold, not that the
+            # position is done (see _close_out).
+            pos.parent_done = t.orderStatus.remaining == 0
+            # Keep the resting stop's size in step with shares actually
+            # held so far -- without this, a breakeven/trailing move that
+            # fires while the parent is still (partially) filling would
+            # build its replacement from a remaining_qty that undercounts
+            # true holdings, which is harmless (under-protects new
+            # shares); the dangerous direction this guards against is
+            # _replace_stop_order ever being handed a stale, too-large
+            # quantity from before this fix (confirmed live: GVH went
+            # short -1441 shares on 2026-09-14 when a replacement stop
+            # was sized off the full intended 3943-share order while only
+            # a fraction had actually filled). Cancel-and-replace (not a
+            # resize-in-place) also means this self-heals correctly even
+            # if the current stop was already cancelled by a prior
+            # flat-for-now close_out below.
+            self._replace_stop_order(pos, new_qty=pos.remaining_qty)
+
+        parent_trade.fillEvent += on_entry_fill
 
         def make_on_target_fill(p: ManagedPosition):
             return lambda t, fill: self._on_target_fill(p, fill)
@@ -104,8 +152,13 @@ class PositionManager:
     def _wire_stop_fill(self, pos: ManagedPosition, trade: Trade) -> None:
         """Separated from track() so a replacement stop order (see
         _replace_stop_order) can re-wire the same fill handling onto its
-        own fresh Trade object."""
-        trade.fillEvent += lambda t, fill: self._on_stop_fill(pos, fill)
+        own fresh Trade object. A replacement stop's Trade never passes
+        through OrderManager._attach_tracking (only the original bracket
+        submission does), so this is also the only place a fill on a
+        *revised* stop ever gets journaled -- without it, a stop that was
+        cancelled-and-replaced even once would go fill-blind in
+        data/journal.sqlite3 even though a real execution happened."""
+        trade.fillEvent += lambda t, fill: self._on_stop_fill(pos, t, fill)
 
     def on_bar(self, ctx: SymbolContext) -> None:
         lots = self._positions.get(ctx.symbol)
@@ -116,6 +169,18 @@ class PositionManager:
             return
 
         for pos in list(lots):  # copy -- a reversal exit mutates the list mid-loop
+            if not pos.entry_filled:
+                # Nothing to protect yet -- breakeven/trailing/reversal-exit
+                # would otherwise manage (and, for stop revisions, replace)
+                # protection for shares that may never actually be owned.
+                continue
+            if pos.remaining_qty <= 0:
+                # Flat for now but still tracked because the parent order
+                # may yet fill more (see _close_out) -- nothing to manage
+                # until that happens. Skipping this also avoids
+                # _reversal_exit building a zero-quantity market order.
+                continue
+
             if self.config.reversal_exit.enabled and self._check_reversal_exit(pos, ctx):
                 continue  # this lot is now flat -- evaluate any remaining lot for this symbol
 
@@ -250,31 +315,57 @@ class PositionManager:
         )
         self._untrack(pos)
 
-    def _replace_stop_order(self, pos: ManagedPosition, new_price: float) -> None:
-        """Cancel-and-replace instead of in-place modification. IBKR
-        rejects in-place modification of an order that's OCA-grouped or
-        already been (partially) filled with error 10326 ("OCA group
-        revision is not allowed") -- and ib_async marks the trade locally
-        Cancelled on that error even though it may still be live at the
-        broker, silently killing protection on the position. A fresh order
-        with a fresh orderId sidesteps this entirely."""
+    def _replace_stop_order(
+        self, pos: ManagedPosition, new_price: float | None = None, new_qty: int | None = None
+    ) -> None:
+        """Cancel-and-replace instead of in-place modification, for both
+        price moves (breakeven/trailing) and quantity changes (a fill on
+        the entry or a target leg). IBKR rejects in-place modification of
+        an order that's OCA-grouped or already been (partially) filled
+        with error 10326 ("OCA group revision is not allowed") -- and
+        ib_async marks the trade locally Cancelled on that error even
+        though it may still be live at the broker, silently killing
+        protection on the position. A fresh order with a fresh orderId
+        sidesteps this entirely -- including when the "old" order is
+        already Cancelled (harmless no-op to cancel it again), which
+        happens whenever this runs right after a temporary flat-for-now
+        state (see _close_out's parent_done branch).
+
+        If `new_qty` resolves to <= 0, there's nothing to protect right
+        now -- just cancel the old order and leave the position without a
+        resting stop rather than submitting an invalid zero-quantity
+        order; the next real fill (see on_entry_fill) calls back in here
+        to establish a fresh one."""
         old_order = pos.stop_order
-        new_price = round_to_tick(new_price)
+        price = round_to_tick(new_price) if new_price is not None else pos.current_stop_price
+        qty = pos.remaining_qty if new_qty is None else new_qty
+        if qty <= 0:
+            self.ib.cancelOrder(old_order)
+            return
         limit_price = None
         if getattr(old_order, "orderType", None) == "STP LMT":
             # keep the limit offset in the same direction bracket_builder
             # used when the order was first built, so trailing/breakeven
             # moves don't drift the limit's protective distance
             if old_order.action == "SELL":
-                limit_price = round_to_tick(new_price * (1 - self.stop_limit_offset_pct / 100.0))
+                limit_price = round_to_tick(price * (1 - self.stop_limit_offset_pct / 100.0))
             else:
-                limit_price = round_to_tick(new_price * (1 + self.stop_limit_offset_pct / 100.0))
+                limit_price = round_to_tick(price * (1 + self.stop_limit_offset_pct / 100.0))
             new_order = StopLimitOrder(
                 old_order.action,
-                old_order.totalQuantity,
+                qty,
                 lmtPrice=limit_price,
-                stopPrice=new_price,
+                stopPrice=price,
                 orderId=self.ib.client.getReqId(),
+                # No parentId here (unlike the original bracket leg this is
+                # replacing): _replace_stop_order only ever runs once
+                # entry_filled is true (see on_bar's gate), so the entry
+                # order this would reference is already Filled and no
+                # longer open at the broker -- IBKR can't resolve a
+                # parentId against a closed order and rejects the whole
+                # submission ("Can't find order with id = <parent>"),
+                # which silently leaves the position with no resting stop
+                # at all. entry_filled is the actual safety net here.
                 transmit=True,
                 outsideRth=True,
                 tif="DAY",
@@ -282,8 +373,8 @@ class PositionManager:
         else:
             new_order = StopOrder(
                 old_order.action,
-                old_order.totalQuantity,
-                new_price,
+                qty,
+                price,
                 orderId=self.ib.client.getReqId(),
                 transmit=True,
                 outsideRth=True,
@@ -308,7 +399,7 @@ class PositionManager:
             qty=new_order.totalQuantity,
             order_type=new_order.orderType,
             limit_price=limit_price,
-            stop_price=new_price,
+            stop_price=price,
             oca_group=new_order.ocaGroup or None,
             status=new_trade.orderStatus.status,
         )
@@ -316,13 +407,8 @@ class PositionManager:
 
         pos.stop_order = new_order
         pos.stop_row_id = new_row_id
-        pos.current_stop_price = new_price
+        pos.current_stop_price = price
         self._wire_stop_fill(pos, new_trade)
-
-    def _resize_stop_qty(self, pos: ManagedPosition, new_qty: int) -> None:
-        pos.stop_order.totalQuantity = new_qty
-        self.ib.placeOrder(pos.contract, pos.stop_order)
-        self.journal.update_order_price(pos.stop_row_id, qty=new_qty)
 
     def _on_target_fill(self, pos: ManagedPosition, fill) -> None:
         filled_qty = fill.execution.shares
@@ -333,22 +419,57 @@ class PositionManager:
         # Resize the stop down after ANY partial target fill (not just a
         # scale_out tier) -- shares that already left via a target fill
         # must not stay covered by a stop still sized for the full lot.
-        self._resize_stop_qty(pos, pos.remaining_qty)
+        self._replace_stop_order(pos, new_qty=pos.remaining_qty)
         logger.info("Target fill for %s: stop resized to %d shares", pos.symbol, pos.remaining_qty)
 
-    def _on_stop_fill(self, pos: ManagedPosition, fill) -> None:
+    def _on_stop_fill(self, pos: ManagedPosition, trade: Trade, fill) -> None:
+        commission = None
+        realized_pnl = None
+        if fill.commissionReport is not None:
+            commission = fill.commissionReport.commission
+            # UNSET_DOUBLE sentinel on the opening leg of a round trip; see account_state.py
+            pnl = fill.commissionReport.realizedPNL
+            if pnl is not None and abs(pnl) < 1e15:
+                realized_pnl = pnl
+        self.journal.record_fill(
+            order_row_id=pos.stop_row_id,
+            ib_order_id=trade.order.orderId,
+            fill_qty=fill.execution.shares,
+            fill_price=fill.execution.price,
+            commission=commission,
+            realized_pnl=realized_pnl,
+        )
+
         filled_qty = fill.execution.shares
         pos.remaining_qty = max(0, pos.remaining_qty - filled_qty)
         if pos.remaining_qty <= 0:
             self._close_out(pos, cancel_stop=False, cancel_target=True)
 
     def _close_out(self, pos: ManagedPosition, cancel_stop: bool, cancel_target: bool) -> None:
-        """Position is flat -- best-effort cancel whichever counterpart
-        order(s) are still resting (a no-op if IBKR's own OCA link already
-        cancelled one) and stop tracking it."""
+        """Everything bought so far has also been sold -- best-effort
+        cancel whichever counterpart order(s) are still resting (a no-op
+        if IBKR's own OCA link already cancelled one).
+
+        Only actually stops tracking the lot if the parent has no shares
+        left to fill (pos.parent_done). Otherwise this is a real but
+        temporary flat: the still-working parent can go on to fill more
+        later (a fast tier fill closing out a small initial partial fill,
+        exactly like the rest still arrives afterward), and untracking
+        here would leave any such later fill with no listener left to
+        protect it -- confirmed live (BLSG, 2026-09-14): 959 shares ended
+        up with no resting stop this way. Staying tracked costs nothing:
+        on_entry_fill re-establishes a fresh stop the moment more shares
+        actually arrive, and on_bar's entry_filled gate already skips a
+        lot with nothing currently held."""
         if cancel_stop:
             self.ib.cancelOrder(pos.stop_order)
         if cancel_target:
             for target_order in pos.target_orders:
                 self.ib.cancelOrder(target_order)
-        self._untrack(pos)
+        if pos.parent_done:
+            self._untrack(pos)
+        else:
+            logger.info(
+                "%s flat for now but parent order still filling -- staying tracked so any further fills stay protected",
+                pos.symbol,
+            )

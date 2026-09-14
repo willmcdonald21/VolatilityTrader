@@ -99,6 +99,30 @@ class RiskManager:
             alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
             return RiskDecision(False, 0, reason, snapshot)
 
+        unrestricted_capacity = self.config.max_concurrent_positions - self.config.reserved_top_tier_slots
+        if snapshot.open_positions_count >= unrestricted_capacity:
+            # Every unrestricted slot is taken -- only the reserved top-tier
+            # slot(s) remain. No separate bookkeeping of which symbols used
+            # which slot is needed: open_positions_count alone tells us
+            # whether we're in reserved territory, since evaluate() is the
+            # sole gate an order passes through before this count can grow.
+            scanner_rank = signal.context.get("scanner_rank")
+            if scanner_rank is None:
+                # Every onboarded symbol is expected to carry a scanner_rank
+                # -- this shouldn't happen. Treat it as ineligible for the
+                # reserved slot rather than crashing or silently admitting it.
+                alert(
+                    f"Signal for {signal.symbol} ({signal.strategy}) has no scanner_rank while the "
+                    "reserved top-tier slot logic is evaluating it -- every onboarded symbol should carry one"
+                )
+            if scanner_rank is None or scanner_rank > self.config.reserved_top_tier_max_rank:
+                reason = (
+                    f"remaining slot reserved for scanner_rank <= {self.config.reserved_top_tier_max_rank} "
+                    f"(open positions: {snapshot.open_positions_count})"
+                )
+                alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
+                return RiskDecision(False, 0, reason, snapshot)
+
         open_lots = self.position_manager.open_lot_count(signal.symbol)
         if open_lots >= 2:
             reason = f"already at max lots (2) for {signal.symbol}"

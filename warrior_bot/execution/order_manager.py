@@ -63,6 +63,7 @@ class OrderManager:
         for take_profit, role in zip(bracket.take_profits, bracket.target_roles):
             role_by_order_id[take_profit.orderId] = role
 
+        parent_trade: Trade | None = None
         stop_trade: Trade | None = None
         stop_row_id: int | None = None
         target_trades: list[Trade] = []
@@ -83,7 +84,9 @@ class OrderManager:
             )
             self._order_row_ids[order.orderId] = row_id
             self._attach_tracking(trade, row_id, role, signal.entry_price)
-            if role == "stop":
+            if role == "parent":
+                parent_trade = trade
+            elif role == "stop":
                 stop_trade, stop_row_id = trade, row_id
             else:
                 target_trades.append(trade)
@@ -97,11 +100,12 @@ class OrderManager:
             profit_tiers or [(quantity, signal.target_price)],
         )
 
-        assert stop_trade is not None and stop_row_id is not None
+        assert parent_trade is not None and stop_trade is not None and stop_row_id is not None
         self.position_manager.track(
             contract,
             signal,
             signal_id=signal_id,
+            parent_trade=parent_trade,
             stop_trade=stop_trade,
             stop_row_id=stop_row_id,
             target_trades=target_trades,

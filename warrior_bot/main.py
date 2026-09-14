@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 from ib_async import Contract
 
@@ -31,6 +31,7 @@ from warrior_bot.strategies.indicators import Bar
 from warrior_bot.strategies.inverted_head_and_shoulders import InvertedHeadAndShouldersStrategy
 from warrior_bot.strategies.vwap_reversion import VwapReversionStrategy
 from warrior_bot.utils.panic import panic_stop
+from warrior_bot.utils.rounding import round_to_tick
 from warrior_bot.utils.time_utils import to_eastern
 
 logger = logging.getLogger("warrior_bot.main")
@@ -93,12 +94,20 @@ class WarriorBot:
         self._flattened_today = False
         self._news_provider_codes = config.news.provider_codes
         self._last_logged_breadth: int | None = None
+        # ET calendar date this process last reset daily state for. This is
+        # what makes EOD flatten (and everything else in reset_daily_state)
+        # keep working every day for a long-running process -- without it,
+        # _flattened_today only ever gets cleared once, in __init__, so a
+        # process that stays up past midnight silently stops flattening
+        # forever after its first day (see _check_new_trading_day).
+        self._trading_day: date | None = None
 
     async def start(self) -> None:
         await self.ib_client.connect()
         snapshot = self.account_state.snapshot()
         self.risk_manager.mark_start_of_day(snapshot.net_liquidation)
         self.journal.record_account_snapshot(snapshot)
+        self._trading_day = to_eastern(datetime.now(timezone.utc)).date()
         if self.config.news.enabled and not self._news_provider_codes:
             try:
                 self._news_provider_codes = await discover_provider_codes(self.ib)
@@ -149,7 +158,7 @@ class WarriorBot:
                 await asyncio.sleep(5)
                 continue
             try:
-                symbols = await scan_candidates(self.ib, self.config)
+                symbols = await asyncio.wait_for(scan_candidates(self.ib, self.config), timeout=30)
                 for rank, symbol in enumerate(symbols, start=1):
                     if symbol not in self.contexts:
                         await self._onboard_symbol(symbol, scanner_rank=rank)
@@ -170,10 +179,37 @@ class WarriorBot:
                 await asyncio.sleep(5)
                 continue
             try:
+                self._check_new_trading_day()
                 self._check_flatten_triggers()
             except Exception:
                 self.logger.exception("Risk loop iteration failed")
             await asyncio.sleep(self.config.exits.risk_loop_interval_seconds)
+
+    def _check_new_trading_day(self) -> None:
+        """Runs reset_daily_state() the first time this loop notices the ET
+        calendar date has changed, so day-trading discipline (EOD flatten,
+        daily loss limit, starter-trade regime tracking) resets every day
+        for a process that stays up past midnight -- not just once, on
+        __init__, for whichever day the process happened to start on."""
+        now_et_date = to_eastern(datetime.now(timezone.utc)).date()
+        if now_et_date == self._trading_day:
+            return
+        snapshot = self.account_state.snapshot()
+        if snapshot.open_positions_count > 0:
+            # RiskManager's max_concurrent_positions check reads live IBKR
+            # state, not PositionManager's local tracking, so clearing that
+            # tracking below can never let a carried-over position get
+            # ignored by risk gates -- but a real position surviving past
+            # midnight means yesterday's EOD flatten didn't do its job, and
+            # that's worth a loud, explicit alert rather than a silent reset.
+            alert(
+                f"New trading day starting with {snapshot.open_positions_count} position(s) still open "
+                "-- the prior day's EOD flatten may have failed. This reset does NOT flatten them; "
+                "check IBKR directly.",
+                channel="limits",
+            )
+        self.reset_daily_state()
+        self._trading_day = now_et_date
 
     def _check_flatten_triggers(self) -> None:
         if self._flattened_today:
@@ -209,15 +245,18 @@ class WarriorBot:
             self.logger.exception("Failed to fetch prior close for %s", symbol)
 
         try:
-            daily_bars = await self.ib.reqHistoricalDataAsync(
-                contract,
-                endDateTime="",
-                durationStr="20 D",
-                barSizeSetting="1 day",
-                whatToShow="TRADES",
-                useRTH=True,
-                formatDate=2,
-                keepUpToDate=False,
+            daily_bars = await asyncio.wait_for(
+                self.ib.reqHistoricalDataAsync(
+                    contract,
+                    endDateTime="",
+                    durationStr="20 D",
+                    barSizeSetting="1 day",
+                    whatToShow="TRADES",
+                    useRTH=True,
+                    formatDate=2,
+                    keepUpToDate=False,
+                ),
+                timeout=30,
             )
             if daily_bars:
                 ctx.avg_daily_volume = sum(b.volume for b in daily_bars) / len(daily_bars)
@@ -251,16 +290,23 @@ class WarriorBot:
             _ctx.add_bar(_bar_from_ib(bars[-1]))
             self._on_new_bar(_contract, _ctx)
 
-        keep_updated = await self.ib.reqHistoricalDataAsync(
-            contract,
-            endDateTime="",
-            durationStr="3600 S",
-            barSizeSetting="1 min",
-            whatToShow="TRADES",
-            useRTH=self.config.trading.use_rth,
-            formatDate=2,
-            keepUpToDate=True,
-        )
+        try:
+            keep_updated = await asyncio.wait_for(
+                self.ib.reqHistoricalDataAsync(
+                    contract,
+                    endDateTime="",
+                    durationStr="3600 S",
+                    barSizeSetting="1 min",
+                    whatToShow="TRADES",
+                    useRTH=self.config.trading.use_rth,
+                    formatDate=2,
+                    keepUpToDate=True,
+                ),
+                timeout=30,
+            )
+        except Exception:
+            self.logger.exception("Failed to subscribe to keep-updated bars for %s", symbol)
+            return
         keep_updated.updateEvent += on_update
         self._subscriptions[symbol] = keep_updated
         self.logger.info(
@@ -323,7 +369,11 @@ class WarriorBot:
         docstring, so the conservative stop always sits below entry."""
         max_risk = signal.entry_price * self.config.risk.max_stop_distance_pct / 100.0
         if signal.risk_per_share > max_risk:
-            signal.stop_price = signal.entry_price - max_risk
+            # Post-construction mutation bypasses Signal.__post_init__'s own
+            # rounding (that only runs once, at __init__) -- round here too,
+            # or this unrounded value flows straight into the stop order's
+            # stopPrice and IBKR rejects the whole bracket with error 110.
+            signal.stop_price = round_to_tick(signal.entry_price - max_risk)
 
     def reset_daily_state(self) -> None:
         for strategy in self.strategies:

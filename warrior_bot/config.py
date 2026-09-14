@@ -50,6 +50,15 @@ class RiskConfig(BaseModel):
     daily_loss_limit_pct: float = Field(gt=0, le=0.5)
     flatten_on_daily_loss_limit: bool = False
     max_concurrent_positions: int = Field(gt=0)
+    # A slice of max_concurrent_positions held back exclusively for
+    # scanner_rank <= reserved_top_tier_max_rank, usable only as overflow
+    # once every unrestricted slot (max_concurrent_positions -
+    # reserved_top_tier_slots) is already occupied -- so a best-of-day
+    # candidate still has a shot even when the book is already full of
+    # average names, rather than being turned away outright. Default 0
+    # keeps existing configs/tests behaving exactly as before (no reserve).
+    reserved_top_tier_slots: int = Field(default=0, ge=0)
+    reserved_top_tier_max_rank: int = Field(default=3, ge=1)
     # Single-trade ceiling expressed relative to *current* buying power,
     # not a fixed dollar or share count -- a fixed number is meaningless
     # across account sizes (2,000 shares is nothing on a $1M account and
@@ -72,6 +81,15 @@ class RiskConfig(BaseModel):
     # signal -- tightens (never loosens) each strategy's own structural
     # stop if that stop would risk more than this % of entry price.
     max_stop_distance_pct: float = Field(default=2.0, gt=0)
+
+    @model_validator(mode="after")
+    def _guard_reserved_slots(self) -> "RiskConfig":
+        if self.reserved_top_tier_slots > self.max_concurrent_positions:
+            raise ValueError(
+                f"risk.reserved_top_tier_slots ({self.reserved_top_tier_slots}) cannot exceed "
+                f"risk.max_concurrent_positions ({self.max_concurrent_positions})"
+            )
+        return self
 
 
 class GapAndGoConfig(BaseModel):
