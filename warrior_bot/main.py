@@ -104,6 +104,7 @@ class WarriorBot:
 
     async def start(self) -> None:
         await self.ib_client.connect()
+        self.order_manager.resync_open_orders()
         snapshot = self.account_state.snapshot()
         self.risk_manager.mark_start_of_day(snapshot.net_liquidation)
         self.journal.record_account_snapshot(snapshot)

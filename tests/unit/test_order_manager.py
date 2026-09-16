@@ -42,9 +42,21 @@ class FakeTrade:
         self.orderStatus = SimpleNamespace(status="Submitted")
 
 
+class FakeIB:
+    def __init__(self, trades):
+        self._trades = trades
+
+    def openTrades(self):
+        return self._trades
+
+
 class FakeJournal:
-    def __init__(self):
+    def __init__(self, orders_by_ib_id=None):
         self.fills = []
+        self._orders_by_ib_id = orders_by_ib_id or {}
+
+    def find_order_by_ib_order_id(self, ib_order_id):
+        return self._orders_by_ib_id.get(ib_order_id)
 
     def update_order_status(self, row_id, status):
         pass
@@ -226,6 +238,68 @@ def test_fill_always_journaled_regardless_of_notifications(monkeypatch):
 
     assert len(om.journal.fills) == 1
     assert om.journal.fills[0]["order_row_id"] == 7
+
+
+def test_resync_reattaches_tracking_to_pre_existing_open_orders(monkeypatch):
+    stop_trade = FakeTrade(FakeOrder(action="SELL", orderId=51004), symbol="VHUB")
+    journal = FakeJournal(orders_by_ib_id={51004: {"row_id": 470, "role": "stop", "entry_price": 1.01}})
+    om = OrderManager(
+        ib=FakeIB([stop_trade]),
+        journal=journal,
+        exits_config=None,
+        position_manager=None,
+        notifications_config=NotificationsConfig(enabled=True),
+        account_state=FakeAccountState(),
+    )
+    sent = _capture_sends(monkeypatch, om)
+
+    om.resync_open_orders()
+    stop_trade.fillEvent.emit(stop_trade, make_fill(shares=2049, price=0.99))
+
+    assert len(journal.fills) == 1
+    assert journal.fills[0]["order_row_id"] == 470
+    assert len(_by_channel(sent, "trade_activity")) == 1
+    assert 51004 in om._order_row_ids
+
+
+def test_resync_skips_orders_not_in_journal(monkeypatch):
+    # A manually-placed order (e.g. a hand-restored protective stop) has
+    # no signal_id to attach fills to -- resync must not raise or attach
+    # anything for it, just leave it untracked.
+    manual_trade = FakeTrade(FakeOrder(action="SELL", orderId=51235), symbol="VHUB")
+    om = OrderManager(
+        ib=FakeIB([manual_trade]),
+        journal=FakeJournal(),
+        exits_config=None,
+        position_manager=None,
+        notifications_config=NotificationsConfig(enabled=True),
+        account_state=FakeAccountState(),
+    )
+
+    om.resync_open_orders()
+
+    assert 51235 not in om._order_row_ids
+
+
+def test_resync_does_not_double_attach_already_tracked_orders(monkeypatch):
+    trade = FakeTrade(FakeOrder(action="SELL", orderId=10))
+    journal = FakeJournal(orders_by_ib_id={10: {"row_id": 99, "role": "stop", "entry_price": 5.0}})
+    om = OrderManager(
+        ib=FakeIB([trade]),
+        journal=journal,
+        exits_config=None,
+        position_manager=None,
+        notifications_config=NotificationsConfig(enabled=True),
+        account_state=FakeAccountState(),
+    )
+    om._order_row_ids[10] = 99  # already attached this session (e.g. just placed)
+    om._attach_tracking(trade, row_id=99, role="stop")  # the attachment resync must not duplicate
+
+    om.resync_open_orders()
+    trade.fillEvent.emit(trade, make_fill(shares=50, price=5.0))
+
+    # Only one listener ever got attached -- one fill, not a double-record.
+    assert len(journal.fills) == 1
 
 
 def test_profit_tier_prices_are_tick_conformant():

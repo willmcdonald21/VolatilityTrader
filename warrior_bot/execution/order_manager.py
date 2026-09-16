@@ -174,6 +174,48 @@ class OrderManager:
         trade.statusEvent += on_status
         trade.fillEvent += on_fill
 
+    def resync_open_orders(self) -> None:
+        """Re-attaches fill/status tracking (journal writes + Discord
+        notify_on_fill/notify_on_pnl) to orders that are still resting at
+        IBKR from before this process started -- covers both a supervisor
+        restart and a fresh `python -m warrior_bot.main` launch.
+
+        `_attach_tracking` normally runs once, right when `submit_signal`
+        places an order, wiring listeners onto that specific in-memory
+        `Trade` object. Those listeners don't survive a process restart --
+        the order keeps resting and filling at IBKR, but the *new* process
+        has no listener on it, so fills silently stop being journaled and
+        stop notifying Discord (confirmed live for VHUB/SCNI/SKDD,
+        2026-09-14). `ib.openTrades()` right after connect already contains
+        Trade objects for this same clientId's still-open orders (IBKR's
+        default reqOpenOrders on connect is scoped to the connecting
+        clientId), so this only needs to re-attach, not replace, them.
+
+        Deliberately does NOT touch `PositionManager` -- re-registering
+        breakeven/trailing/reversal-exit management for an already-open
+        position is a strategy-behavior change (which lot state, which
+        stop is "current", etc.) and out of scope here; this only restores
+        visibility (journal + Discord), not management. Orders placed
+        manually outside the bot (never in the journal) are skipped --
+        there's no signal_id to attach fills to."""
+        resynced = 0
+        for trade in self.ib.openTrades():
+            order_id = trade.order.orderId
+            if order_id in self._order_row_ids:
+                continue  # already tracked by this process (placed after resync ran)
+            found = self.journal.find_order_by_ib_order_id(order_id)
+            if found is None:
+                continue
+            self._order_row_ids[order_id] = found["row_id"]
+            self._attach_tracking(trade, found["row_id"], found["role"], found["entry_price"])
+            resynced += 1
+        if resynced:
+            logger.info(
+                "Resynced fill/status tracking for %d pre-existing open order(s) "
+                "(journal + Discord notifications restored for these)",
+                resynced,
+            )
+
     def cancel_all(self) -> None:
         for trade in self.ib.openTrades():
             self.ib.cancelOrder(trade.order)

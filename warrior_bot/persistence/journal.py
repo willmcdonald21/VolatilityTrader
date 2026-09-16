@@ -145,6 +145,21 @@ class Journal:
         )
         self.conn.commit()
 
+    def find_order_by_ib_order_id(self, ib_order_id: int) -> dict | None:
+        """Looks up the journal row (+ role, entry price) for a previously
+        recorded order, keyed by IBKR's own order id -- used to re-attach
+        fill/status tracking to orders that are still resting at IBKR from
+        before a process restart (see OrderManager.resync_open_orders)."""
+        row = self.conn.execute(
+            """SELECT o.id AS row_id, o.role, s.entry_price
+               FROM orders o JOIN signals s ON s.id = o.signal_id
+               WHERE o.ib_order_id = ?""",
+            (ib_order_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"row_id": row[0], "role": row[1], "entry_price": row[2]}
+
     def record_kill_switch_event(self, triggered_by: str, action_taken: str) -> None:
         self.conn.execute(
             "INSERT INTO kill_switch_events (ts, triggered_by, action_taken) VALUES (?, ?, ?)",
