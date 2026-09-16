@@ -1,12 +1,43 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from tests.unit.fixtures import make_bars
 from warrior_bot.config import BreakevenConfig, ExitsConfig, ReversalExitConfig, TrailingConfig
+from warrior_bot.execution import position_manager as position_manager_module
 from warrior_bot.execution.position_manager import PositionManager
 from warrior_bot.signals.signal import Signal
+
+
+@pytest.fixture(autouse=True)
+def _fast_debounced_resize(monkeypatch):
+    """Quantity-only stop resizes (on_entry_fill/_on_target_fill) are
+    debounced onto the event loop (see _schedule_stop_resize) so a burst of
+    fills collapses into one replace instead of one per fill. Tests run
+    synchronously with no loop driving itself, so this gives each test its
+    own loop and a zero-length debounce -- `flush_resize(pos)` below then
+    runs exactly the scheduled task to completion on demand."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    monkeypatch.setattr(position_manager_module, "_STOP_RESIZE_DEBOUNCE_SECONDS", 0)
+    yield
+    pending = asyncio.all_tasks(loop)
+    for task in pending:
+        task.cancel()
+    if pending:
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    loop.close()
+
+
+def flush_resize(pos) -> None:
+    """Runs a pending debounced stop resize (see _schedule_stop_resize) to
+    completion. No-op if nothing is pending."""
+    if pos.resize_task is not None:
+        asyncio.get_event_loop().run_until_complete(pos.resize_task)
 
 
 class FakeEvent:
@@ -213,6 +244,7 @@ def track_position(
     )
     if entry_filled:
         parent_trade.fillEvent.emit(parent_trade, make_fill(quantity))
+        flush_resize(pm._positions[signal.symbol][-1])
     return stop_trade, target_trade
 
 
@@ -310,6 +342,7 @@ def test_scale_out_fill_resizes_stop_quantity():
     target_trade.fillEvent.emit(target_trade, make_fill(40))
 
     pos = pm._positions["TEST"][0]
+    flush_resize(pos)
     assert pos.stop_order.totalQuantity == 60
     assert any(order is pos.stop_order and order.totalQuantity == 60 for _, order in ib.placed)
     assert "TEST" in pm._positions  # remainder still tracked
@@ -773,6 +806,27 @@ def test_replacement_stop_fill_is_journaled():
     assert recorded["ib_order_id"] == new_stop_trade.order.orderId
 
 
+def test_original_stop_fill_is_not_double_journaled():
+    # Regression (2026-09-14, live): track() wired _wire_stop_fill onto the
+    # *original* bracket's stop_trade with no way to distinguish it from a
+    # replacement. But OrderManager.submit_signal already runs that same
+    # Trade through _attach_tracking (journaling its fills) before ever
+    # calling track() -- so every fill on a stop that was never replaced
+    # was recorded twice in data/journal.sqlite3. PositionManager must stay
+    # silent on the original stop's fills; only a cancel-and-replace
+    # revision (see test_replacement_stop_fill_is_journaled above) is its
+    # job to journal, since OrderManager never sees those.
+    ib = FakeIB()
+    journal = FakeJournal()
+    pm = PositionManager(ib, journal, make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    stop_trade, _ = track_position(pm, signal)
+
+    stop_trade.fillEvent.emit(stop_trade, make_fill(100, price=9.0))
+
+    assert journal.fills_recorded == []
+
+
 def test_replacement_stop_sized_to_actual_fills_not_full_order_size():
     # Confirmed live incident (2026-09-14): GVH's parent entry order (3943
     # shares) was still only partially filled when breakeven fired. The
@@ -839,9 +893,10 @@ def test_remaining_qty_grows_with_each_partial_entry_fill():
     assert pm._positions["TEST"][0].remaining_qty == 300
     parent_trade.fillEvent.emit(parent_trade, make_fill(400))
     assert pm._positions["TEST"][0].remaining_qty == 700
-    # the resting stop is kept in step with each fill as it arrives --
-    # each one is a cancel-and-replace, so the *current* stop_order is a
-    # fresh object each time, not the original fixture's stop_order.
+    # the resting stop is kept in step with fills as they arrive -- resized
+    # once the debounced burst settles, so the *current* stop_order is a
+    # fresh object, not the original fixture's stop_order.
+    flush_resize(pm._positions["TEST"][0])
     assert pm._positions["TEST"][0].stop_order.totalQuantity == 700
 
 
@@ -891,6 +946,7 @@ def test_position_stays_tracked_when_flat_but_parent_still_filling():
     assert pos.remaining_qty == 900
     assert pos.parent_done is True
     # A fresh stop now exists, correctly sized for the newly-filled shares.
+    flush_resize(pos)
     assert pos.stop_order.totalQuantity == 900
     assert pos.stop_order not in ib.cancelled
 

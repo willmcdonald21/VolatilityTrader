@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 
@@ -20,6 +21,18 @@ from warrior_bot.strategies.indicators import (
 from warrior_bot.utils.rounding import round_to_tick
 
 logger = logging.getLogger("warrior_bot.execution.position_manager")
+
+# Thin/low-float symbols (this bot's entire universe) routinely fill a
+# single parent order in a burst of dozens of tiny partial fills a few
+# hundred milliseconds apart (confirmed live, 2026-09-15: MTEN's 3,479-share
+# entry arrived as 23 separate fills across ~6 seconds). Resizing the stop
+# on every one of those individually means 20+ cancel-and-replace round
+# trips to the broker for a single logical entry. Coalescing fills that
+# land within this window into one replace, sized off whatever
+# remaining_qty is by the time the debounce fires, collapses that back down
+# to (usually) one stop order per burst while still protecting the full
+# filled quantity moments after the burst ends.
+_STOP_RESIZE_DEBOUNCE_SECONDS = 1.5
 
 
 @dataclass
@@ -54,6 +67,10 @@ class ManagedPosition:
     parent_done: bool = False
     breakeven_done: bool = False
     trailing_active: bool = False
+    # Pending debounced stop-resize (see _schedule_stop_resize) -- cancelled
+    # and rescheduled on every fill so a burst only replaces the stop once,
+    # after fills stop arriving for _STOP_RESIZE_DEBOUNCE_SECONDS.
+    resize_task: asyncio.Task | None = None
 
 
 class PositionManager:
@@ -138,7 +155,7 @@ class PositionManager:
             # resize-in-place) also means this self-heals correctly even
             # if the current stop was already cancelled by a prior
             # flat-for-now close_out below.
-            self._replace_stop_order(pos, new_qty=pos.remaining_qty)
+            self._schedule_stop_resize(pos)
 
         parent_trade.fillEvent += on_entry_fill
 
@@ -147,18 +164,29 @@ class PositionManager:
 
         for target_trade in target_trades:
             target_trade.fillEvent += make_on_target_fill(pos)
-        self._wire_stop_fill(pos, stop_trade)
+        # journal_fill=False: this is the original bracket's stop_trade,
+        # which OrderManager.submit_signal already ran through
+        # _attach_tracking (journaling its fills there) before ever
+        # calling track() -- journaling it again here double-counts every
+        # fill on the original stop (confirmed live, 2026-09-14: every
+        # stop-fill row in data/journal.sqlite3 for an unreplaced stop was
+        # duplicated back-to-back). Only a *replacement* stop (see
+        # _replace_stop_order) needs this path to journal at all.
+        self._wire_stop_fill(pos, stop_trade, journal_fill=False)
 
-    def _wire_stop_fill(self, pos: ManagedPosition, trade: Trade) -> None:
+    def _wire_stop_fill(self, pos: ManagedPosition, trade: Trade, journal_fill: bool = True) -> None:
         """Separated from track() so a replacement stop order (see
         _replace_stop_order) can re-wire the same fill handling onto its
         own fresh Trade object. A replacement stop's Trade never passes
         through OrderManager._attach_tracking (only the original bracket
-        submission does), so this is also the only place a fill on a
-        *revised* stop ever gets journaled -- without it, a stop that was
-        cancelled-and-replaced even once would go fill-blind in
-        data/journal.sqlite3 even though a real execution happened."""
-        trade.fillEvent += lambda t, fill: self._on_stop_fill(pos, t, fill)
+        submission does), so journal_fill=True here is the only place a
+        fill on a *revised* stop ever gets journaled -- without it, a stop
+        that was cancelled-and-replaced even once would go fill-blind in
+        data/journal.sqlite3 even though a real execution happened. The
+        original bracket's stop_trade (see track() above) is the one
+        exception -- OrderManager already journals that one, so track()
+        passes journal_fill=False to avoid double-recording it."""
+        trade.fillEvent += lambda t, fill: self._on_stop_fill(pos, t, fill, journal_fill=journal_fill)
 
     def on_bar(self, ctx: SymbolContext) -> None:
         lots = self._positions.get(ctx.symbol)
@@ -303,6 +331,9 @@ class PositionManager:
         return True
 
     def _reversal_exit(self, pos: ManagedPosition, reasons: list[str]) -> None:
+        if pos.resize_task is not None:
+            pos.resize_task.cancel()
+            pos.resize_task = None
         self.ib.cancelOrder(pos.stop_order)
         for target_order in pos.target_orders:
             self.ib.cancelOrder(target_order)
@@ -314,6 +345,28 @@ class PositionManager:
             triggered_by=f"reversal_exit:{pos.symbol}:{reason_str}", action_taken="market_exit_position"
         )
         self._untrack(pos)
+
+    def _schedule_stop_resize(self, pos: ManagedPosition) -> None:
+        """Debounced entry point for quantity-only stop resizes (fill-driven,
+        as opposed to the price-driven breakeven/trailing calls, which stay
+        immediate since on_bar already rate-limits those to once per bar).
+        Cancelling and rescheduling on every call means a burst of fills
+        collapses into a single _replace_stop_order once the burst goes
+        quiet for _STOP_RESIZE_DEBOUNCE_SECONDS, sized off whichever
+        remaining_qty is current at that point -- never a stale snapshot
+        from when the burst started."""
+        if pos.resize_task is not None:
+            pos.resize_task.cancel()
+
+        async def _debounced() -> None:
+            try:
+                await asyncio.sleep(_STOP_RESIZE_DEBOUNCE_SECONDS)
+            except asyncio.CancelledError:
+                return
+            pos.resize_task = None
+            self._replace_stop_order(pos, new_qty=pos.remaining_qty)
+
+        pos.resize_task = asyncio.ensure_future(_debounced())
 
     def _replace_stop_order(
         self, pos: ManagedPosition, new_price: float | None = None, new_qty: int | None = None
@@ -419,26 +472,27 @@ class PositionManager:
         # Resize the stop down after ANY partial target fill (not just a
         # scale_out tier) -- shares that already left via a target fill
         # must not stay covered by a stop still sized for the full lot.
-        self._replace_stop_order(pos, new_qty=pos.remaining_qty)
-        logger.info("Target fill for %s: stop resized to %d shares", pos.symbol, pos.remaining_qty)
+        self._schedule_stop_resize(pos)
+        logger.info("Target fill for %s: stop resize scheduled for %d shares", pos.symbol, pos.remaining_qty)
 
-    def _on_stop_fill(self, pos: ManagedPosition, trade: Trade, fill) -> None:
-        commission = None
-        realized_pnl = None
-        if fill.commissionReport is not None:
-            commission = fill.commissionReport.commission
-            # UNSET_DOUBLE sentinel on the opening leg of a round trip; see account_state.py
-            pnl = fill.commissionReport.realizedPNL
-            if pnl is not None and abs(pnl) < 1e15:
-                realized_pnl = pnl
-        self.journal.record_fill(
-            order_row_id=pos.stop_row_id,
-            ib_order_id=trade.order.orderId,
-            fill_qty=fill.execution.shares,
-            fill_price=fill.execution.price,
-            commission=commission,
-            realized_pnl=realized_pnl,
-        )
+    def _on_stop_fill(self, pos: ManagedPosition, trade: Trade, fill, journal_fill: bool = True) -> None:
+        if journal_fill:
+            commission = None
+            realized_pnl = None
+            if fill.commissionReport is not None:
+                commission = fill.commissionReport.commission
+                # UNSET_DOUBLE sentinel on the opening leg of a round trip; see account_state.py
+                pnl = fill.commissionReport.realizedPNL
+                if pnl is not None and abs(pnl) < 1e15:
+                    realized_pnl = pnl
+            self.journal.record_fill(
+                order_row_id=pos.stop_row_id,
+                ib_order_id=trade.order.orderId,
+                fill_qty=fill.execution.shares,
+                fill_price=fill.execution.price,
+                commission=commission,
+                realized_pnl=realized_pnl,
+            )
 
         filled_qty = fill.execution.shares
         pos.remaining_qty = max(0, pos.remaining_qty - filled_qty)
@@ -467,6 +521,9 @@ class PositionManager:
             for target_order in pos.target_orders:
                 self.ib.cancelOrder(target_order)
         if pos.parent_done:
+            if pos.resize_task is not None:
+                pos.resize_task.cancel()
+                pos.resize_task = None
             self._untrack(pos)
         else:
             logger.info(
