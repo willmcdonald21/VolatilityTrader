@@ -18,6 +18,31 @@ def cancel_all_orders(ib: IB, channel: str = "kill_switch") -> None:
     alert("reqGlobalCancel issued — all active orders cancelled", channel=channel)
 
 
+def flatten_position(ib: IB, position, channel: str = "kill_switch") -> None:
+    """Market-closes a single position (one element of ib.positions()).
+    Factored out of flatten_all_positions so a caller that has already
+    identified exactly one symbol needing to get flat immediately (e.g.
+    main.py's position-reconciliation watchdog finding a real position
+    with no resting protective stop) doesn't have to route through -- and
+    risk touching -- every other open position via reqGlobalCancel/a full
+    account-wide flatten."""
+    if position.position == 0:
+        return
+    action = "SELL" if position.position > 0 else "BUY"
+    qty = abs(position.position)
+    order = MarketOrder(action, qty)
+    # ib.positions() reports each position's actual trading exchange
+    # (e.g. NASDAQ) rather than SMART -- routing a market order
+    # directly to it triggers IBKR's precautionary direct-routing
+    # rejection (error 201/10311, hit during the Aug 27 BIRD/BMRA
+    # flatten attempt). Route through SMART instead, on a copy so the
+    # shared Contract object from positions() isn't mutated.
+    contract = copy.copy(position.contract)
+    contract.exchange = "SMART"
+    ib.placeOrder(contract, order)
+    alert(f"Flattening {position.contract.symbol} qty={qty} via market {action}", channel=channel)
+
+
 def flatten_all_positions(ib: IB, channel: str = "kill_switch") -> None:
     """Market-close every open position. Used by the manual kill switch
     (scripts/kill_switch.py) and by WarriorBot's automatic EOD/daily-loss
@@ -27,21 +52,7 @@ def flatten_all_positions(ib: IB, channel: str = "kill_switch") -> None:
     alert to "kill_switch" (manual) or "limits" (automatic) accordingly."""
     positions = ib.positions()
     for pos in positions:
-        if pos.position == 0:
-            continue
-        action = "SELL" if pos.position > 0 else "BUY"
-        qty = abs(pos.position)
-        order = MarketOrder(action, qty)
-        # ib.positions() reports each position's actual trading exchange
-        # (e.g. NASDAQ) rather than SMART -- routing a market order
-        # directly to it triggers IBKR's precautionary direct-routing
-        # rejection (error 201/10311, hit during the Aug 27 BIRD/BMRA
-        # flatten attempt). Route through SMART instead, on a copy so the
-        # shared Contract object from positions() isn't mutated.
-        contract = copy.copy(pos.contract)
-        contract.exchange = "SMART"
-        ib.placeOrder(contract, order)
-        alert(f"Flattening {pos.contract.symbol} qty={qty} via market {action}", channel=channel)
+        flatten_position(ib, pos, channel=channel)
     logger.warning("Flatten requested for %d position(s)", len(positions))
 
 

@@ -68,16 +68,43 @@ def test_on_connected_drops_tracked_symbols_after_reconnect(tmp_path):
     assert bot._subscriptions == {}
 
 
-def test_on_connected_does_not_touch_position_manager(tmp_path):
+def test_on_connected_does_not_clear_position_manager_tracking(tmp_path):
+    # Unlike bar subscriptions (wiped and re-onboarded from scratch), a
+    # reconnect must never lose track of a real open position -- it only
+    # needs its fill *listeners* resynced onto fresh Trade objects (see
+    # PositionManager.resync_after_reconnect), which is a no-op here since
+    # there are no real orders at IBKR for this fake lot to find.
     bot = WarriorBot(make_config(tmp_path))
     bot.contexts["AAPL"] = object()
-    bot.position_manager._positions["AAPL"] = object()
+    bot.position_manager._positions["AAPL"] = []
 
     bot._on_connected()
 
-    # standing bracket orders are IBKR's problem to keep working, not ours
-    # to re-establish -- only the scanning/bar-subscription side is reset
     assert "AAPL" in bot.position_manager._positions
+
+
+def test_on_connected_resyncs_order_and_position_tracking(tmp_path, monkeypatch):
+    bot = WarriorBot(make_config(tmp_path))
+    bot.contexts["AAPL"] = object()
+    calls = []
+    bot.position_manager.resync_after_reconnect = lambda ib: calls.append(("position_manager", ib)) or {5, 6}
+    bot.order_manager.resync_open_orders = lambda **kwargs: calls.append(("order_manager", kwargs))
+
+    bot._on_connected()
+
+    assert calls[0] == ("position_manager", bot.ib)
+    assert calls[1] == ("order_manager", {"force": True, "skip_order_ids": frozenset({5, 6})})
+
+
+def test_on_connected_skips_resync_on_first_connect(tmp_path):
+    bot = WarriorBot(make_config(tmp_path))
+    calls = []
+    bot.position_manager.resync_after_reconnect = lambda ib: calls.append("position_manager") or set()
+    bot.order_manager.resync_open_orders = lambda **kwargs: calls.append("order_manager")
+
+    bot._on_connected()  # nothing tracked yet -- first connect, not a reconnect
+
+    assert calls == []
 
 
 def make_signal(entry=10.0, stop=9.0) -> Signal:
@@ -570,3 +597,134 @@ def test_onboard_symbol_skips_entirely_when_at_capacity_and_nothing_evictable(tm
     assert qualify_called == []  # bailed out before doing any work at all
     assert "NEW" not in bot.contexts
 
+
+# -- position reconciliation watchdog: regression coverage for the
+# 2026-09-16 NRXS incident (unprotected 850-share naked short for ~3h53m,
+# closed only because the scheduled EOD flatten happened to still be ahead
+# of it). See PositionReconciliationConfig (warrior_bot/config.py) for the
+# full incident writeup.
+
+
+class _FakePosition:
+    def __init__(self, symbol, qty, exchange="NASDAQ"):
+        self.contract = SimpleNamespace(symbol=symbol, exchange=exchange)
+        self.position = qty
+
+
+class _FakeOrder:
+    def __init__(self, action, orderType, totalQuantity, remaining=None):
+        self.action = action
+        self.orderType = orderType
+        self.totalQuantity = totalQuantity
+
+
+class _FakeTrade:
+    def __init__(self, symbol, action, orderType, totalQuantity, remaining=None):
+        self.contract = SimpleNamespace(symbol=symbol)
+        self.order = _FakeOrder(action, orderType, totalQuantity)
+        self.orderStatus = SimpleNamespace(remaining=remaining if remaining is not None else totalQuantity)
+
+
+def test_reconciliation_drops_stale_local_tracking_when_broker_flat(tmp_path, monkeypatch):
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.position_manager._positions["GHOST"] = [object()]
+    bot.ib.positions = lambda: []
+    bot.ib.openTrades = lambda: []
+
+    bot._check_position_reconciliation()
+
+    assert "GHOST" not in bot.position_manager.tracked_symbols()
+
+
+def test_reconciliation_flattens_naked_short_regardless_of_resting_orders(tmp_path, monkeypatch):
+    # A short is never an intended state for this long-only bot -- must be
+    # flattened even if something happens to be resting on it.
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.positions = lambda: [_FakePosition("NRXS", -850.0)]
+    bot.ib.openTrades = lambda: [_FakeTrade("NRXS", "BUY", "STP LMT", 850.0)]
+    placed = []
+    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    bot._check_position_reconciliation()
+
+    assert len(placed) == 1
+    contract, order = placed[0]
+    assert contract.symbol == "NRXS"
+    assert order.action == "BUY"
+    assert order.totalQuantity == 850.0
+
+
+def test_reconciliation_flattens_long_position_with_no_resting_stop(tmp_path, monkeypatch):
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
+    bot.ib.openTrades = lambda: []  # nothing resting at all
+    placed = []
+    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    bot._check_position_reconciliation()
+
+    assert len(placed) == 1
+    contract, order = placed[0]
+    assert contract.symbol == "UCAR"
+    assert order.action == "SELL"
+    assert order.totalQuantity == 770.0
+
+
+def test_reconciliation_leaves_protected_long_position_alone(tmp_path, monkeypatch):
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
+    bot.ib.openTrades = lambda: [_FakeTrade("UCAR", "SELL", "STP LMT", 770.0)]
+    placed = []
+    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    bot._check_position_reconciliation()
+
+    assert placed == []
+
+
+def test_reconciliation_treats_take_profit_limit_order_as_no_protection(tmp_path, monkeypatch):
+    # A resting take-profit LMT sell doesn't cap downside -- only a
+    # STP/STP LMT order actually protects a long position.
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
+    bot.ib.openTrades = lambda: [_FakeTrade("UCAR", "SELL", "LMT", 770.0)]
+    placed = []
+    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    bot._check_position_reconciliation()
+
+    assert len(placed) == 1  # flagged as unprotected despite the resting LMT order
+
+
+def test_reconciliation_sums_partial_stop_coverage_across_multiple_orders(tmp_path, monkeypatch):
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
+    bot.ib.openTrades = lambda: [
+        _FakeTrade("UCAR", "SELL", "STP LMT", 400.0),
+        _FakeTrade("UCAR", "SELL", "STP", 370.0),  # 400+370=770, exactly covers it
+    ]
+    placed = []
+    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    bot._check_position_reconciliation()
+
+    assert placed == []
+
+
+def test_reconciliation_untracks_symbol_after_emergency_flatten(tmp_path, monkeypatch):
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.position_manager._positions["UCAR"] = [object()]
+    bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
+    bot.ib.openTrades = lambda: []
+    bot.ib.placeOrder = lambda contract, order: None
+
+    bot._check_position_reconciliation()
+
+    assert "UCAR" not in bot.position_manager.tracked_symbols()

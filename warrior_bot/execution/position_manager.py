@@ -42,6 +42,7 @@ class ManagedPosition:
     signal: Signal
     signal_id: int
     remaining_qty: int
+    parent_order: Order
     stop_order: Order
     stop_row_id: int
     # Authoritative current stop price, tracked here rather than read back
@@ -101,6 +102,17 @@ class PositionManager:
     def open_lot_count(self, symbol: str) -> int:
         return len(self._positions.get(symbol, []))
 
+    def tracked_symbols(self) -> set[str]:
+        return set(self._positions.keys())
+
+    def drop_symbol(self, symbol: str) -> None:
+        """Used by main.py's position-reconciliation watchdog when IBKR's
+        real position for `symbol` is flat but this class still shows
+        tracked lots for it (stale local state -- e.g. a resync that
+        couldn't resolve a filled-while-disconnected stop, see
+        resync_after_reconnect). No IBKR side effects, matching clear()."""
+        self._positions.pop(symbol, None)
+
     def track(
         self,
         contract: Contract,
@@ -120,10 +132,11 @@ class PositionManager:
             # Starts at 0, not the full intended order size -- this bot
             # trades exclusively thin/low-float stocks where the parent
             # entry order routinely takes minutes to fully fill (or never
-            # fully fills). on_entry_fill below grows this with each real
-            # partial fill, so it always reflects shares actually held,
-            # never the size we merely intended to buy.
+            # fully fills). _wire_entry_fill below grows this with each
+            # real partial fill, so it always reflects shares actually
+            # held, never the size we merely intended to buy.
             remaining_qty=0,
+            parent_order=parent_trade.order,
             stop_order=stop_trade.order,
             stop_row_id=stop_row_id,
             current_stop_price=signal.stop_price,
@@ -131,6 +144,25 @@ class PositionManager:
             target_roles=list(target_roles),
         )
         self._positions.setdefault(signal.symbol, []).append(pos)
+
+        self._wire_entry_fill(pos, parent_trade)
+
+        for target_trade in target_trades:
+            self._wire_target_fill(pos, target_trade)
+        # journal_fill=False: this is the original bracket's stop_trade,
+        # which OrderManager.submit_signal already ran through
+        # _attach_tracking (journaling its fills there) before ever
+        # calling track() -- journaling it again here double-counts every
+        # fill on the original stop (confirmed live, 2026-09-14: every
+        # stop-fill row in data/journal.sqlite3 for an unreplaced stop was
+        # duplicated back-to-back). Only a *replacement* stop (see
+        # _replace_stop_order) needs this path to journal at all.
+        self._wire_stop_fill(pos, stop_trade, journal_fill=False)
+
+    def _wire_entry_fill(self, pos: ManagedPosition, trade: Trade) -> None:
+        """Separated from track() so resync_after_reconnect can re-wire the
+        same handling onto a fresh Trade object for a parent order that
+        hadn't finished filling before a reconnect (see that method)."""
 
         def on_entry_fill(t: Trade, fill) -> None:
             pos.entry_filled = True
@@ -157,22 +189,7 @@ class PositionManager:
             # flat-for-now close_out below.
             self._schedule_stop_resize(pos)
 
-        parent_trade.fillEvent += on_entry_fill
-
-        def make_on_target_fill(p: ManagedPosition):
-            return lambda t, fill: self._on_target_fill(p, fill)
-
-        for target_trade in target_trades:
-            target_trade.fillEvent += make_on_target_fill(pos)
-        # journal_fill=False: this is the original bracket's stop_trade,
-        # which OrderManager.submit_signal already ran through
-        # _attach_tracking (journaling its fills there) before ever
-        # calling track() -- journaling it again here double-counts every
-        # fill on the original stop (confirmed live, 2026-09-14: every
-        # stop-fill row in data/journal.sqlite3 for an unreplaced stop was
-        # duplicated back-to-back). Only a *replacement* stop (see
-        # _replace_stop_order) needs this path to journal at all.
-        self._wire_stop_fill(pos, stop_trade, journal_fill=False)
+        trade.fillEvent += on_entry_fill
 
     def _wire_stop_fill(self, pos: ManagedPosition, trade: Trade, journal_fill: bool = True) -> None:
         """Separated from track() so a replacement stop order (see
@@ -187,6 +204,87 @@ class PositionManager:
         exception -- OrderManager already journals that one, so track()
         passes journal_fill=False to avoid double-recording it."""
         trade.fillEvent += lambda t, fill: self._on_stop_fill(pos, t, fill, journal_fill=journal_fill)
+
+    def _wire_target_fill(self, pos: ManagedPosition, trade: Trade) -> None:
+        trade.fillEvent += lambda t, fill: self._on_target_fill(pos, fill)
+
+    def resync_after_reconnect(self, ib: IB) -> set[int]:
+        """Re-wires fill listeners for every tracked lot's stop/target/parent
+        orders onto fresh Trade objects after an IBKR disconnect/reconnect.
+
+        ib_async's IB.disconnect() calls wrapper.reset(), which wipes its
+        internal trades/permId2Trade dicts -- any order that survives the
+        reconnect at the broker gets a brand-new Trade object the first
+        time ib_async hears about it again (via reqOpenOrders during
+        reconnection), and any fillEvent listener wired onto the OLD Trade
+        object never fires again, silently, with no error. Confirmed live,
+        2026-09-16: two NRXS stop orders filled correctly at the broker
+        just after a reconnect, invisibly to this class -- remaining_qty
+        was never decremented and the lot was never untracked, so a later
+        stop-resize placed a brand-new full-size duplicate stop on top of
+        an already-flat lot, which itself later filled for real, doubling
+        the exit into a naked short that sat unprotected for ~3h53m.
+
+        Returns the set of stop/target orderIds re-wired here, so callers
+        can tell OrderManager.resync_open_orders not to also re-attach its
+        own journaling listener to them -- this class always journals
+        whatever it resyncs (journal_fill=True unconditionally, unlike
+        track()'s original-vs-replacement distinction), so there's no more
+        "OrderManager already has a live listener on this one" asymmetry
+        to preserve once a reconnect has killed every pre-existing
+        listener uniformly. The parent order is deliberately excluded from
+        the returned set -- OrderManager always owns journaling entry
+        fills; this class's own parent-fill listener only tracks qty/state
+        and never journals, so there's no conflict there to avoid.
+
+        Anything NOT found among ib.openTrades() (filled or cancelled
+        entirely while disconnected -- not resolvable from listener
+        re-wiring alone, since there's no fresh Trade object to attach to)
+        is left as-is and logged. main.py's periodic position-reconciliation
+        watchdog is the unconditional backstop that catches and flattens
+        any resulting mismatch against IBKR's real position on its next
+        cycle, regardless of why the mismatch happened -- deliberately not
+        duplicated here, to keep this method's job to exactly what
+        listener re-wiring can actually resolve."""
+        claimed: set[int] = set()
+        open_by_id = {trade.order.orderId: trade for trade in ib.openTrades()}
+
+        for symbol, lots in list(self._positions.items()):
+            for pos in list(lots):
+                if not pos.entry_filled:
+                    fresh_parent = open_by_id.get(pos.parent_order.orderId)
+                    if fresh_parent is not None:
+                        self._wire_entry_fill(pos, fresh_parent)
+                    else:
+                        logger.warning(
+                            "Resync: parent order for %s (orderId=%d) not found after reconnect -- "
+                            "entry-fill tracking may be stale; reconciliation watchdog will verify",
+                            symbol,
+                            pos.parent_order.orderId,
+                        )
+
+                fresh_stop = open_by_id.get(pos.stop_order.orderId)
+                if fresh_stop is not None:
+                    self._wire_stop_fill(pos, fresh_stop, journal_fill=True)
+                    claimed.add(pos.stop_order.orderId)
+                else:
+                    logger.warning(
+                        "Resync: stop order for %s (orderId=%d) not found after reconnect -- "
+                        "may have filled or been cancelled while disconnected; "
+                        "reconciliation watchdog will verify against IBKR's real position",
+                        symbol,
+                        pos.stop_order.orderId,
+                    )
+
+                for target_order in pos.target_orders:
+                    fresh_target = open_by_id.get(target_order.orderId)
+                    if fresh_target is not None:
+                        self._wire_target_fill(pos, fresh_target)
+                        claimed.add(target_order.orderId)
+
+        if claimed:
+            logger.info("Resync: re-wired fill tracking for %d order(s) after reconnect", len(claimed))
+        return claimed
 
     def on_bar(self, ctx: SymbolContext) -> None:
         lots = self._positions.get(ctx.symbol)

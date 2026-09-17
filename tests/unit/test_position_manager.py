@@ -110,6 +110,11 @@ class FakeIB:
         self.cancelled: list[FakeOrder] = []
         self.trades: list[FakeTrade] = []
         self.client = FakeClient()
+        # What ib.openTrades() returns -- tests populate this directly to
+        # simulate the fresh Trade objects ib_async rebuilds after a
+        # reconnect (see resync_after_reconnect's docstring for why these
+        # are deliberately NOT the same objects as anything in self.trades).
+        self.open_trades: list[FakeTrade] = []
 
     def placeOrder(self, contract, order):
         self.placed.append((contract, order))
@@ -119,6 +124,9 @@ class FakeIB:
 
     def cancelOrder(self, order):
         self.cancelled.append(order)
+
+    def openTrades(self):
+        return self.open_trades
 
 
 def find_trade(ib: FakeIB, order: FakeOrder) -> FakeTrade:
@@ -980,3 +988,133 @@ def test_on_bar_skips_flat_lot_still_tracked_for_pending_parent_fills():
 
     assert len(ib.placed) == placed_before  # no naked market order for 0 shares
     assert "TEST" in pm._positions
+
+
+# -- resync_after_reconnect: regression coverage for the 2026-09-16 NRXS
+# naked-short incident. ib_async's IB.disconnect() calls wrapper.reset(),
+# which wipes its Trade-object cache -- any fillEvent listener wired onto a
+# pre-reconnect Trade goes silently dead even though the order keeps
+# working fine at the broker. See PositionReconciliationConfig
+# (warrior_bot/config.py) for the full incident writeup.
+
+
+def test_resync_rewires_stop_fill_onto_fresh_trade_and_claims_its_id():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal)
+    pos = pm._positions["TEST"][0]
+    stale_stop_order = pos.stop_order  # what on_entry_fill's resize already replaced it with
+
+    # Simulates ib_async rebuilding a brand-new Trade for the same
+    # still-resting orderId after a reconnect -- NOT the same object as
+    # anything track_position/on_entry_fill created.
+    fresh_trade = FakeTrade(stale_stop_order)
+    ib.open_trades = [fresh_trade]
+
+    claimed = pm.resync_after_reconnect(ib)
+
+    assert claimed == {stale_stop_order.orderId}
+    # The old Trade's listener is now provably dead -- only a fill on the
+    # FRESH object should move the position.
+    fresh_trade.fillEvent.emit(fresh_trade, make_fill(pos.remaining_qty))
+    assert "TEST" not in pm._positions  # fully closed out
+
+
+def test_resync_leaves_position_tracked_when_stop_not_found_at_broker():
+    # The exact NRXS scenario: the stop already filled (or was cancelled)
+    # entirely while disconnected, so there's no fresh Trade to find.
+    # resync_after_reconnect can't resolve this alone -- it must not crash
+    # or silently mutate state; main.py's reconciliation watchdog is the
+    # backstop that reconciles against IBKR's real position separately.
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal)
+    ib.open_trades = []  # nothing found
+
+    claimed = pm.resync_after_reconnect(ib)
+
+    assert claimed == set()
+    assert "TEST" in pm._positions  # left as-is, not guessed at
+
+
+def test_resync_rewires_parent_fill_for_still_filling_entry():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, entry_filled=False)
+    pos = pm._positions["TEST"][0]
+    assert pos.entry_filled is False
+
+    fresh_parent_trade = FakeTrade(pos.parent_order)
+    ib.open_trades = [fresh_parent_trade]  # stop order (never resized, entry never filled) not present
+
+    pm.resync_after_reconnect(ib)
+    fresh_parent_trade.fillEvent.emit(fresh_parent_trade, make_fill(100))
+
+    assert pos.entry_filled is True
+    assert pos.remaining_qty == 100
+
+
+def test_resync_does_not_claim_parent_order_id():
+    # OrderManager always owns journaling entry fills; PositionManager's own
+    # parent-fill listener never journals, so there's no double-journal risk
+    # to avoid there -- the parent orderId must never appear in the claimed
+    # set (which tells order_manager.resync_open_orders what to skip).
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, entry_filled=False)
+    pos = pm._positions["TEST"][0]
+
+    fresh_parent_trade = FakeTrade(pos.parent_order)
+    fresh_stop_trade = FakeTrade(pos.stop_order)
+    ib.open_trades = [fresh_parent_trade, fresh_stop_trade]
+
+    claimed = pm.resync_after_reconnect(ib)
+
+    assert pos.parent_order.orderId not in claimed
+    assert pos.stop_order.orderId in claimed
+
+
+def test_resync_rewires_target_fill_onto_fresh_trade():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    _, target_trade = track_position(pm, signal, target_role="scale_out", target_qty=40)
+    pos = pm._positions["TEST"][0]
+    qty_before = pos.remaining_qty
+
+    fresh_stop_trade = FakeTrade(pos.stop_order)
+    fresh_target_trade = FakeTrade(target_trade.order)
+    ib.open_trades = [fresh_stop_trade, fresh_target_trade]
+
+    claimed = pm.resync_after_reconnect(ib)
+    assert target_trade.order.orderId in claimed
+
+    fresh_target_trade.fillEvent.emit(fresh_target_trade, make_fill(40))
+
+    assert pos.remaining_qty == qty_before - 40
+
+
+def test_resync_journals_stop_fill_after_reconnect():
+    # A reconnect kills the asymmetry track()/_wire_stop_fill relies on
+    # (whether OrderManager already has a live listener on the original
+    # stop) -- resync must always journal what it re-wires itself, or a
+    # fill after a reconnect on a never-replaced original stop would go
+    # completely fill-blind in the journal (not just mismanaged locally).
+    ib = FakeIB()
+    journal = FakeJournal()
+    pm = PositionManager(ib, journal, make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal)
+    pos = pm._positions["TEST"][0]
+    fresh_stop_trade = FakeTrade(pos.stop_order)
+    ib.open_trades = [fresh_stop_trade]
+
+    pm.resync_after_reconnect(ib)
+    fills_before = len(journal.fills_recorded)
+    fresh_stop_trade.fillEvent.emit(fresh_stop_trade, make_fill(pos.remaining_qty))
+
+    assert len(journal.fills_recorded) == fills_before + 1

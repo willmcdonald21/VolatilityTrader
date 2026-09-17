@@ -72,3 +72,24 @@ def test_flatten_buys_to_close_short_positions(monkeypatch):
     _, order = ib.placed[0]
     assert order.action == "BUY"
     assert order.totalQuantity == 500.0
+
+
+def test_flatten_position_flattens_a_single_symbol(monkeypatch):
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    ib = FakeIB([])  # deliberately not driven from ib.positions() -- caller already has the position
+
+    panic.flatten_position(ib, make_position("NRXS", -850.0))
+
+    assert len(ib.placed) == 1
+    contract, order = ib.placed[0]
+    assert contract.symbol == "NRXS"
+    assert order.action == "BUY"
+    assert order.totalQuantity == 850.0
+
+
+def test_flatten_position_noop_on_zero_qty():
+    ib = FakeIB([])
+
+    panic.flatten_position(ib, make_position("FLAT", 0.0))
+
+    assert ib.placed == []

@@ -30,7 +30,7 @@ from warrior_bot.strategies.gap_and_go import GapAndGoStrategy
 from warrior_bot.strategies.indicators import Bar
 from warrior_bot.strategies.inverted_head_and_shoulders import InvertedHeadAndShouldersStrategy
 from warrior_bot.strategies.vwap_reversion import VwapReversionStrategy
-from warrior_bot.utils.panic import panic_stop
+from warrior_bot.utils.panic import flatten_position, panic_stop
 from warrior_bot.utils.rounding import round_to_tick
 from warrior_bot.utils.time_utils import is_active_session, to_eastern
 
@@ -102,6 +102,7 @@ class WarriorBot:
         self._scan_task: asyncio.Task | None = None
         self._risk_task: asyncio.Task | None = None
         self._watchdog_task: asyncio.Task | None = None
+        self._reconciliation_task: asyncio.Task | None = None
         self._flattened_today = False
         self._news_provider_codes = config.news.provider_codes
         self._last_logged_breadth: int | None = None
@@ -128,6 +129,7 @@ class WarriorBot:
         self._scan_task = asyncio.ensure_future(self._scan_loop())
         self._risk_task = asyncio.ensure_future(self._risk_loop())
         self._watchdog_task = asyncio.ensure_future(self._data_watchdog_loop())
+        self._reconciliation_task = asyncio.ensure_future(self._position_reconciliation_loop())
         self.logger.info(
             "WarriorBot started: mode=%s strategies=%s",
             self.config.trading.mode,
@@ -141,6 +143,8 @@ class WarriorBot:
             self._risk_task.cancel()
         if self._watchdog_task:
             self._watchdog_task.cancel()
+        if self._reconciliation_task:
+            self._reconciliation_task.cancel()
         self.ib_client.disconnect()
 
     def _on_connected(self) -> None:
@@ -151,9 +155,24 @@ class WarriorBot:
         nothing tracked yet); on a reconnect, drops already-tracked symbols
         so `_scan_loop` treats them as new again and re-onboards them --
         fresh contract qualification, warmup bars, and a live bar
-        subscription on the new session. Never touches `position_manager`:
-        already-open bracket orders are standing orders IBKR keeps working
-        server-side independent of our API session."""
+        subscription on the new session.
+
+        Also resyncs order/position fill tracking -- ib_async's
+        disconnect() calls wrapper.reset(), which wipes its own internal
+        Trade-object cache, so any fillEvent listener OrderManager or
+        PositionManager wired onto a pre-reconnect Trade goes silently
+        dead even though the underlying order keeps working fine at the
+        broker. Confirmed live, 2026-09-16: exactly this silently orphaned
+        PositionManager's tracking of two NRXS stop fills, leaving a
+        closed lot looking open until a stale resize placed a duplicate
+        full-size stop that later filled for real -- an 850-share naked
+        short with no resting protection for ~3h53m. position_manager's
+        resync runs first and reports which stop/target orderIds it
+        re-wired itself, so order_manager's resync (force=True, since it
+        would otherwise skip every orderId it already knows about from
+        before the reconnect -- see resync_open_orders' docstring) doesn't
+        also re-attach its own journaling listener to those and
+        double-journal the next fill."""
         if not self.contexts:
             return
         orphaned = list(self.contexts.keys())
@@ -168,6 +187,9 @@ class WarriorBot:
         self._subscriptions.clear()
         self._last_bar_at.clear()
         self._last_scan_seen_at.clear()
+
+        claimed = self.position_manager.resync_after_reconnect(self.ib)
+        self.order_manager.resync_open_orders(force=True, skip_order_ids=frozenset(claimed))
 
     async def _scan_loop(self) -> None:
         while True:
@@ -255,6 +277,92 @@ class WarriorBot:
         self.position_manager.clear()
         self.journal.record_kill_switch_event(triggered_by=reason, action_taken="cancel_all+flatten_all")
         self._flattened_today = True
+
+    async def _position_reconciliation_loop(self) -> None:
+        cfg = self.config.position_reconciliation
+        if not cfg.enabled:
+            return
+        while True:
+            if not self.ib.isConnected():
+                await asyncio.sleep(5)
+                continue
+            try:
+                self._check_position_reconciliation()
+            except Exception:
+                self.logger.exception("Position reconciliation iteration failed")
+            await asyncio.sleep(cfg.check_interval_seconds)
+
+    def _check_position_reconciliation(self) -> None:
+        """Unconditional backstop against the 2026-09-16 NRXS incident
+        (unprotected 850-share naked short for ~3h53m, closed only by
+        luck -- the scheduled EOD flatten happened to still be ahead of
+        it): independent of *why* a symbol ends up here (a reconnect
+        orphaning fill listeners, per PositionManager.resync_after_reconnect,
+        or any other cause not yet discovered), this periodically checks
+        IBKR's own live position/order state directly and immediately
+        flattens any symbol holding a real position with no adequate
+        resting protective stop. See PositionReconciliationConfig for the
+        full incident writeup and the "flatten now" over "reconstruct the
+        right stop" reasoning."""
+        live_positions = {p.contract.symbol: p for p in self.ib.positions() if p.position != 0}
+
+        # Stale local tracking: PositionManager thinks a symbol is still
+        # open but IBKR shows it flat (e.g. a resync that couldn't resolve
+        # a stop that filled/cancelled entirely while disconnected).
+        for symbol in self.position_manager.tracked_symbols() - set(live_positions.keys()):
+            self.logger.warning(
+                "Reconciliation: %s tracked locally but flat at IBKR -- dropping stale local state", symbol
+            )
+            self.position_manager.drop_symbol(symbol)
+
+        if not live_positions:
+            return
+
+        # Only a resting STP/STP LMT SELL order actually caps downside on
+        # a long position -- a resting take-profit LMT order doesn't.
+        stop_qty_by_symbol: dict[str, float] = {}
+        for trade in self.ib.openTrades():
+            if trade.order.action != "SELL" or trade.order.orderType not in ("STP", "STP LMT"):
+                continue
+            remaining = trade.orderStatus.remaining or trade.order.totalQuantity
+            symbol = trade.contract.symbol
+            stop_qty_by_symbol[symbol] = stop_qty_by_symbol.get(symbol, 0.0) + remaining
+
+        for symbol, position in live_positions.items():
+            if position.position < 0:
+                # Never an intended state for this long-only bot (Signal.side
+                # is always "BUY") -- any short found here IS the bug, by
+                # definition, regardless of whether anything happens to
+                # cover it.
+                self._emergency_flatten_symbol(
+                    symbol, position, reason="naked_short_detected", covered_qty=0.0
+                )
+                continue
+            covered = stop_qty_by_symbol.get(symbol, 0.0)
+            if covered < position.position:
+                self._emergency_flatten_symbol(
+                    symbol, position, reason="unprotected_position_detected", covered_qty=covered
+                )
+
+    def _emergency_flatten_symbol(self, symbol: str, position, reason: str, covered_qty: float) -> None:
+        self.logger.error(
+            "Reconciliation: %s has %s shares with only %.0f covered by a resting stop -- flattening immediately "
+            "(reason=%s)",
+            symbol,
+            position.position,
+            covered_qty,
+            reason,
+        )
+        alert(
+            f"Reconciliation watchdog: {symbol} found with a real position and no adequate resting "
+            f"protective stop -- flattening immediately (reason={reason})",
+            channel="limits",
+        )
+        flatten_position(self.ib, position, channel="limits")
+        self.position_manager.drop_symbol(symbol)
+        self.journal.record_kill_switch_event(
+            triggered_by=f"reconciliation:{symbol}:{reason}", action_taken="market_flatten_symbol"
+        )
 
     def _ensure_subscription_capacity(self, incoming_symbol: str) -> bool:
         """Returns True once there's room for one more live subscription --

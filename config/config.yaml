@@ -152,6 +152,16 @@ data_watchdog:
   max_concurrent_subscriptions: 90   # self-imposed cap, below where things broke live (~156-170)
   inactive_unsubscribe_seconds: 1800 # no position + out of scanner top-N this long -> evictable
 
+position_reconciliation:
+  # Guards against the 2026-09-16 incident: NRXS sat as an unprotected
+  # 850-share naked short for ~3h53m after a reconnect silently orphaned
+  # its stop-fill listeners. Periodically checks IBKR's own position/order
+  # state directly and immediately flattens any symbol found with a real
+  # position but no resting protective stop -- see
+  # PositionReconciliationConfig docstring for full detail.
+  enabled: true
+  check_interval_seconds: 30
+
 journal:
   db_path: data/journal.sqlite3
 

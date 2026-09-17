@@ -174,7 +174,7 @@ class OrderManager:
         trade.statusEvent += on_status
         trade.fillEvent += on_fill
 
-    def resync_open_orders(self) -> None:
+    def resync_open_orders(self, force: bool = False, skip_order_ids: frozenset[int] = frozenset()) -> None:
         """Re-attaches fill/status tracking (journal writes + Discord
         notify_on_fill/notify_on_pnl) to orders that are still resting at
         IBKR from before this process started -- covers both a supervisor
@@ -191,17 +191,34 @@ class OrderManager:
         default reqOpenOrders on connect is scoped to the connecting
         clientId), so this only needs to re-attach, not replace, them.
 
-        Deliberately does NOT touch `PositionManager` -- re-registering
-        breakeven/trailing/reversal-exit management for an already-open
-        position is a strategy-behavior change (which lot state, which
-        stop is "current", etc.) and out of scope here; this only restores
-        visibility (journal + Discord), not management. Orders placed
-        manually outside the bot (never in the journal) are skipped --
-        there's no signal_id to attach fills to."""
+        `force=True` is for the *same-process reconnect* case (see
+        main.py's `_on_connected`), which the `_order_row_ids` guard below
+        would otherwise defeat: this instance already knows every orderId
+        it has ever placed, but ib_async's own reconnect handling
+        (IB.disconnect() -> wrapper.reset()) throws away its Trade objects
+        and builds fresh ones, so a listener wired on the pre-reconnect
+        Trade is just as dead here as it would be after a process restart
+        -- `_order_row_ids` still containing the id doesn't mean the
+        listener attached to it is still live. `force=True` re-attaches
+        regardless of that dict, which is harmless/idempotent (the old
+        listener is on an abandoned object nobody feeds events into
+        anymore). `skip_order_ids` excludes orders
+        `PositionManager.resync_after_reconnect` already re-wired itself
+        (stop/target orders only) -- without it, a reconnect resync would
+        double-journal the next fill on any of those, the same bug already
+        fixed once in track()/_wire_stop_fill for the non-reconnect path.
+
+        Deliberately does NOT touch `PositionManager`'s own management
+        listeners (breakeven/trailing/reversal-exit/qty tracking) --
+        that's `PositionManager.resync_after_reconnect`'s job, called
+        separately. Orders placed manually outside the bot (never in the
+        journal) are skipped -- there's no signal_id to attach fills to."""
         resynced = 0
         for trade in self.ib.openTrades():
             order_id = trade.order.orderId
-            if order_id in self._order_row_ids:
+            if order_id in skip_order_ids:
+                continue
+            if not force and order_id in self._order_row_ids:
                 continue  # already tracked by this process (placed after resync ran)
             found = self.journal.find_order_by_ib_order_id(order_id)
             if found is None:

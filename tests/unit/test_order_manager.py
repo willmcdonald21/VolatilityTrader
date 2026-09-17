@@ -331,3 +331,75 @@ def test_profit_tier_prices_are_tick_conformant():
     assert len(specs) == 2
     for qty, price in specs:
         assert price == round(price, 2)
+
+def test_resync_force_reattaches_orders_already_known_from_before_reconnect():
+    # The reconnect case (main.py's _on_connected): this instance already
+    # placed this order and has its orderId in _order_row_ids from before
+    # ib_async's reconnect wiped its Trade-object cache -- the plain
+    # `if order_id in self._order_row_ids: continue` guard would wrongly
+    # treat that as "already has a live listener" when the listener it
+    # actually has is wired to a dead, pre-reconnect Trade object.
+    # force=True must re-attach onto the fresh Trade regardless.
+    journal = FakeJournal(orders_by_ib_id={10: {"row_id": 99, "role": "stop", "entry_price": 5.0}})
+    om = OrderManager(
+        ib=None,
+        journal=journal,
+        exits_config=None,
+        position_manager=None,
+        notifications_config=NotificationsConfig(enabled=False),
+        account_state=FakeAccountState(),
+    )
+    om._order_row_ids[10] = 99  # known from before the reconnect
+
+    fresh_trade = FakeTrade(FakeOrder(action="SELL", orderId=10))
+    om.ib = FakeIB([fresh_trade])
+
+    om.resync_open_orders(force=True)
+    fresh_trade.fillEvent.emit(fresh_trade, make_fill(shares=50, price=5.0))
+
+    assert len(journal.fills) == 1  # the fresh Trade's listener is live
+
+
+def test_resync_without_force_skips_already_known_orders():
+    journal = FakeJournal(orders_by_ib_id={10: {"row_id": 99, "role": "stop", "entry_price": 5.0}})
+    om = OrderManager(
+        ib=None,
+        journal=journal,
+        exits_config=None,
+        position_manager=None,
+        notifications_config=NotificationsConfig(enabled=False),
+        account_state=FakeAccountState(),
+    )
+    om._order_row_ids[10] = 99
+    fresh_trade = FakeTrade(FakeOrder(action="SELL", orderId=10))
+    om.ib = FakeIB([fresh_trade])
+
+    om.resync_open_orders(force=False)
+    fresh_trade.fillEvent.emit(fresh_trade, make_fill(shares=50, price=5.0))
+
+    assert len(journal.fills) == 0  # not re-attached -- default (non-reconnect) behavior unchanged
+
+
+def test_resync_skip_order_ids_excludes_positions_already_claimed():
+    # Coordinates with PositionManager.resync_after_reconnect: an orderId
+    # it already re-wired itself (and will journal itself) must not also
+    # get OrderManager's own journaling listener, or the next fill on it
+    # double-journals -- the exact bug already fixed once in
+    # track()/_wire_stop_fill for the non-reconnect path.
+    journal = FakeJournal(orders_by_ib_id={10: {"row_id": 99, "role": "stop", "entry_price": 5.0}})
+    om = OrderManager(
+        ib=None,
+        journal=journal,
+        exits_config=None,
+        position_manager=None,
+        notifications_config=NotificationsConfig(enabled=False),
+        account_state=FakeAccountState(),
+    )
+    fresh_trade = FakeTrade(FakeOrder(action="SELL", orderId=10))
+    om.ib = FakeIB([fresh_trade])
+
+    om.resync_open_orders(force=True, skip_order_ids=frozenset({10}))
+    fresh_trade.fillEvent.emit(fresh_trade, make_fill(shares=50, price=5.0))
+
+    assert len(journal.fills) == 0
+    assert 10 not in om._order_row_ids

@@ -316,6 +316,36 @@ class DataWatchdogConfig(BaseModel):
     inactive_unsubscribe_seconds: int = Field(default=1800, gt=0)
 
 
+class PositionReconciliationConfig(BaseModel):
+    """Guards against the failure mode confirmed live on 2026-09-16: NRXS
+    ended up as an unprotected naked short of 850 shares for ~3h53m,
+    closed only by luck -- the scheduled EOD flatten happened to still be
+    ahead of it. Root cause: an IBKR disconnect/reconnect (ib_async's
+    IB.disconnect() calls wrapper.reset(), which wipes its internal
+    trades/permId2Trade dicts) silently orphaned PositionManager's fill
+    listeners for orders that kept working at the broker across the
+    reconnect. Two of NRXS's stop-loss exits filled correctly but
+    invisibly to the bot, which never decremented its local qty or
+    untracked the lot -- so a later stop-resize placed a brand-new,
+    full-size duplicate stop on an already-flat lot, which itself later
+    filled for real, doubling the exit into a naked short.
+
+    resync_after_reconnect (position_manager.py) re-wires whatever
+    listeners it can find fresh Trade objects for, but can't always
+    resolve every case cleanly (e.g. an order that filled or was
+    cancelled entirely while disconnected). This watchdog is the
+    unconditional backstop: independent of *why* a symbol ended up here,
+    it periodically checks IBKR's own live position/order state directly
+    and immediately flattens (not re-protects -- simplest, always-correct,
+    matches this bot's existing EOD-flatten/kill-switch philosophy of
+    "get flat now" over reconstructing a stop at the "right" price) any
+    symbol holding a real position with no resting protective stop
+    order."""
+
+    enabled: bool = True
+    check_interval_seconds: int = Field(default=30, gt=0)
+
+
 class JournalConfig(BaseModel):
     db_path: str = "data/journal.sqlite3"
 
@@ -352,6 +382,7 @@ class AppConfig(BaseModel):
     notifications: NotificationsConfig = NotificationsConfig()
     scanner: ScannerConfig
     data_watchdog: DataWatchdogConfig = DataWatchdogConfig()
+    position_reconciliation: PositionReconciliationConfig = PositionReconciliationConfig()
     journal: JournalConfig
     kill_switch: KillSwitchConfig
     logging: LoggingConfig
