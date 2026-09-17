@@ -277,6 +277,45 @@ class ScannerConfig(BaseModel):
     max_candidates: int = 25
 
 
+class DataWatchdogConfig(BaseModel):
+    """Guards against the failure mode confirmed live on 2026-09-15: RETO
+    (that day's #1 scanner-ranked gainer) and several other symbols
+    (WAFU/WNW/FTFT/ARTL/BGMS/SKIL) each got one onboarding log line, then
+    never produced another strategy evaluation for the rest of the session
+    -- real, actively-moving stocks the bot was simply blind to. Root cause
+    had two independent faces, both stemming from the same gap: onboarded
+    symbols were never unsubscribed or health-checked, so the bot's live
+    subscription count only ever grew (by 11am that day it had already
+    onboarded ~156-170 symbols). (1) new keepUpToDate requests made once
+    IBKR's live-line budget is exhausted can fail outright, or nominally
+    "succeed" (return the historical warmup) while the ongoing live stream
+    never actually starts. (2) confirmed the same day: a transient
+    IBKR-side "HMDS server disconnect" silently killed ~179 concurrent live
+    subscriptions in a single burst (error 10182, 15:52 ET) with zero
+    self-healing. This config drives two independent defenses: proactively
+    freeing subscription budget before the cap is ever hit, and a
+    staleness watchdog that detects and resubscribes any symbol whose feed
+    has gone silent, regardless of cause.
+    """
+
+    enabled: bool = True
+    check_interval_seconds: int = Field(default=60, gt=0)
+    # No live update received in this long (during the bot's active
+    # session) -> treat the subscription as dead and resubscribe. Comfortably
+    # above the ~60s cadence of 1-minute bars, tight enough to catch a real
+    # failure within a few minutes rather than losing the rest of the day to it.
+    stale_after_seconds: int = Field(default=180, gt=0)
+    # Self-imposed ceiling kept well below where things broke live
+    # (~156-170 concurrent subscriptions) so the bot manages its own budget
+    # instead of silently discovering IBKR's real, undocumented cap.
+    max_concurrent_subscriptions: int = Field(default=90, gt=0)
+    # A tracked symbol with no open position that hasn't appeared in the
+    # scanner's top-N results for this long is eligible to be evicted (its
+    # live subscription freed) to make room for a fresh, currently-relevant
+    # candidate once at the cap above.
+    inactive_unsubscribe_seconds: int = Field(default=1800, gt=0)
+
+
 class JournalConfig(BaseModel):
     db_path: str = "data/journal.sqlite3"
 
@@ -312,6 +351,7 @@ class AppConfig(BaseModel):
     news: NewsConfig = NewsConfig()
     notifications: NotificationsConfig = NotificationsConfig()
     scanner: ScannerConfig
+    data_watchdog: DataWatchdogConfig = DataWatchdogConfig()
     journal: JournalConfig
     kill_switch: KillSwitchConfig
     logging: LoggingConfig

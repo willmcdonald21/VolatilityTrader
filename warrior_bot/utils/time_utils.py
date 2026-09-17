@@ -58,6 +58,16 @@ def is_regular_hours(now: datetime | None = None) -> bool:
     return RTH_OPEN <= now.time() < RTH_CLOSE
 
 
+def is_active_session(now: datetime | None = None) -> bool:
+    """True from pre-market open through after-hours close (4:00-20:00 ET)
+    -- the bot's full active window. Used to gate work that should pause
+    overnight (e.g. the live-data staleness watchdog in main.py) rather than
+    needlessly resubscribing/churning every tracked symbol once there's no
+    session running at all."""
+    now = to_eastern(now) if now is not None else now_eastern()
+    return PRE_MARKET_OPEN <= now.time() < AFTER_HOURS_CLOSE
+
+
 def session_date_start(now: datetime | None = None) -> datetime:
     now = now or now_eastern()
     return now.replace(hour=0, minute=0, second=0, microsecond=0)

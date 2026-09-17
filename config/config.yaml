@@ -139,6 +139,19 @@ scanner:
   refresh_seconds: 5
   max_candidates: 25
 
+data_watchdog:
+  # Guards against the 2026-09-15 incident: RETO (that day's #1 gainer) and
+  # several other symbols got one onboarding log line then went silent for
+  # the rest of the session -- root-caused to unbounded live subscriptions
+  # (no cleanup, ever) combined with a live-line cap and a transient IBKR
+  # "HMDS server disconnect" that killed ~179 subscriptions in one burst
+  # with no self-healing. See DataWatchdogConfig docstring for full detail.
+  enabled: true
+  check_interval_seconds: 60
+  stale_after_seconds: 180       # no live bar callback in this long -> resubscribe
+  max_concurrent_subscriptions: 90   # self-imposed cap, below where things broke live (~156-170)
+  inactive_unsubscribe_seconds: 1800 # no position + out of scanner top-N this long -> evictable
+
 journal:
   db_path: data/journal.sqlite3
 
