@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 
 from ib_async import IB, Contract, MarketOrder, Order, StopLimitOrder, StopOrder, Trade
 
@@ -68,6 +69,9 @@ class ManagedPosition:
     parent_done: bool = False
     breakeven_done: bool = False
     trailing_active: bool = False
+    # When the bracket was submitted -- the clock cancel_stale_entries runs
+    # against, so a working entry can't outlive the setup that justified it.
+    submitted_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     # Pending debounced stop-resize (see _schedule_stop_resize) -- cancelled
     # and rescheduled on every fill so a burst only replaces the stop once,
     # after fills stop arriving for _STOP_RESIZE_DEBOUNCE_SECONDS.
@@ -315,6 +319,44 @@ class PositionManager:
 
             if pos.breakeven_done and self.config.trailing.enabled:
                 self._check_trailing(pos, ctx, last_price)
+
+    def cancel_stale_entries(self, timeout_seconds: float) -> None:
+        """Cancels entry orders still working `timeout_seconds` after they
+        were submitted.
+
+        Every entry is a DAY limit order priced at the close of the bar that
+        triggered it, so anything that doesn't fill promptly just rests at
+        the broker until EOD -- and can fill hours later, on a completely
+        different tape, still carrying the stop and target computed from the
+        original setup's structure. Confirmed live: RLGT's 2026-09-15
+        vwap_reversion entry signalled at 04:30 ET and filled at 08:26 ET,
+        3h56m later.
+
+        Shares already filled are left alone -- they are a real position and
+        keep their resting stop. Only the unfilled remainder is cancelled,
+        and `parent_done` is set so the rest of this class stops waiting for
+        fills that are never coming (see _close_out)."""
+        if timeout_seconds <= 0:
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(seconds=timeout_seconds)
+        for lots in list(self._positions.values()):
+            for pos in list(lots):
+                if pos.parent_done or pos.submitted_at > cutoff:
+                    continue
+                logger.warning(
+                    "Entry for %s still working %.0fs after submission -- cancelling the unfilled "
+                    "remainder (filled so far: %d shares)",
+                    pos.symbol,
+                    timeout_seconds,
+                    pos.remaining_qty,
+                )
+                self.ib.cancelOrder(pos.parent_order)
+                pos.parent_done = True
+                if not pos.entry_filled:
+                    # Nothing ever filled, so there is no position to
+                    # protect and no exit leg worth keeping: IBKR cancels
+                    # the attached children along with their parent.
+                    self._untrack(pos)
 
     def clear(self) -> None:
         """Drops all tracked positions with no IBKR side effects — used

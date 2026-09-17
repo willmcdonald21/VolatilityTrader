@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -1118,3 +1118,79 @@ def test_resync_journals_stop_fill_after_reconnect():
     fresh_stop_trade.fillEvent.emit(fresh_stop_trade, make_fill(pos.remaining_qty))
 
     assert len(journal.fills_recorded) == fills_before + 1
+
+
+def _age_position(pos, seconds):
+    pos.submitted_at = datetime.now(timezone.utc) - timedelta(seconds=seconds)
+
+
+def test_stale_unfilled_entry_is_cancelled_and_untracked():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config())
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, entry_filled=False)
+    pos = pm._positions["TEST"][0]
+    _age_position(pos, 400)
+
+    pm.cancel_stale_entries(timeout_seconds=300)
+
+    assert pos.parent_order in ib.cancelled
+    assert "TEST" not in pm._positions  # nothing ever filled -- nothing to protect
+
+
+def test_stale_partially_filled_entry_cancels_remainder_but_keeps_the_position():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config())
+    signal = make_signal(entry=10.0, stop=9.0)
+    parent_order = FakeOrder("BUY", 1000, lmtPrice=signal.entry_price, orderId=1)
+    parent_trade = FakeTrade(parent_order, remaining=900)  # 100 of 1000 filled
+    stop_trade = FakeTrade(FakeOrder("SELL", 1000, auxPrice=signal.stop_price, orderId=2, parentId=1))
+    target_trade = FakeTrade(FakeOrder("SELL", 1000, lmtPrice=signal.target_price, orderId=3))
+    pm.track(
+        contract=object(),
+        signal=signal,
+        signal_id=1,
+        parent_trade=parent_trade,
+        stop_trade=stop_trade,
+        stop_row_id=1,
+        target_trades=[target_trade],
+        target_roles=["scale_out"],
+    )
+    parent_trade.fillEvent.emit(parent_trade, make_fill(100))
+    pos = pm._positions["TEST"][0]
+    flush_resize(pos)
+    _age_position(pos, 400)
+
+    pm.cancel_stale_entries(timeout_seconds=300)
+
+    assert pos.parent_order in ib.cancelled
+    assert "TEST" in pm._positions  # the 100 filled shares are a real position
+    assert pos.remaining_qty == 100
+    assert pos.parent_done is True  # no further fills are coming
+
+
+def test_fresh_entry_is_left_alone():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config())
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, entry_filled=False)
+    pos = pm._positions["TEST"][0]
+    _age_position(pos, 60)
+
+    pm.cancel_stale_entries(timeout_seconds=300)
+
+    assert pos.parent_order not in ib.cancelled
+    assert "TEST" in pm._positions
+
+
+def test_fully_filled_entry_is_never_cancelled_however_old():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config())
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, quantity=100)  # entry_filled=True -> parent_done
+    pos = pm._positions["TEST"][0]
+    _age_position(pos, 100_000)
+
+    pm.cancel_stale_entries(timeout_seconds=300)
+
+    assert pos.parent_order not in ib.cancelled
