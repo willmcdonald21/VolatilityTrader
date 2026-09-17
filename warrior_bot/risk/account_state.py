@@ -41,29 +41,67 @@ class AccountState:
                     return 0.0
         return 0.0
 
-    def _closing_fills(self) -> list[tuple[datetime, float]]:
-        """(fill_time, realized_pnl) for today's closing fills only.
-
-        IB's CommissionReport.realizedPNL carries a sentinel value
-        (UNSET_DOUBLE, i.e. sys.float_info.max) for the opening leg of a
-        round trip rather than 0 — those must be excluded or they blow up
-        the total, not just skipped via a falsy check.
-        """
-        closing: list[tuple[datetime, float]] = []
+    def _todays_fills(self) -> list:
+        """This session's fills, oldest first — average-cost accounting
+        below depends on processing them in execution order."""
+        todays = []
         for fill in self.ib.fills():
             fill_time = fill.time
             if fill_time.tzinfo is None:
                 fill_time = fill_time.replace(tzinfo=timezone.utc)
             if fill_time < self._session_start:
                 continue
-            pnl = fill.commissionReport.realizedPNL
-            if pnl is None or abs(pnl) >= UNSET_DOUBLE / 2:
-                continue
-            closing.append((fill_time, pnl))
-        return closing
+            todays.append((fill_time, fill))
+        todays.sort(key=lambda pair: pair[0])
+        return [fill for _, fill in todays]
 
     def daily_realized_pnl(self) -> float:
-        return sum(pnl for _, pnl in self._closing_fills())
+        """Round-trip realized P&L across this session's fills, net of
+        commissions, via per-symbol average-cost matching.
+
+        Deliberately does NOT use CommissionReport.realizedPNL. That field
+        is documented to carry an UNSET_DOUBLE sentinel on the opening leg
+        of a round trip, but IBKR's paper simulator also leaves it at ~0 on
+        genuine *closing* fills -- every realized_pnl ever written to
+        data/journal.sqlite3 is 0.0, across 2,500+ fills. Summing it
+        therefore pinned this to 0.0 permanently, which silently disarmed
+        the only automatic circuit breaker in the bot: RiskManager's daily
+        loss limit compares against this number, so no loss -- of any size
+        -- could ever trip the halt or the flatten. Recomputing from raw
+        fill prices is the same method scripts/dashboard_report.py uses,
+        hand-validated against a full day of fills on 2026-09-14.
+        """
+        qty_held: dict[str, float] = {}
+        avg_cost: dict[str, float] = {}
+        realized = 0.0
+
+        for fill in self._todays_fills():
+            symbol = fill.contract.symbol
+            shares = float(fill.execution.shares)
+            price = float(fill.execution.price)
+            if fill.commissionReport is not None:
+                commission = fill.commissionReport.commission
+                if commission is not None and abs(commission) < UNSET_DOUBLE / 2:
+                    realized -= commission
+
+            held = qty_held.get(symbol, 0.0)
+            cost = avg_cost.get(symbol, 0.0)
+            if fill.execution.side == "BOT":
+                total = held + shares
+                avg_cost[symbol] = ((cost * held) + (price * shares)) / total if total else 0.0
+                qty_held[symbol] = total
+            else:
+                # Only shares actually accounted for as held contribute a
+                # round trip. Selling more than this session has bought
+                # should never happen for a long-only bot, but it did once
+                # (the 2026-09-16 NRXS naked short) -- count the matched
+                # portion and leave the rest out rather than inventing a
+                # cost basis for shares whose entry isn't in this session.
+                matched = min(shares, held)
+                realized += (price - cost) * matched
+                qty_held[symbol] = held - matched
+
+        return realized
 
     def snapshot(self) -> AccountSnapshot:
         return AccountSnapshot(
