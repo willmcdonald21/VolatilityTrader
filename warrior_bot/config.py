@@ -76,11 +76,54 @@ class RiskConfig(BaseModel):
     # PositionManager.open_lot_count).
     first_entry_pct_of_funds: float = Field(default=0.10, gt=0, le=1.0)
     addon_pct_of_funds: float = Field(default=0.05, gt=0, le=1.0)
+    # Fraction of start-of-day equity risked per trade, i.e. what is lost if
+    # the stop fills. When set, this becomes the PRIMARY sizing rule and
+    # share count falls out of the stop distance (budget / risk-per-share)
+    # instead of being a flat slice of the account -- so a wider, structurally
+    # correct stop costs fewer shares rather than more dollars, and every
+    # trade risks the same amount whatever its stop distance. The
+    # %-of-funds numbers above stay on as notional caps.
+    #
+    # Sizing off notional alone is what forced max_stop_distance_pct down to
+    # a level that cannot work on this bot's universe: with share count
+    # independent of stop distance, the only way to bound per-trade loss was
+    # to bound the stop itself, which put every stop ~1.7% from entry --
+    # inside the normal 1-minute noise of a $1-3 low-float stock. On both
+    # 2026-09-15 and 2026-09-16 that produced a 100% stop-out rate with not
+    # one profit tier ever filled.
+    #
+    # null disables it and restores pure notional sizing.
+    risk_per_trade_pct: float | None = Field(default=None, gt=0, le=0.1)
+    addon_risk_pct: float | None = Field(default=None, gt=0, le=0.1)
+
+    @model_validator(mode="after")
+    def _guard_risk_sizing(self) -> "RiskConfig":
+        if self.addon_risk_pct is not None and self.risk_per_trade_pct is None:
+            raise ValueError(
+                "risk.addon_risk_pct is set but risk.risk_per_trade_pct is not -- "
+                "risk-based sizing is either on for both lots or off for both."
+            )
+        return self
     # Global conservative stop-loss cap, applied uniformly in
     # WarriorBot._handle_signal regardless of which strategy produced the
     # signal -- tightens (never loosens) each strategy's own structural
     # stop if that stop would risk more than this % of entry price.
     max_stop_distance_pct: float = Field(default=2.0, gt=0)
+    # How long a symbol stays ineligible after one of ITS SIGNALS WAS
+    # REJECTED (never after an accepted one -- an entry still permanently
+    # uses up that strategy's one shot at the symbol for the day). Every
+    # rejection reason is transient capacity, so the setup deserves another
+    # look once the book frees up; the delay just stops a level-triggered
+    # setup from re-firing on every single bar in the meantime.
+    rejected_signal_cooldown_seconds: float = Field(default=300.0, gt=0)
+    # A working entry (parent) order left unfilled this long is cancelled.
+    # These are DAY limit orders at the signal bar's close, so without this
+    # they rest until 15:55 and can fill hours after the setup that
+    # justified them is dead -- confirmed live: RLGT's 2026-09-15 04:30 ET
+    # vwap_reversion entry filled at 08:26 ET, 3h56m later, still carrying
+    # the stop computed from the 04:30 structure. Shares already filled keep
+    # their stop; only the still-working remainder is cancelled.
+    entry_fill_timeout_seconds: float = Field(default=300.0, gt=0)
 
     @model_validator(mode="after")
     def _guard_reserved_slots(self) -> "RiskConfig":

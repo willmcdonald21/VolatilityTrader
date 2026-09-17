@@ -166,6 +166,14 @@ def _today_et():
     return to_eastern(datetime.now(timezone.utc)).date()
 
 
+def _yesterday_et():
+    """Derived from the ET date, not the UTC one -- _check_new_trading_day
+    compares ET dates, and after 8pm ET the UTC date has already rolled over,
+    so a UTC-based "yesterday" equals today in ET and these tests silently
+    stop testing a day change at all."""
+    return _today_et() - timedelta(days=1)
+
+
 def test_check_new_trading_day_noop_on_same_day(tmp_path):
     bot = WarriorBot(make_config(tmp_path))
     bot.account_state.snapshot = lambda: _fake_snapshot()
@@ -180,7 +188,7 @@ def test_check_new_trading_day_noop_on_same_day(tmp_path):
 def test_check_new_trading_day_resets_flattened_today_flag(tmp_path):
     bot = WarriorBot(make_config(tmp_path))
     bot.account_state.snapshot = lambda: _fake_snapshot()
-    bot._trading_day = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+    bot._trading_day = _yesterday_et()
     bot._flattened_today = True  # simulates yesterday's EOD flatten having already fired
 
     bot._check_new_trading_day()
@@ -194,7 +202,7 @@ def test_check_new_trading_day_alerts_when_positions_still_open(tmp_path, monkey
     monkeypatch.setattr("warrior_bot.main.alert", lambda message, channel=None: alerts.append((message, channel)))
     bot = WarriorBot(make_config(tmp_path))
     bot.account_state.snapshot = lambda: _fake_snapshot(open_positions_count=2)
-    bot._trading_day = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+    bot._trading_day = _yesterday_et()
 
     bot._check_new_trading_day()
 
@@ -209,7 +217,7 @@ def test_check_new_trading_day_no_alert_when_no_positions_open(tmp_path, monkeyp
     monkeypatch.setattr("warrior_bot.main.alert", lambda message, channel=None: alerts.append((message, channel)))
     bot = WarriorBot(make_config(tmp_path))
     bot.account_state.snapshot = lambda: _fake_snapshot(open_positions_count=0)
-    bot._trading_day = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+    bot._trading_day = _yesterday_et()
 
     bot._check_new_trading_day()
 
@@ -728,3 +736,33 @@ def test_reconciliation_untracks_symbol_after_emergency_flatten(tmp_path, monkey
     bot._check_position_reconciliation()
 
     assert "UCAR" not in bot.position_manager.tracked_symbols()
+
+
+class _RankCtx:
+    def __init__(self, rank):
+        self.scanner_rank = rank
+
+
+def test_scan_refreshes_rank_of_already_tracked_symbols(tmp_path):
+    # The whole point of the reserved top-tier slot is the day's most
+    # obvious name -- which is rarely the name that was most obvious when
+    # it first got onboarded.
+    bot = WarriorBot(make_config(tmp_path))
+    bot.contexts = {"AAA": _RankCtx(18), "BBB": _RankCtx(1)}
+
+    for rank, symbol in enumerate(["BBB", "AAA"], start=1):
+        bot.contexts[symbol].scanner_rank = rank
+    bot._demote_symbols_absent_from_scan({"BBB", "AAA"})
+
+    assert bot.contexts["BBB"].scanner_rank == 1
+    assert bot.contexts["AAA"].scanner_rank == 2
+
+
+def test_symbols_dropping_out_of_the_scan_lose_their_rank(tmp_path):
+    bot = WarriorBot(make_config(tmp_path))
+    bot.contexts = {"AAA": _RankCtx(1), "BBB": _RankCtx(2)}
+
+    bot._demote_symbols_absent_from_scan({"AAA"})
+
+    assert bot.contexts["AAA"].scanner_rank == 1
+    assert bot.contexts["BBB"].scanner_rank is None

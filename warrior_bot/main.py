@@ -210,6 +210,18 @@ class WarriorBot:
                 for rank, symbol in enumerate(symbols, start=1):
                     if symbol not in self.contexts:
                         await self._onboard_symbol(symbol, scanner_rank=rank)
+                    else:
+                        # Re-stamp the live rank on every tick. Rank is the
+                        # bot's whole notion of "how obvious is this name
+                        # right now", and RiskManager gates its reserved
+                        # top-tier slot on it -- freezing it at whatever the
+                        # symbol happened to rank when first onboarded means
+                        # a name that opens mid-pack and later becomes THE
+                        # leader of the day is still judged on its opening
+                        # rank, and gets turned away from the slot that
+                        # exists precisely for it.
+                        self.contexts[symbol].scanner_rank = rank
+                self._demote_symbols_absent_from_scan(set(symbols))
                 breadth = count_extreme_gainers(self.contexts.values())
                 if breadth != self._last_logged_breadth:
                     self.logger.info(
@@ -221,6 +233,16 @@ class WarriorBot:
                 self.logger.exception("Scan loop iteration failed")
             await asyncio.sleep(self.config.scanner.refresh_seconds)
 
+    def _demote_symbols_absent_from_scan(self, current: set[str]) -> None:
+        """A tracked symbol that has dropped out of the scanner's top-N is
+        no longer a top-tier candidate, so it must not keep claiming a rank
+        that says it is. Cleared to None rather than to a large number:
+        RiskManager treats a missing rank as ineligible for the reserved
+        slot, which is exactly right for a name that is no longer ranking."""
+        for symbol, ctx in self.contexts.items():
+            if symbol not in current and ctx.scanner_rank is not None:
+                ctx.scanner_rank = None
+
     async def _risk_loop(self) -> None:
         while True:
             if not self.ib.isConnected():
@@ -229,6 +251,9 @@ class WarriorBot:
             try:
                 self._check_new_trading_day()
                 self._check_flatten_triggers()
+                self.position_manager.cancel_stale_entries(
+                    self.config.risk.entry_fill_timeout_seconds
+                )
             except Exception:
                 self.logger.exception("Risk loop iteration failed")
             await asyncio.sleep(self.config.exits.risk_loop_interval_seconds)
@@ -622,9 +647,11 @@ class WarriorBot:
                 self.logger.exception("Strategy %s failed evaluating %s", strategy.name, ctx.symbol)
                 continue
             if signal is not None:
-                self._handle_signal(contract, signal)
+                self._handle_signal(contract, signal, strategy, now)
 
-    def _handle_signal(self, contract: Contract, signal: Signal) -> None:
+    def _handle_signal(
+        self, contract: Contract, signal: Signal, strategy: BaseStrategy, now: datetime
+    ) -> None:
         self._clamp_stop_to_conservative_max(signal)
         signal_id = self.journal.record_signal(signal)
         decision = self.risk_manager.evaluate(signal)
@@ -632,6 +659,12 @@ class WarriorBot:
         if not decision.accepted:
             self.journal.record_rejection(signal, decision.reason)
             self.logger.info("Rejected %s/%s: %s", signal.symbol, signal.strategy, decision.reason)
+            # The setup was real; only capacity turned it away. Give the
+            # symbol another look once the cooldown passes instead of
+            # burning this strategy's one daily shot at it on a rejection.
+            strategy.rearm_after_rejection(
+                signal.symbol, now, self.config.risk.rejected_signal_cooldown_seconds
+            )
             return
         self.logger.info(
             "%sAccepted %s/%s qty=%d entry=%.4f stop=%.4f target=%.4f",
@@ -671,6 +704,20 @@ class WarriorBot:
     def reset_daily_state(self) -> None:
         for strategy in self.strategies:
             strategy.reset_daily()
+        # Drop every symbol's accumulated bar history along with its
+        # subscription, so the next scan re-onboards it with fresh warmup
+        # bars and a fresh prior close. Without this, `ctx.bars` just keeps
+        # growing across the midnight boundary for any symbol still tracked
+        # -- and every session-scoped number derived from it silently spans
+        # two days: VWAP anchors to yesterday, cumulative volume (and so
+        # relative volume) double-counts it, and prior_close stays the close
+        # from the day before that.
+        for symbol in list(self._subscriptions):
+            self._unsubscribe_symbol(symbol, reason="daily_reset")
+        self.contexts.clear()
+        self.contracts.clear()
+        self._last_bar_at.clear()
+        self._last_scan_seen_at.clear()
         self.account_state.reset_session()
         snapshot = self.account_state.snapshot()
         self.risk_manager.mark_start_of_day(snapshot.net_liquidation)

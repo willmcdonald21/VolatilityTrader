@@ -21,9 +21,22 @@ risk:
   daily_profit_goal_usd: null      # set to enable "profit cushion" sizing; null = feature off, always full size
   cushion_profit_fraction: 0.25    # trade at reduced size until this fraction of the daily goal is realized
   cushion_size_fraction: 0.25      # size multiplier applied while under the cushion threshold
-  first_entry_pct_of_funds: 0.10   # first entry into a symbol: this fraction of AvailableFunds
-  addon_pct_of_funds: 0.05         # one add-on lot allowed if a second signal fires on a symbol already held; a third signal is rejected
-  max_stop_distance_pct: 2.0       # conservative stop-loss cap (% of entry price), enforced on every signal regardless of strategy
+  first_entry_pct_of_funds: 0.10   # notional CAP on a first entry (fraction of AvailableFunds) -- no longer the primary sizing rule
+  addon_pct_of_funds: 0.05         # notional CAP on the one allowed add-on lot; a third signal on the same symbol is rejected
+  risk_per_trade_pct: 0.005        # PRIMARY sizing rule: fraction of start-of-day equity lost if the stop fills (0.5% ~= $235 on $47k).
+                                   # Share count = budget / (entry - stop), so a wider structural stop buys fewer shares instead of
+                                   # risking more dollars, and every trade risks the same amount regardless of stop distance.
+  addon_risk_pct: 0.0025           # the pyramid add-on risks half a first entry's budget
+  max_stop_distance_pct: 8.0       # was 2.0 -- an outer catastrophe bound now, not the mechanism that limits per-trade loss.
+                                   # At 2% it overrode the strategies' own structural stops on nearly every trade and parked them
+                                   # inside normal 1-minute noise for a $1-3 low-float name: 09-15 and 09-16 both closed with a
+                                   # 100% stop-out rate and zero profit tiers filled. risk_per_trade_pct now caps the dollars.
+  rejected_signal_cooldown_seconds: 300  # a signal REJECTED for capacity makes its symbol eligible again after this long,
+                                         # instead of burning that strategy's one daily shot at the symbol (96 setups were
+                                         # silently discarded this way on 2026-09-14). An ACCEPTED entry still uses up the shot.
+  entry_fill_timeout_seconds: 300  # cancel an entry order still unfilled this long after submission -- these are DAY limit
+                                   # orders, so without it they rest until 15:55 and can fill hours after the setup is dead
+                                   # (RLGT filled 3h56m late on 2026-09-15). Filled shares keep their stop; only the rest is pulled.
 
 pullback_quality:
   # Entry-time "dip or dump" dump-avoidance checks, shared by bull_flag/abcd's

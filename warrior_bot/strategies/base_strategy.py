@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from warrior_bot.strategies.indicators import (
@@ -114,6 +114,39 @@ class BaseStrategy(ABC):
 
     def reset_daily(self) -> None:
         self._state.clear()
+
+    def already_triggered(self, ctx: SymbolContext, now: datetime) -> bool:
+        """One entry per symbol per strategy per day is the intended
+        discipline -- but only for a signal that actually became an order.
+
+        A signal that was *rejected* by RiskManager (every current rejection
+        reason is transient: all slots busy, reserved for a higher-ranked
+        name, kill switch on, size rounded to zero) used to burn the symbol
+        for the rest of the session anyway, because `triggered` was set
+        inside evaluate() before risk ever saw it. On 2026-09-14 that
+        silently discarded 96 setups -- every one of them a symbol this
+        strategy could never look at again that day, however well it went on
+        to trade. `rearm_after_rejection` schedules those to become eligible
+        again after a cooldown; this check is what honours it."""
+        state = self.state_for(ctx.symbol)
+        if not state.get("triggered"):
+            return False
+        rearm_at = state.get("rearm_at")
+        if rearm_at is not None and now >= rearm_at:
+            state["triggered"] = False
+            state.pop("rearm_at", None)
+            return False
+        return True
+
+    def rearm_after_rejection(self, symbol: str, now: datetime, cooldown_seconds: float) -> None:
+        """Makes a rejected symbol eligible to signal again once `cooldown`
+        has passed. The cooldown (rather than re-arming instantly) is what
+        keeps a level-triggered setup -- gap_and_go stays "broken out" for
+        every bar after the breakout -- from re-firing on all of them while
+        the book is full."""
+        state = self.state_for(symbol)
+        if state.get("triggered"):
+            state["rearm_at"] = now + timedelta(seconds=cooldown_seconds)
 
     def _reject(self, ctx: SymbolContext, reason: str) -> None:
         """Breadcrumb for why a candidate didn't produce a signal on this

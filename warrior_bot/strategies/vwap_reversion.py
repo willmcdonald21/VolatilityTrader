@@ -23,7 +23,7 @@ class VwapReversionStrategy(BaseStrategy):
 
     def evaluate(self, ctx: SymbolContext, now: datetime) -> Signal | None:
         state = self.state_for(ctx.symbol)
-        if state.get("triggered"):
+        if self.already_triggered(ctx, now):
             return None
         if not self._check_engaged(ctx):
             return self._reject(ctx, "macd_bearish")

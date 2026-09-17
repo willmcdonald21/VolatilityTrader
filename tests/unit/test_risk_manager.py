@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
+
 from warrior_bot.config import RiskConfig
 from warrior_bot.risk.account_state import AccountSnapshot
 from warrior_bot.risk.risk_manager import RiskManager
@@ -52,6 +54,9 @@ def make_risk_manager(tmp_path, snapshot, open_lots: int = 0, **risk_overrides) 
         cushion_size_fraction=risk_overrides.get("cushion_size_fraction", 0.25),
         first_entry_pct_of_funds=risk_overrides.get("first_entry_pct_of_funds", 0.10),
         addon_pct_of_funds=risk_overrides.get("addon_pct_of_funds", 0.05),
+        risk_per_trade_pct=risk_overrides.get("risk_per_trade_pct"),
+        addon_risk_pct=risk_overrides.get("addon_risk_pct"),
+        max_stop_distance_pct=risk_overrides.get("max_stop_distance_pct", 2.0),
     )
     account_state = FakeAccountState(snapshot)
     position_manager = FakePositionManager(open_lots)
@@ -345,3 +350,85 @@ def test_start_of_day_equity_property(tmp_path):
     assert rm.start_of_day_equity is None
     rm.mark_start_of_day(100_000)
     assert rm.start_of_day_equity == 100_000
+
+
+def test_risk_based_sizing_derives_shares_from_stop_distance(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, available_funds=100_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.005)
+    rm.mark_start_of_day(100_000)
+    signal = make_signal(entry=2.00, stop=1.90)  # $0.10 of risk per share
+
+    decision = rm.evaluate(signal)
+
+    # $100k * 0.5% = $500 budget / $0.10 per share = 5,000 shares
+    assert decision.sized_qty == 5000
+
+
+def test_wider_stop_buys_fewer_shares_for_the_same_dollar_risk(tmp_path):
+    # The entire point of the change: stop distance moves share count, not
+    # the amount at risk. available_funds is generous so the notional cap
+    # doesn't bind the tight-stop leg and hide the relationship.
+    snapshot = default_snapshot(net_liquidation=100_000, available_funds=500_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.005)
+    rm.mark_start_of_day(100_000)
+
+    tight = rm.evaluate(make_signal(entry=2.00, stop=1.96))  # $0.04 risk/share
+    wide = rm.evaluate(make_signal(entry=2.00, stop=1.84))  # $0.16 risk/share
+
+    assert tight.sized_qty == 12_500
+    assert wide.sized_qty == 3_125
+    for decision, risk_per_share in ((tight, 0.04), (wide, 0.16)):
+        assert decision.sized_qty * risk_per_share == pytest.approx(500.0)
+
+
+def test_notional_cap_still_binds_when_risk_budget_would_buy_more(tmp_path):
+    # A very tight stop makes the risk budget enormous in share terms --
+    # the %-of-funds cap is what stops it becoming an oversized position.
+    snapshot = default_snapshot(net_liquidation=100_000, available_funds=100_000)
+    rm = make_risk_manager(
+        tmp_path, snapshot, risk_per_trade_pct=0.005, first_entry_pct_of_funds=0.10
+    )
+    rm.mark_start_of_day(100_000)
+    signal = make_signal(entry=10.0, stop=9.99)  # $0.01 risk/share -> 50,000 shares by risk
+
+    decision = rm.evaluate(signal)
+
+    assert decision.sized_qty == 1000  # floor(100_000 * 0.10 / 10), the notional cap
+
+
+def test_addon_lot_risks_less_than_a_first_entry(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, available_funds=100_000)
+    rm = make_risk_manager(
+        tmp_path, snapshot, open_lots=1, risk_per_trade_pct=0.005, addon_risk_pct=0.0025
+    )
+    rm.mark_start_of_day(100_000)
+    signal = make_signal(entry=2.00, stop=1.90)
+
+    decision = rm.evaluate(signal)
+
+    assert decision.sized_qty == 2500  # half the 5,000 a first entry would take
+
+
+def test_risk_budget_uses_start_of_day_equity_not_the_drawn_down_snapshot(tmp_path):
+    # Sizing off live equity would shrink every trade after a loss and
+    # compound the drawdown; the budget stays fixed for the session.
+    # available_funds deliberately generous so the notional cap can't bind
+    # and mask which equity figure the risk budget used.
+    snapshot = default_snapshot(net_liquidation=90_000, available_funds=500_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.005)
+    rm.mark_start_of_day(100_000)
+    signal = make_signal(entry=2.00, stop=1.90)
+
+    decision = rm.evaluate(signal)
+
+    assert decision.sized_qty == 5000  # off 100k start-of-day, not the 90k now
+
+
+def test_sizing_falls_back_to_notional_when_risk_sizing_is_disabled(tmp_path):
+    snapshot = default_snapshot(available_funds=100_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=None)
+    signal = make_signal(entry=10.0, stop=9.0)
+
+    decision = rm.evaluate(signal)
+
+    assert decision.sized_qty == 1000  # unchanged legacy behaviour

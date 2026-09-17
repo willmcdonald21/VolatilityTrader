@@ -106,15 +106,12 @@ class RiskManager:
             # which slot is needed: open_positions_count alone tells us
             # whether we're in reserved territory, since evaluate() is the
             # sole gate an order passes through before this count can grow.
+            # A missing rank means the symbol is not in the scanner's
+            # current top-N at all (main.py clears the rank of any tracked
+            # symbol that drops out of a scan) -- ineligible for a slot
+            # reserved for the day's most obvious names, same as a symbol
+            # ranked below the cutoff.
             scanner_rank = signal.context.get("scanner_rank")
-            if scanner_rank is None:
-                # Every onboarded symbol is expected to carry a scanner_rank
-                # -- this shouldn't happen. Treat it as ineligible for the
-                # reserved slot rather than crashing or silently admitting it.
-                alert(
-                    f"Signal for {signal.symbol} ({signal.strategy}) has no scanner_rank while the "
-                    "reserved top-tier slot logic is evaluating it -- every onboarded symbol should carry one"
-                )
             if scanner_rank is None or scanner_rank > self.config.reserved_top_tier_max_rank:
                 reason = (
                     f"remaining slot reserved for scanner_rank <= {self.config.reserved_top_tier_max_rank} "
@@ -156,12 +153,45 @@ class RiskManager:
             (snapshot.buying_power * self.config.max_position_pct_of_buying_power) / signal.entry_price
         )
 
-        sized_qty = max(0, min(raw_shares, cap_by_pct_of_buying_power))
+        caps = [raw_shares, cap_by_pct_of_buying_power]
+
+        shares_by_risk = self._shares_by_risk_budget(signal, snapshot, open_lots)
+        if shares_by_risk is not None:
+            caps.append(shares_by_risk)
+
+        sized_qty = max(0, min(caps))
 
         if self.config.daily_profit_goal_usd and not self._cushion_met(snapshot):
             sized_qty = math.floor(sized_qty * self.config.cushion_size_fraction)
 
         return sized_qty
+
+    def _shares_by_risk_budget(
+        self, signal: Signal, snapshot: AccountSnapshot, open_lots: int
+    ) -> int | None:
+        """Shares whose worst case (a fill at the stop) costs exactly the
+        configured risk budget. None when risk-based sizing is off.
+
+        Equity is taken from start-of-day rather than the live snapshot so
+        the budget is a fixed dollar amount for the whole session, instead
+        of shrinking with each loss and compounding a drawdown into
+        progressively smaller size."""
+        risk_pct = (
+            self.config.risk_per_trade_pct
+            if open_lots == 0
+            else (self.config.addon_risk_pct or self.config.risk_per_trade_pct)
+        )
+        if risk_pct is None:
+            return None
+        # Quantized to sub-penny tick precision before dividing: entry and
+        # stop are each tick-rounded, but their difference still carries
+        # float residue (2.00 - 1.90 = 0.10000000000000009), which flooring
+        # turns into a silently missing share on otherwise exact numbers.
+        risk_per_share = round(signal.risk_per_share, 4)
+        if risk_per_share <= 0:
+            return None
+        equity = self._start_of_day_equity or snapshot.net_liquidation
+        return math.floor((equity * risk_pct) / risk_per_share)
 
     def _cushion_met(self, snapshot: AccountSnapshot) -> bool:
         """Warrior Trading's 'profit cushion' rule: trade at reduced size

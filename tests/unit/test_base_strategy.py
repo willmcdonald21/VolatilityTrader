@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from tests.unit.fixtures import make_bars
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
@@ -130,3 +130,50 @@ def test_check_engaged_re_engages_once_macd_turns_bullish_again():
     bullish_ctx = _make_ctx_with_macd_trend(rising=True)
     bullish_ctx.symbol = "TEST"
     assert strategy._check_engaged(bullish_ctx) is True
+
+
+def test_triggered_symbol_stays_blocked_without_a_rejection():
+    # An accepted signal still uses up this strategy's one shot at the
+    # symbol for the day -- that discipline is unchanged.
+    strategy = make_strategy()
+    ctx = SymbolContext(symbol="TEST")
+    now = datetime.now(timezone.utc)
+    strategy.state_for("TEST")["triggered"] = True
+
+    assert strategy.already_triggered(ctx, now) is True
+    assert strategy.already_triggered(ctx, now + timedelta(hours=4)) is True
+
+
+def test_rejected_symbol_becomes_eligible_again_after_cooldown():
+    strategy = make_strategy()
+    ctx = SymbolContext(symbol="TEST")
+    now = datetime.now(timezone.utc)
+    strategy.state_for("TEST")["triggered"] = True
+
+    strategy.rearm_after_rejection("TEST", now, cooldown_seconds=300)
+
+    assert strategy.already_triggered(ctx, now + timedelta(seconds=299)) is True
+    assert strategy.already_triggered(ctx, now + timedelta(seconds=301)) is False
+
+
+def test_rearm_clears_state_so_a_later_accepted_signal_blocks_again():
+    strategy = make_strategy()
+    ctx = SymbolContext(symbol="TEST")
+    now = datetime.now(timezone.utc)
+    strategy.state_for("TEST")["triggered"] = True
+    strategy.rearm_after_rejection("TEST", now, cooldown_seconds=60)
+
+    assert strategy.already_triggered(ctx, now + timedelta(seconds=61)) is False
+
+    # The re-armed symbol signals again and is accepted this time.
+    strategy.state_for("TEST")["triggered"] = True
+    assert strategy.already_triggered(ctx, now + timedelta(hours=1)) is True
+
+
+def test_rearm_is_a_noop_for_a_symbol_that_never_triggered():
+    strategy = make_strategy()
+    now = datetime.now(timezone.utc)
+
+    strategy.rearm_after_rejection("TEST", now, cooldown_seconds=300)
+
+    assert "rearm_at" not in strategy.state_for("TEST")
