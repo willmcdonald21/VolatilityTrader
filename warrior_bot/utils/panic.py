@@ -30,7 +30,11 @@ def flatten_position(ib: IB, position, channel: str = "kill_switch") -> None:
         return
     action = "SELL" if position.position > 0 else "BUY"
     qty = abs(position.position)
-    order = MarketOrder(action, qty)
+    # Plain MarketOrder defaults to regular-trading-hours-only; this bot
+    # trades and needs to flatten mostly pre/post market, so without this
+    # the order silently never fills and the reconciliation watchdog
+    # re-fires on the same unresolved position every check interval.
+    order = MarketOrder(action, qty, outsideRth=True, tif="DAY")
     # ib.positions() reports each position's actual trading exchange
     # (e.g. NASDAQ) rather than SMART -- routing a market order
     # directly to it triggers IBKR's precautionary direct-routing
