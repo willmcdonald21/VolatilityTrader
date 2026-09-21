@@ -35,7 +35,7 @@ risk:
   rejected_signal_cooldown_seconds: 300  # a signal REJECTED for capacity makes its symbol eligible again after this long,
                                          # instead of burning that strategy's one daily shot at the symbol (96 setups were
                                          # silently discarded this way on 2026-09-14). An ACCEPTED entry still uses up the shot.
-  no_entry_before_et: "04:15"       # no new entries before this ET time -- 09-21 fired 11 signals in the first second of the 04:00 open
+  no_entry_before_et: "06:30"       # no new entries before this ET time -- 09-21 fired 11 signals in the first second of the 04:00 open; 06:30 waits for real premarket volume
   addon_min_seconds_after_first_entry: 120  # the pyramid add-on must come at least this long after the first lot
   count_unrealized_loss_in_daily_limit: true  # daily loss limit = realized + open positions' unrealized loss
   entry_fill_timeout_seconds: 300  # cancel an entry order still unfilled this long after submission -- these are DAY limit
