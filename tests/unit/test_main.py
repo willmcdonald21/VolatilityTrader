@@ -624,6 +624,7 @@ class _FakeOrder:
         self.action = action
         self.orderType = orderType
         self.totalQuantity = totalQuantity
+        self.orderRef = ""
 
 
 class _FakeTrade:

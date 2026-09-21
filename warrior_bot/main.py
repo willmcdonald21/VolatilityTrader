@@ -298,7 +298,9 @@ class WarriorBot:
     def _trigger_flatten(self, reason: str) -> None:
         self.logger.warning("Flattening all positions: reason=%s", reason)
         alert(f"Flattening all positions and stopping for the day: reason={reason}", channel="limits")
-        panic_stop(self.ib, flatten=True, channel="limits")
+        panic_stop(
+            self.ib, flatten=True, channel="limits", limit_offset_pct=self.config.execution.flatten_limit_offset_pct
+        )
         self.position_manager.clear()
         self.journal.record_kill_switch_event(triggered_by=reason, action_taken="cancel_all+flatten_all")
         self._flattened_today = True
@@ -370,6 +372,17 @@ class WarriorBot:
                 )
 
     def _emergency_flatten_symbol(self, symbol: str, position, reason: str, covered_qty: float) -> None:
+        placed = flatten_position(
+            self.ib,
+            position,
+            channel="limits",
+            limit_offset_pct=self.config.execution.flatten_limit_offset_pct,
+        )
+        if not placed:
+            # A flatten for this symbol is already working -- nothing new to
+            # alert on or journal, and re-alerting every check interval just
+            # buries the real signal.
+            return
         self.logger.error(
             "Reconciliation: %s has %s shares with only %.0f covered by a resting stop -- flattening immediately "
             "(reason=%s)",
@@ -383,10 +396,9 @@ class WarriorBot:
             f"protective stop -- flattening immediately (reason={reason})",
             channel="limits",
         )
-        flatten_position(self.ib, position, channel="limits")
         self.position_manager.drop_symbol(symbol)
         self.journal.record_kill_switch_event(
-            triggered_by=f"reconciliation:{symbol}:{reason}", action_taken="market_flatten_symbol"
+            triggered_by=f"reconciliation:{symbol}:{reason}", action_taken="flatten_symbol"
         )
 
     def _ensure_subscription_capacity(self, incoming_symbol: str) -> bool:
@@ -654,7 +666,7 @@ class WarriorBot:
     ) -> None:
         self._clamp_stop_to_conservative_max(signal)
         signal_id = self.journal.record_signal(signal)
-        decision = self.risk_manager.evaluate(signal)
+        decision = self.risk_manager.evaluate(signal, now=now)
         self.journal.record_risk_decision(signal_id, decision)
         if not decision.accepted:
             self.journal.record_rejection(signal, decision.reason)

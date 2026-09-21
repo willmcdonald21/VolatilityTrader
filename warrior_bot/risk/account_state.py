@@ -14,6 +14,11 @@ class AccountSnapshot:
     buying_power: float
     open_positions_count: int
     daily_realized_pnl: float
+    # Symbols IBKR reports a nonzero position in, and the summed unrealized
+    # P&L of those positions. Defaulted so callers that only care about the
+    # original five fields keep working.
+    open_symbols: frozenset = frozenset()
+    daily_unrealized_pnl: float = 0.0
 
 
 class AccountState:
@@ -103,6 +108,16 @@ class AccountState:
 
         return realized
 
+    def unrealized_pnl(self) -> float:
+        total = 0.0
+        for item in self.ib.portfolio(self.account):
+            if item.position == 0:
+                continue
+            pnl = item.unrealizedPNL
+            if pnl is not None and pnl == pnl and abs(pnl) < UNSET_DOUBLE / 2:  # pnl == pnl: not NaN
+                total += pnl
+        return total
+
     def snapshot(self) -> AccountSnapshot:
         return AccountSnapshot(
             net_liquidation=self._account_value("NetLiquidation"),
@@ -110,4 +125,6 @@ class AccountState:
             buying_power=self._account_value("BuyingPower"),
             open_positions_count=len([p for p in self.ib.positions(self.account) if p.position != 0]),
             daily_realized_pnl=self.daily_realized_pnl(),
+            open_symbols=frozenset(p.contract.symbol for p in self.ib.positions(self.account) if p.position != 0),
+            daily_unrealized_pnl=self.unrealized_pnl(),
         )

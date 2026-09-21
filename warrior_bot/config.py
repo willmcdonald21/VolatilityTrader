@@ -44,6 +44,11 @@ class ExecutionConfig(BaseModel):
     # % beyond the stop trigger, capping worst-case slippage the same way
     # the source material's "ask+10c/bid-10c" marketable-limit pattern does.
     stop_limit_offset_pct: float = Field(default=0.5, ge=0)
+    # Emergency flattens outside regular hours use a marketable LIMIT this %
+    # through the last price, because IBKR ignores outsideRth on market
+    # orders and simply queues them until 09:30 (2026-09-21: the daily-loss
+    # flatten at 04:18 ET didn't execute until the open).
+    flatten_limit_offset_pct: float = Field(default=5.0, gt=0)
 
 
 class RiskConfig(BaseModel):
@@ -124,6 +129,19 @@ class RiskConfig(BaseModel):
     # the stop computed from the 04:30 structure. Shares already filled keep
     # their stop; only the still-working remainder is cancelled.
     entry_fill_timeout_seconds: float = Field(default=300.0, gt=0)
+    # No new entries before this ET time. 2026-09-21: 11 signals fired within
+    # one second of the 04:00 ET open, on a first bar with almost no volume
+    # or VWAP history behind it, and 7 symbols were bought at the opening
+    # prints; the loss limit was breached within 18 minutes.
+    no_entry_before_et: time = time(4, 15)
+    # A second lot (the pyramid add-on) is only allowed this long after the
+    # symbol's first lot was submitted. An add-on is supposed to confirm
+    # strength; two strategies firing in the same second confirms nothing.
+    addon_min_seconds_after_first_entry: float = Field(default=120.0, ge=0)
+    # Count open positions' unrealized LOSS toward the daily loss limit, not
+    # just realized P&L. Realized-only let three positions sit unprotected
+    # and keep bleeding well past the limit on 2026-09-21.
+    count_unrealized_loss_in_daily_limit: bool = True
 
     @model_validator(mode="after")
     def _guard_reserved_slots(self) -> "RiskConfig":

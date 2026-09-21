@@ -22,14 +22,19 @@ def make_fill(symbol, side, shares, price, commission=0.0, minutes_ago=0, realiz
 
 
 class FakeIB:
-    def __init__(self, fills):
+    def __init__(self, fills, portfolio=None, positions=None):
         self._fills = fills
+        self._portfolio = portfolio or []
+        self._positions = positions or []
+
+    def portfolio(self, account=""):
+        return self._portfolio
 
     def fills(self):
         return self._fills
 
     def positions(self, account=""):
-        return []
+        return self._positions
 
     def accountValues(self, account=""):
         return []
@@ -135,3 +140,25 @@ def test_realized_pnl_counts_only_the_matched_portion_of_an_oversized_sell():
     )
 
     assert state.daily_realized_pnl() == pytest.approx(-50.0)
+
+
+def _item(symbol, position, unrealized):
+    return SimpleNamespace(contract=SimpleNamespace(symbol=symbol), position=position, unrealizedPNL=unrealized)
+
+
+def test_unrealized_pnl_sums_open_positions_and_ignores_nan_and_flat():
+    ib = FakeIB([], portfolio=[_item("A", 100, -250.0), _item("B", 50, 40.0), _item("C", 10, float("nan")), _item("D", 0, -999.0)])
+
+    assert AccountState(ib).unrealized_pnl() == -210.0
+
+
+def test_snapshot_exposes_open_symbols_and_unrealized():
+    pos = SimpleNamespace(contract=SimpleNamespace(symbol="GTEC"), position=2546.0)
+    flat = SimpleNamespace(contract=SimpleNamespace(symbol="OLD"), position=0.0)
+    ib = FakeIB([], portfolio=[_item("GTEC", 2546, -300.0)], positions=[pos, flat])
+
+    snap = AccountState(ib).snapshot()
+
+    assert snap.open_symbols == frozenset({"GTEC"})
+    assert snap.daily_unrealized_pnl == -300.0
+    assert snap.open_positions_count == 1

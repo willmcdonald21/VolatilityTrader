@@ -106,6 +106,14 @@ class PositionManager:
     def open_lot_count(self, symbol: str) -> int:
         return len(self._positions.get(symbol, []))
 
+    def seconds_since_first_entry(self, symbol: str) -> float | None:
+        """Age of the symbol's oldest tracked lot, None if none is tracked."""
+        lots = self._positions.get(symbol)
+        if not lots:
+            return None
+        oldest = min(lot.submitted_at for lot in lots)
+        return (datetime.now(timezone.utc) - oldest).total_seconds()
+
     def tracked_symbols(self) -> set[str]:
         return set(self._positions.keys())
 

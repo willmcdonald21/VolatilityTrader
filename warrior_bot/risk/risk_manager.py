@@ -3,12 +3,14 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from warrior_bot.config import RiskConfig
 from warrior_bot.logging_setup import alert
 from warrior_bot.risk.account_state import AccountSnapshot, AccountState
 from warrior_bot.signals.signal import Signal
+from warrior_bot.utils.time_utils import to_eastern
 
 if TYPE_CHECKING:
     # Deferred to a type-checking-only import: warrior_bot.persistence.journal
@@ -69,12 +71,29 @@ class RiskManager:
         if self._start_of_day_equity is None:
             return False
         loss_limit = self._start_of_day_equity * self.config.daily_loss_limit_pct
-        return snapshot.daily_realized_pnl <= -loss_limit
+        return self._daily_pnl_for_limit(snapshot) <= -loss_limit
+
+    def _daily_pnl_for_limit(self, snapshot: AccountSnapshot) -> float:
+        """Realized P&L plus the open positions' unrealized LOSS (gains that
+        haven't been banked don't offset it). Realized-only let positions
+        bleed unchecked past the limit on 2026-09-21."""
+        pnl = snapshot.daily_realized_pnl
+        if self.config.count_unrealized_loss_in_daily_limit:
+            pnl += min(0.0, snapshot.daily_unrealized_pnl)
+        return pnl
 
     def should_flatten_for_loss_limit(self, snapshot: AccountSnapshot) -> bool:
         return self.config.flatten_on_daily_loss_limit and self._loss_limit_breached(snapshot)
 
-    def evaluate(self, signal: Signal) -> RiskDecision:
+    def _open_position_count(self, snapshot: AccountSnapshot) -> int:
+        """Symbols IBKR shows as held UNION symbols with a bracket already
+        submitted. The broker's count alone lags every fill, so signals
+        evaluated in the same second all saw zero open positions and 7
+        symbols were bought against a cap of 5 on 2026-09-21."""
+        pending = self.position_manager.tracked_symbols()
+        return max(snapshot.open_positions_count, len(snapshot.open_symbols | pending))
+
+    def evaluate(self, signal: Signal, now: datetime | None = None) -> RiskDecision:
         snapshot = self.account_state.snapshot()
 
         if self._start_of_day_equity is None:
@@ -88,19 +107,27 @@ class RiskManager:
         if self._loss_limit_breached(snapshot):
             loss_limit = self._start_of_day_equity * self.config.daily_loss_limit_pct
             reason = (
-                f"daily loss limit breached: realized {snapshot.daily_realized_pnl:.2f} "
+                f"daily loss limit breached: realized {self._daily_pnl_for_limit(snapshot):.2f} "
                 f"<= -{loss_limit:.2f}"
             )
             alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}", channel="limits")
             return RiskDecision(False, 0, reason, snapshot)
 
-        if snapshot.open_positions_count >= self.config.max_concurrent_positions:
-            reason = f"max concurrent positions reached ({snapshot.open_positions_count})"
+        # Only applied when the caller supplies a clock reading -- never
+        # guessed from wall-clock time, so evaluate() stays deterministic.
+        if now is not None and to_eastern(now).time() < self.config.no_entry_before_et:
+            reason = f"entry window not open until {self.config.no_entry_before_et.strftime('%H:%M')} ET"
+            alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
+            return RiskDecision(False, 0, reason, snapshot)
+
+        open_count = self._open_position_count(snapshot)
+        if open_count >= self.config.max_concurrent_positions:
+            reason = f"max concurrent positions reached ({open_count})"
             alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
             return RiskDecision(False, 0, reason, snapshot)
 
         unrestricted_capacity = self.config.max_concurrent_positions - self.config.reserved_top_tier_slots
-        if snapshot.open_positions_count >= unrestricted_capacity:
+        if open_count >= unrestricted_capacity:
             # Every unrestricted slot is taken -- only the reserved top-tier
             # slot(s) remain. No separate bookkeeping of which symbols used
             # which slot is needed: open_positions_count alone tells us
@@ -115,7 +142,7 @@ class RiskManager:
             if scanner_rank is None or scanner_rank > self.config.reserved_top_tier_max_rank:
                 reason = (
                     f"remaining slot reserved for scanner_rank <= {self.config.reserved_top_tier_max_rank} "
-                    f"(open positions: {snapshot.open_positions_count})"
+                    f"(open positions: {open_count})"
                 )
                 alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
                 return RiskDecision(False, 0, reason, snapshot)
@@ -125,6 +152,16 @@ class RiskManager:
             reason = f"already at max lots (2) for {signal.symbol}"
             alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
             return RiskDecision(False, 0, reason, snapshot)
+
+        if open_lots >= 1:
+            age = self.position_manager.seconds_since_first_entry(signal.symbol)
+            if age is not None and age < self.config.addon_min_seconds_after_first_entry:
+                reason = (
+                    f"add-on for {signal.symbol} too soon after first entry "
+                    f"({age:.0f}s < {self.config.addon_min_seconds_after_first_entry:.0f}s)"
+                )
+                alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
+                return RiskDecision(False, 0, reason, snapshot)
 
         sized_qty = self._size_position(signal, snapshot, open_lots)
         if sized_qty < 1:

@@ -9,6 +9,7 @@ trading:
   use_rth: false                 # false = include pre-market/after-hours bars (needed for gap scanning)
 
 execution:
+  flatten_limit_offset_pct: 5.0  # outside RTH, emergency flattens are marketable limits this % through the last price (market orders just queue until 09:30)
   stop_limit_offset_pct: 0.5     # stop-loss is a stop-limit order; limit sits this % beyond the trigger (IBKR rejects plain market/stop orders outside RTH)
 
 risk:
@@ -34,6 +35,9 @@ risk:
   rejected_signal_cooldown_seconds: 300  # a signal REJECTED for capacity makes its symbol eligible again after this long,
                                          # instead of burning that strategy's one daily shot at the symbol (96 setups were
                                          # silently discarded this way on 2026-09-14). An ACCEPTED entry still uses up the shot.
+  no_entry_before_et: "04:15"       # no new entries before this ET time -- 09-21 fired 11 signals in the first second of the 04:00 open
+  addon_min_seconds_after_first_entry: 120  # the pyramid add-on must come at least this long after the first lot
+  count_unrealized_loss_in_daily_limit: true  # daily loss limit = realized + open positions' unrealized loss
   entry_fill_timeout_seconds: 300  # cancel an entry order still unfilled this long after submission -- these are DAY limit
                                    # orders, so without it they rest until 15:55 and can fill hours after the setup is dead
                                    # (RLGT filled 3h56m late on 2026-09-15). Filled shares keep their stop; only the rest is pulled.

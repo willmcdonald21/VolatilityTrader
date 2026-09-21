@@ -22,11 +22,19 @@ class FakePositionManager:
     """Stands in for PositionManager.open_lot_count -- the number of
     already-open lots RiskManager should treat this symbol as holding."""
 
-    def __init__(self, open_lots: int = 0):
+    def __init__(self, open_lots: int = 0, tracked: set | None = None, first_entry_age: float | None = None):
         self._open_lots = open_lots
+        self._tracked = tracked or set()
+        self._first_entry_age = first_entry_age
 
     def open_lot_count(self, symbol: str) -> int:
         return self._open_lots
+
+    def tracked_symbols(self) -> set:
+        return set(self._tracked)
+
+    def seconds_since_first_entry(self, symbol: str):
+        return self._first_entry_age
 
 
 def make_signal(entry=10.0, stop=9.0, target=12.0, context=None) -> Signal:
@@ -432,3 +440,98 @@ def test_sizing_falls_back_to_notional_when_risk_sizing_is_disabled(tmp_path):
     decision = rm.evaluate(signal)
 
     assert decision.sized_qty == 1000  # unchanged legacy behaviour
+
+
+# -- 2026-09-21 regressions --------------------------------------------------
+
+
+def test_pending_brackets_count_toward_position_cap_before_any_fill(tmp_path):
+    # Broker still reports zero positions (nothing has filled yet), but three
+    # brackets were already submitted in the same second -- the cap is 3.
+    snapshot = default_snapshot(open_positions_count=0)
+    rm = make_risk_manager(tmp_path, snapshot, max_concurrent_positions=3)
+    rm.position_manager = FakePositionManager(tracked={"AAA", "BBB", "CCC"})
+
+    decision = rm.evaluate(make_signal())
+
+    assert not decision.accepted
+    assert "max concurrent positions" in decision.reason
+
+
+def test_held_and_pending_symbols_are_deduplicated_in_the_cap(tmp_path):
+    snapshot = default_snapshot(open_positions_count=1)
+    snapshot.open_symbols = frozenset({"AAA"})
+    rm = make_risk_manager(tmp_path, snapshot, max_concurrent_positions=3)
+    rm.position_manager = FakePositionManager(tracked={"AAA", "BBB"})  # AAA counted once -> 2 open
+
+    assert rm.evaluate(make_signal()).accepted
+
+
+def test_unrealized_loss_counts_toward_daily_limit(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=-500)
+    snapshot.daily_unrealized_pnl = -1800  # -2300 total against a 2000 limit
+    rm = make_risk_manager(tmp_path, snapshot, daily_loss_limit_pct=0.02)
+
+    decision = rm.evaluate(make_signal())
+
+    assert not decision.accepted
+    assert "daily loss limit" in decision.reason
+    assert rm.should_flatten_for_loss_limit(snapshot) is False  # flag off in this config; limit itself is breached
+    assert rm._loss_limit_breached(snapshot)
+
+
+def test_unrealized_gain_does_not_offset_realized_loss(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=-2500)
+    snapshot.daily_unrealized_pnl = 5000
+    rm = make_risk_manager(tmp_path, snapshot, daily_loss_limit_pct=0.02)
+
+    assert not rm.evaluate(make_signal()).accepted
+
+
+def test_unrealized_loss_ignored_when_disabled(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=0.0)
+    snapshot.daily_unrealized_pnl = -5000
+    rm = make_risk_manager(tmp_path, snapshot, daily_loss_limit_pct=0.02)
+    rm.config.count_unrealized_loss_in_daily_limit = False
+
+    assert rm.evaluate(make_signal()).accepted
+
+
+def test_entry_rejected_before_window_opens(tmp_path):
+    rm = make_risk_manager(tmp_path, default_snapshot())
+    at_0400 = datetime(2026, 9, 21, 8, 0, 6, tzinfo=timezone.utc)  # 04:00:06 ET
+
+    decision = rm.evaluate(make_signal(), now=at_0400)
+
+    assert not decision.accepted
+    assert "entry window not open until 04:15" in decision.reason
+
+
+def test_entry_allowed_once_window_opens(tmp_path):
+    rm = make_risk_manager(tmp_path, default_snapshot())
+    at_0416 = datetime(2026, 9, 21, 8, 16, 0, tzinfo=timezone.utc)  # 04:16 ET
+
+    assert rm.evaluate(make_signal(), now=at_0416).accepted
+
+
+def test_no_clock_means_no_window_gate(tmp_path):
+    rm = make_risk_manager(tmp_path, default_snapshot())
+
+    assert rm.evaluate(make_signal()).accepted  # now omitted -> never guessed from wall-clock
+
+
+def test_addon_rejected_when_first_lot_is_too_fresh(tmp_path):
+    rm = make_risk_manager(tmp_path, default_snapshot(), open_lots=1)
+    rm.position_manager = FakePositionManager(open_lots=1, first_entry_age=3.0)
+
+    decision = rm.evaluate(make_signal())
+
+    assert not decision.accepted
+    assert "too soon after first entry" in decision.reason
+
+
+def test_addon_allowed_after_minimum_gap(tmp_path):
+    rm = make_risk_manager(tmp_path, default_snapshot(), open_lots=1)
+    rm.position_manager = FakePositionManager(open_lots=1, first_entry_age=300.0)
+
+    assert rm.evaluate(make_signal()).accepted
