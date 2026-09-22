@@ -71,7 +71,11 @@ class WarriorBot:
             self.ib, self.journal, config.exits, stop_limit_offset_pct=config.execution.stop_limit_offset_pct
         )
         self.risk_manager = RiskManager(
-            config.risk, self.account_state, self.position_manager, config.resolve_path(config.kill_switch.flag_file)
+            config.risk,
+            self.account_state,
+            self.position_manager,
+            config.resolve_path(config.kill_switch.flag_file),
+            no_entry_after_et=config.exits.eod_flatten_time,
         )
         self.order_manager = OrderManager(
             self.ib,
@@ -103,13 +107,22 @@ class WarriorBot:
         self._risk_task: asyncio.Task | None = None
         self._watchdog_task: asyncio.Task | None = None
         self._reconciliation_task: asyncio.Task | None = None
-        self._flattened_today = False
+        # Tracked separately, not as one shared flag: a daily-loss-limit
+        # flatten firing earlier in the day must never suppress the 15:55
+        # EOD sweep later that same day. A single _flattened_today flag did
+        # exactly that -- should_flatten_for_loss_limit re-derives from live
+        # P&L on every check (not a one-way latch), so realized P&L can
+        # recover, new entries resume, and anything opened after the early
+        # loss-limit flatten had nothing left to close it if the EOD sweep
+        # believed the day was already handled.
+        self._eod_flatten_fired = False
+        self._loss_limit_flatten_fired = False
         self._news_provider_codes = config.news.provider_codes
         self._last_logged_breadth: int | None = None
         # ET calendar date this process last reset daily state for. This is
         # what makes EOD flatten (and everything else in reset_daily_state)
         # keep working every day for a long-running process -- without it,
-        # _flattened_today only ever gets cleared once, in __init__, so a
+        # the flags above only ever get cleared once, in __init__, so a
         # process that stays up past midnight silently stops flattening
         # forever after its first day (see _check_new_trading_day).
         self._trading_day: date | None = None
@@ -285,15 +298,17 @@ class WarriorBot:
         self._trading_day = now_et_date
 
     def _check_flatten_triggers(self) -> None:
-        if self._flattened_today:
-            return
         now_et = to_eastern(datetime.now(timezone.utc))
-        if now_et.time() >= self.config.exits.eod_flatten_time:
+        if not self._eod_flatten_fired and now_et.time() >= self.config.exits.eod_flatten_time:
             self._trigger_flatten("eod_flatten")
+            self._eod_flatten_fired = True
+            return
+        if self._loss_limit_flatten_fired:
             return
         snapshot = self.account_state.snapshot()
         if self.risk_manager.should_flatten_for_loss_limit(snapshot):
             self._trigger_flatten("daily_loss_limit")
+            self._loss_limit_flatten_fired = True
 
     def _trigger_flatten(self, reason: str) -> None:
         self.logger.warning("Flattening all positions: reason=%s", reason)
@@ -303,7 +318,6 @@ class WarriorBot:
         )
         self.position_manager.clear()
         self.journal.record_kill_switch_event(triggered_by=reason, action_taken="cancel_all+flatten_all")
-        self._flattened_today = True
 
     async def _position_reconciliation_loop(self) -> None:
         cfg = self.config.position_reconciliation
@@ -734,7 +748,8 @@ class WarriorBot:
         snapshot = self.account_state.snapshot()
         self.risk_manager.mark_start_of_day(snapshot.net_liquidation)
         self.position_manager.clear()
-        self._flattened_today = False
+        self._eod_flatten_fired = False
+        self._loss_limit_flatten_fired = False
         self._last_logged_breadth = None
         self.logger.info("Daily state reset. Start-of-day equity=%.2f", snapshot.net_liquidation)
 

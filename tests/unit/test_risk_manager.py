@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
 
 import pytest
 
@@ -68,7 +68,13 @@ def make_risk_manager(tmp_path, snapshot, open_lots: int = 0, **risk_overrides) 
     )
     account_state = FakeAccountState(snapshot)
     position_manager = FakePositionManager(open_lots)
-    return RiskManager(config, account_state, position_manager, kill_switch_path=tmp_path / "KILL_SWITCH")
+    return RiskManager(
+        config,
+        account_state,
+        position_manager,
+        kill_switch_path=tmp_path / "KILL_SWITCH",
+        no_entry_after_et=risk_overrides.get("no_entry_after_et"),
+    )
 
 
 def default_snapshot(**overrides) -> AccountSnapshot:
@@ -518,6 +524,34 @@ def test_no_clock_means_no_window_gate(tmp_path):
     rm = make_risk_manager(tmp_path, default_snapshot())
 
     assert rm.evaluate(make_signal()).accepted  # now omitted -> never guessed from wall-clock
+
+
+def test_entry_rejected_at_or_after_eod_flatten_cutoff(tmp_path):
+    # Confirmed live, 2026-09-21: AUUD signalled at 16:49 ET, an hour past
+    # the 15:55 EOD flatten cutoff, filled, and had nothing left to close
+    # it that day -- it sat open through the midnight reset into the next
+    # morning's premarket.
+    rm = make_risk_manager(tmp_path, default_snapshot(), no_entry_after_et=time(15, 55))
+    at_1649 = datetime(2026, 9, 21, 20, 49, 0, tzinfo=timezone.utc)  # 16:49 ET
+
+    decision = rm.evaluate(make_signal(), now=at_1649)
+
+    assert not decision.accepted
+    assert "entry window closed at 15:55" in decision.reason
+
+
+def test_entry_allowed_right_up_to_the_eod_cutoff(tmp_path):
+    rm = make_risk_manager(tmp_path, default_snapshot(), no_entry_after_et=time(15, 55))
+    at_1554 = datetime(2026, 9, 21, 19, 54, 0, tzinfo=timezone.utc)  # 15:54 ET
+
+    assert rm.evaluate(make_signal(), now=at_1554).accepted
+
+
+def test_no_eod_cutoff_configured_means_no_upper_gate(tmp_path):
+    rm = make_risk_manager(tmp_path, default_snapshot())  # no_entry_after_et defaults to None
+    at_2000 = datetime(2026, 9, 22, 0, 0, 0, tzinfo=timezone.utc)  # 20:00 ET
+
+    assert rm.evaluate(make_signal(), now=at_2000).accepted
 
 
 def test_addon_rejected_when_first_lot_is_too_fresh(tmp_path):

@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, time
 from typing import TYPE_CHECKING
 
 from warrior_bot.config import RiskConfig
@@ -43,11 +43,20 @@ class RiskManager:
         account_state: AccountState,
         position_manager: PositionManager,
         kill_switch_path: Path,
+        no_entry_after_et: time | None = None,
     ):
         self.config = config
         self.account_state = account_state
         self.position_manager = position_manager
         self.kill_switch_path = kill_switch_path
+        # Sourced from exits.eod_flatten_time by the caller (main.py) rather
+        # than duplicated onto RiskConfig -- one clock governs both "stop
+        # opening new positions" and "force-close whatever's open", so they
+        # can't drift apart. None (the default, used by callers/tests that
+        # don't pass one) disables the gate entirely, matching
+        # no_entry_before_et's existing "no now supplied -> permissive"
+        # behavior below.
+        self.no_entry_after_et = no_entry_after_et
         self._manual_kill_switch = False
         self._start_of_day_equity: float | None = None
 
@@ -117,6 +126,22 @@ class RiskManager:
         # guessed from wall-clock time, so evaluate() stays deterministic.
         if now is not None and to_eastern(now).time() < self.config.no_entry_before_et:
             reason = f"entry window not open until {self.config.no_entry_before_et.strftime('%H:%M')} ET"
+            alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
+            return RiskDecision(False, 0, reason, snapshot)
+
+        # A position opened after the EOD flatten cutoff has nothing left
+        # to close it that day: _trigger_flatten's 15:55 sweep only fires
+        # once and has already run (or is about to, this very tick) by the
+        # time an entry this late could fill. Confirmed live, 2026-09-21:
+        # AUUD signalled at 16:49 ET -- an hour past the 15:55 cutoff --
+        # filled, and sat open through the midnight daily reset and into
+        # the next morning's premarket before anything flattened it.
+        if (
+            now is not None
+            and self.no_entry_after_et is not None
+            and to_eastern(now).time() >= self.no_entry_after_et
+        ):
+            reason = f"entry window closed at {self.no_entry_after_et.strftime('%H:%M')} ET (EOD flatten cutoff)"
             alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
             return RiskDecision(False, 0, reason, snapshot)
 

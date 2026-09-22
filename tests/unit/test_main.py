@@ -178,22 +178,26 @@ def test_check_new_trading_day_noop_on_same_day(tmp_path):
     bot = WarriorBot(make_config(tmp_path))
     bot.account_state.snapshot = lambda: _fake_snapshot()
     bot._trading_day = _today_et()
-    bot._flattened_today = True
+    bot._eod_flatten_fired = True
+    bot._loss_limit_flatten_fired = True
 
     bot._check_new_trading_day()
 
-    assert bot._flattened_today is True  # unchanged -- still the same trading day
+    assert bot._eod_flatten_fired is True  # unchanged -- still the same trading day
+    assert bot._loss_limit_flatten_fired is True
 
 
-def test_check_new_trading_day_resets_flattened_today_flag(tmp_path):
+def test_check_new_trading_day_resets_flatten_flags(tmp_path):
     bot = WarriorBot(make_config(tmp_path))
     bot.account_state.snapshot = lambda: _fake_snapshot()
     bot._trading_day = _yesterday_et()
-    bot._flattened_today = True  # simulates yesterday's EOD flatten having already fired
+    bot._eod_flatten_fired = True  # simulates yesterday's EOD flatten having already fired
+    bot._loss_limit_flatten_fired = True
 
     bot._check_new_trading_day()
 
-    assert bot._flattened_today is False  # today's own EOD flatten can fire again
+    assert bot._eod_flatten_fired is False  # today's own EOD flatten can fire again
+    assert bot._loss_limit_flatten_fired is False
     assert bot._trading_day == _today_et()
 
 
@@ -767,3 +771,42 @@ def test_symbols_dropping_out_of_the_scan_lose_their_rank(tmp_path):
 
     assert bot.contexts["AAA"].scanner_rank == 1
     assert bot.contexts["BBB"].scanner_rank is None
+
+
+def test_loss_limit_flatten_does_not_suppress_later_eod_sweep(tmp_path, monkeypatch):
+    # Confirmed live, 2026-09-21: a single shared _flattened_today flag let
+    # an early daily-loss-limit flatten permanently block the 15:55 EOD
+    # sweep for the rest of that day. should_flatten_for_loss_limit
+    # re-derives from live P&L on every check rather than latching, so
+    # realized P&L can recover and new entries resume after the early
+    # flatten -- anything opened in that gap had nothing left to close it.
+    triggered = []
+    monkeypatch.setattr("warrior_bot.main.panic_stop", lambda *a, **k: triggered.append("flatten"))
+    bot = WarriorBot(make_config(tmp_path))
+    bot.risk_manager.should_flatten_for_loss_limit = lambda snapshot: False
+    bot.account_state.snapshot = lambda: _fake_snapshot()
+
+    # An early loss-limit flatten fires mid-morning.
+    bot.risk_manager.should_flatten_for_loss_limit = lambda snapshot: True
+    bot._check_flatten_triggers()
+    assert bot._loss_limit_flatten_fired is True
+    assert bot._eod_flatten_fired is False
+    assert len(triggered) == 1
+
+    # P&L recovers; no further loss-limit trigger, no EOD time yet -- a
+    # quiet tick should do nothing.
+    bot.risk_manager.should_flatten_for_loss_limit = lambda snapshot: False
+    bot._check_flatten_triggers()
+    assert len(triggered) == 1
+
+    # 15:55 ET arrives -- the EOD sweep must still fire, even though a
+    # flatten already ran once today for a different reason.
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 21, 19, 56, 0, tzinfo=timezone.utc)  # 15:56 ET
+
+    monkeypatch.setattr("warrior_bot.main.datetime", _FrozenDatetime)
+    bot._check_flatten_triggers()
+    assert bot._eod_flatten_fired is True
+    assert len(triggered) == 2
