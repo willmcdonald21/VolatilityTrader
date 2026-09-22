@@ -142,6 +142,16 @@ class RiskConfig(BaseModel):
     # just realized P&L. Realized-only let three positions sit unprotected
     # and keep bleeding well past the limit on 2026-09-21.
     count_unrealized_loss_in_daily_limit: bool = True
+    # A symbol already held by a DIFFERENT strategy is, by default, off
+    # limits to a new signal -- two independent strategies firing on the
+    # same name within minutes builds two uncoordinated brackets (separate
+    # entry/stop/target, doubled real exposure, neither aware of the
+    # other). Confirmed across the journal: this pattern wins 10% of the
+    # time; 2026-09-22 alone had 7 instances totaling -$578.62, over half
+    # that day's loss. A same-strategy add-on (the intentional pyramid,
+    # still gated by addon_min_seconds_after_first_entry below) is
+    # unaffected either way.
+    allow_cross_strategy_stacking: bool = False
 
     @model_validator(mode="after")
     def _guard_reserved_slots(self) -> "RiskConfig":

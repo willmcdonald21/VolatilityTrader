@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -11,6 +12,8 @@ from warrior_bot.logging_setup import alert
 from warrior_bot.risk.account_state import AccountSnapshot, AccountState
 from warrior_bot.signals.signal import Signal
 from warrior_bot.utils.time_utils import to_eastern
+
+logger = logging.getLogger("warrior_bot.risk.risk_manager")
 
 if TYPE_CHECKING:
     # Deferred to a type-checking-only import: warrior_bot.persistence.journal
@@ -59,6 +62,19 @@ class RiskManager:
         self.no_entry_after_et = no_entry_after_et
         self._manual_kill_switch = False
         self._start_of_day_equity: float | None = None
+        # Latched, not re-derived: once the daily loss limit is breached
+        # once, evaluate() below refuses every signal for the rest of the
+        # trading day, however P&L moves afterward. Before this, the
+        # breach check re-ran fresh on every signal -- daily_realized_pnl
+        # and the open-position unrealized loss both move continuously, so
+        # a partial recovery (a stop-out closing, a winner offsetting)
+        # silently reopened the door to new entries on a day already
+        # flagged as bad. Confirmed live, 2026-09-22: the limit was
+        # breached and flattened three separate times in one session
+        # (04:13, 13:58, 15:47 ET), each recovery followed by a fresh round
+        # of new positions -- exactly the "stop for the day" the alert
+        # message already claimed but the code never enforced.
+        self._loss_limit_halted_today = False
 
     def activate_kill_switch(self) -> None:
         self._manual_kill_switch = True
@@ -71,6 +87,7 @@ class RiskManager:
 
     def mark_start_of_day(self, equity: float) -> None:
         self._start_of_day_equity = equity
+        self._loss_limit_halted_today = False
 
     @property
     def start_of_day_equity(self) -> float | None:
@@ -113,11 +130,19 @@ class RiskManager:
             alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}", channel="kill_switch")
             return RiskDecision(False, 0, reason, snapshot)
 
-        if self._loss_limit_breached(snapshot):
+        if self._loss_limit_halted_today or self._loss_limit_breached(snapshot):
             loss_limit = self._start_of_day_equity * self.config.daily_loss_limit_pct
+            if not self._loss_limit_halted_today:
+                self._loss_limit_halted_today = True
+                logger.warning(
+                    "Daily loss limit breached -- halting new entries for the rest of the trading day "
+                    "(realized+unrealized %.2f <= -%.2f)",
+                    self._daily_pnl_for_limit(snapshot),
+                    loss_limit,
+                )
             reason = (
                 f"daily loss limit breached: realized {self._daily_pnl_for_limit(snapshot):.2f} "
-                f"<= -{loss_limit:.2f}"
+                f"<= -{loss_limit:.2f} -- halted for the rest of the trading day"
             )
             alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}", channel="limits")
             return RiskDecision(False, 0, reason, snapshot)
@@ -179,6 +204,25 @@ class RiskManager:
             return RiskDecision(False, 0, reason, snapshot)
 
         if open_lots >= 1:
+            # A symbol already held by a strategy other than this signal's
+            # own is not a pyramid add-on -- it's a second, uncoordinated
+            # strategy piling onto a position it had no part in opening,
+            # each with its own entry/stop/target and neither aware of the
+            # other. Confirmed in the journal: this pattern wins 10% of the
+            # time overall; 2026-09-22 alone had 7 instances (-$578.62,
+            # over half that day's loss). Every existing lot being the SAME
+            # strategy as this signal (the normal pyramid case) leaves this
+            # set empty and falls through to the age check below, unchanged.
+            holder_strategies = self.position_manager.open_lot_strategies(signal.symbol)
+            other_strategies = holder_strategies - {signal.strategy}
+            if other_strategies and not self.config.allow_cross_strategy_stacking:
+                reason = (
+                    f"cross_strategy_lot_conflict: {signal.symbol} already held by "
+                    f"{', '.join(sorted(other_strategies))}"
+                )
+                alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
+                return RiskDecision(False, 0, reason, snapshot)
+
             age = self.position_manager.seconds_since_first_entry(signal.symbol)
             if age is not None and age < self.config.addon_min_seconds_after_first_entry:
                 reason = (

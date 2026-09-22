@@ -22,13 +22,30 @@ class FakePositionManager:
     """Stands in for PositionManager.open_lot_count -- the number of
     already-open lots RiskManager should treat this symbol as holding."""
 
-    def __init__(self, open_lots: int = 0, tracked: set | None = None, first_entry_age: float | None = None):
+    def __init__(
+        self,
+        open_lots: int = 0,
+        tracked: set | None = None,
+        first_entry_age: float | None = None,
+        holder_strategies: set | None = None,
+    ):
         self._open_lots = open_lots
         self._tracked = tracked or set()
         self._first_entry_age = first_entry_age
+        # Defaults to "gap_and_go" (make_signal's own default strategy)
+        # whenever a lot is open and no explicit holders were given -- the
+        # common case in these tests is exercising the add-on path itself,
+        # not the cross-strategy gate, so the default holder should look
+        # like the signal's own strategy unless a test says otherwise.
+        self._holder_strategies = holder_strategies if holder_strategies is not None else (
+            {"gap_and_go"} if open_lots >= 1 else set()
+        )
 
     def open_lot_count(self, symbol: str) -> int:
         return self._open_lots
+
+    def open_lot_strategies(self, symbol: str) -> set:
+        return set(self._holder_strategies)
 
     def tracked_symbols(self) -> set:
         return set(self._tracked)
@@ -65,6 +82,7 @@ def make_risk_manager(tmp_path, snapshot, open_lots: int = 0, **risk_overrides) 
         risk_per_trade_pct=risk_overrides.get("risk_per_trade_pct"),
         addon_risk_pct=risk_overrides.get("addon_risk_pct"),
         max_stop_distance_pct=risk_overrides.get("max_stop_distance_pct", 2.0),
+        allow_cross_strategy_stacking=risk_overrides.get("allow_cross_strategy_stacking", False),
     )
     account_state = FakeAccountState(snapshot)
     position_manager = FakePositionManager(open_lots)
@@ -569,3 +587,84 @@ def test_addon_allowed_after_minimum_gap(tmp_path):
     rm.position_manager = FakePositionManager(open_lots=1, first_entry_age=300.0)
 
     assert rm.evaluate(make_signal()).accepted
+
+
+def test_cross_strategy_signal_rejected_when_symbol_held_by_different_strategy(tmp_path):
+    # A symbol already open under vwap_reversion; a gap_and_go signal
+    # (make_signal's default strategy) fires on the same name minutes
+    # later. This is not a pyramid add-on -- it's a second, uncoordinated
+    # strategy on a position it had no part in opening.
+    rm = make_risk_manager(tmp_path, default_snapshot(), open_lots=1)
+    rm.position_manager = FakePositionManager(
+        open_lots=1, holder_strategies={"vwap_reversion"}, first_entry_age=300.0
+    )
+
+    decision = rm.evaluate(make_signal())
+
+    assert not decision.accepted
+    assert "cross_strategy_lot_conflict" in decision.reason
+    assert "vwap_reversion" in decision.reason
+
+
+def test_same_strategy_addon_not_blocked_by_cross_strategy_gate(tmp_path):
+    # Every existing lot is the SAME strategy as the new signal -- this is
+    # the ordinary pyramid add-on and must fall through untouched to the
+    # existing age-based gate (and pass it here, at 300s old).
+    rm = make_risk_manager(tmp_path, default_snapshot(), open_lots=1)
+    rm.position_manager = FakePositionManager(
+        open_lots=1, holder_strategies={"gap_and_go"}, first_entry_age=300.0
+    )
+
+    assert rm.evaluate(make_signal()).accepted
+
+
+def test_cross_strategy_stacking_allowed_when_explicitly_enabled(tmp_path):
+    rm = make_risk_manager(
+        tmp_path, default_snapshot(), open_lots=1, allow_cross_strategy_stacking=True
+    )
+    rm.position_manager = FakePositionManager(
+        open_lots=1, holder_strategies={"vwap_reversion"}, first_entry_age=300.0
+    )
+
+    assert rm.evaluate(make_signal()).accepted
+
+
+def test_daily_loss_limit_halts_rest_of_day_even_after_pnl_recovers(tmp_path):
+    # Confirmed live, 2026-09-22: the limit was breached and flattened
+    # three separate times in one session because the old check re-derived
+    # from live P&L on every signal -- a partial recovery silently reopened
+    # the door. It must not: once breached, every later signal is rejected
+    # for the rest of the trading day regardless of what P&L does next.
+    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=-2500)
+    rm = make_risk_manager(tmp_path, snapshot, daily_loss_limit_pct=0.02)  # limit = 2000
+
+    breached = rm.evaluate(make_signal())
+    assert not breached.accepted
+    assert "halted for the rest of the trading day" in breached.reason
+
+    # P&L fully recovers to flat -- old behavior would accept again.
+    rm.account_state = FakeAccountState(default_snapshot(net_liquidation=100_000, daily_realized_pnl=0.0))
+    recovered = rm.evaluate(make_signal())
+
+    assert not recovered.accepted
+    assert "halted for the rest of the trading day" in recovered.reason
+
+
+def test_daily_loss_limit_halt_clears_on_mark_start_of_day(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=-2500)
+    rm = make_risk_manager(tmp_path, snapshot, daily_loss_limit_pct=0.02)
+    assert not rm.evaluate(make_signal()).accepted
+    assert rm._loss_limit_halted_today is True
+
+    rm.account_state = FakeAccountState(default_snapshot(net_liquidation=100_000, daily_realized_pnl=0.0))
+    rm.mark_start_of_day(100_000)  # simulates reset_daily_state() on a new trading day
+
+    assert rm._loss_limit_halted_today is False
+    assert rm.evaluate(make_signal()).accepted
+
+
+def test_no_loss_limit_halt_when_never_breached(tmp_path):
+    rm = make_risk_manager(tmp_path, default_snapshot(daily_realized_pnl=0.0), daily_loss_limit_pct=0.02)
+
+    assert rm.evaluate(make_signal()).accepted
+    assert rm._loss_limit_halted_today is False
