@@ -1,11 +1,57 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
+import pytest
+
 from warrior_bot.config import ExitsConfig, NotificationsConfig, ProfitTierConfig
+from warrior_bot.execution import order_manager as order_manager_module
 from warrior_bot.execution.order_manager import OrderManager
 from warrior_bot.signals.signal import Signal
+
+
+@pytest.fixture(autouse=True)
+def _fast_entry_summary_debounce(monkeypatch):
+    """Mirrors test_position_manager.py's _fast_debounced_resize fixture --
+    _accumulate_entry_fill/_send_entry_summary debounce a burst of parent
+    fills onto the event loop (see _ENTRY_SUMMARY_DEBOUNCE_SECONDS) so
+    tests run synchronously with no loop driving itself, and
+    flush_entry_summary below runs exactly the scheduled task on demand."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    monkeypatch.setattr(order_manager_module, "_ENTRY_SUMMARY_DEBOUNCE_SECONDS", 0)
+    yield
+    pending = asyncio.all_tasks(loop)
+    for task in pending:
+        task.cancel()
+    if pending:
+        loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+    loop.close()
+
+
+def flush_entry_summary(om: OrderManager, signal_id: int) -> None:
+    task = om._entry_fill_state[signal_id]["task"]
+    if task is not None:
+        asyncio.get_event_loop().run_until_complete(task)
+
+
+class FakePositionManager:
+    """Duck-types the subset of PositionManager's interface
+    _send_entry_summary actually reads -- `lots` maps symbol -> list of
+    (signal_id, avg_price) tuples representing OTHER already-open lots for
+    that symbol, letting a test simulate a pyramid add-on without needing
+    a real PositionManager/bracket submission."""
+
+    def __init__(self, lots: dict[str, list[tuple[int, float]]] | None = None):
+        self._lots = lots or {}
+
+    def other_open_lot(self, symbol, exclude_signal_id):
+        for signal_id, _avg_price in self._lots.get(symbol, []):
+            if signal_id != exclude_signal_id:
+                return SimpleNamespace(signal_id=signal_id)
+        return None
 
 
 class FakeEvent:
@@ -88,15 +134,18 @@ def make_fill(shares=100, price=10.0, realized_pnl=None):
     return SimpleNamespace(execution=SimpleNamespace(shares=shares, price=price), commissionReport=commission_report)
 
 
-def make_order_manager(notifications_enabled=True, daily_realized_pnl=0.0, **notif_overrides):
+def make_order_manager(
+    notifications_enabled=True, daily_realized_pnl=0.0, position_manager=None, trading_mode="paper", **notif_overrides
+):
     notifications_config = NotificationsConfig(enabled=notifications_enabled, **notif_overrides)
     return OrderManager(
         ib=None,
         journal=FakeJournal(),
         exits_config=None,
-        position_manager=None,
+        position_manager=position_manager or FakePositionManager(),
         notifications_config=notifications_config,
         account_state=FakeAccountState(daily_realized_pnl),
+        trading_mode=trading_mode,
     )
 
 
@@ -111,6 +160,28 @@ def _capture_sends(monkeypatch, om):
 
 def _by_channel(sent, channel):
     return [content for content, ch in sent if ch == channel]
+
+
+def _capture_embeds(monkeypatch, om):
+    sent = []
+    monkeypatch.setattr(
+        "warrior_bot.execution.order_manager.send_discord_embed",
+        lambda embed, channel: sent.append((embed, channel)),
+    )
+    return sent
+
+
+def _seed_entry_state(om, signal_id, symbol="AAPL", strategy="gap_and_go", stop_price=9.0, trim_targets=None):
+    om._entry_fill_state[signal_id] = {
+        "symbol": symbol,
+        "strategy": strategy,
+        "stop_price": stop_price,
+        "trim_targets": trim_targets if trim_targets is not None else [(1.0, 12.0)],
+        "qty": 0.0,
+        "notional": 0.0,
+        "avg_price": None,
+        "task": None,
+    }
 
 
 def test_entry_fill_labeled_buy_no_pnl_message(monkeypatch):
@@ -403,3 +474,158 @@ def test_resync_skip_order_ids_excludes_positions_already_claimed():
 
     assert len(journal.fills) == 0
     assert 10 not in om._order_row_ids
+
+
+# -- trade_activity_summary: debounced entry-fill-burst embed --
+# Regression coverage for the 2026-09-22 report of "duplicate" BUY lines in
+# Discord -- confirmed (via IBKR's own execution report) to be genuine
+# separate partial fills of one parent order, not a bug, but visually noisy.
+# This coalesces a burst of parent fills into one embed per entry.
+
+
+def test_accumulate_entry_fill_schedules_and_sends_after_debounce(monkeypatch):
+    om = make_order_manager()
+    embeds = _capture_embeds(monkeypatch, om)
+    _seed_entry_state(om, signal_id=1, symbol="JTAI", stop_price=2.02, trim_targets=[(0.34, 2.19)])
+
+    om._accumulate_entry_fill(1, fill_qty=100.0, fill_price=2.11)
+    flush_entry_summary(om, 1)
+
+    assert len(embeds) == 1
+    embed, channel = embeds[0]
+    assert channel == "trade_activity_summary"
+    assert "JTAI" in embed["title"]
+
+
+def test_accumulate_entry_fill_coalesces_a_burst_into_one_embed(monkeypatch):
+    # Mirrors the real JTAI incident: 100+100+100+842+200+140 = 1482,
+    # landing as 6 separate fillEvent calls -- must produce exactly one
+    # embed with the combined totals, not six.
+    om = make_order_manager()
+    embeds = _capture_embeds(monkeypatch, om)
+    _seed_entry_state(om, signal_id=1, symbol="JTAI")
+
+    for qty in (100.0, 100.0, 100.0, 842.0, 200.0, 140.0):
+        om._accumulate_entry_fill(1, fill_qty=qty, fill_price=2.11)  # same debounce task rescheduled each time
+    flush_entry_summary(om, 1)
+
+    assert len(embeds) == 1
+    field_by_name = {f["name"]: f["value"] for f in embeds[0][0]["fields"]}
+    assert field_by_name["Shares"] == "1482"
+    assert field_by_name["Avg Price"] == "$2.11"
+
+
+def test_accumulate_entry_fill_weighted_average_across_different_prices(monkeypatch):
+    om = make_order_manager()
+    embeds = _capture_embeds(monkeypatch, om)
+    _seed_entry_state(om, signal_id=1, symbol="X")
+
+    om._accumulate_entry_fill(1, fill_qty=100.0, fill_price=2.00)
+    om._accumulate_entry_fill(1, fill_qty=300.0, fill_price=2.10)
+    flush_entry_summary(om, 1)
+
+    # (100*2.00 + 300*2.10) / 400 = 2.075 -> $2.08 (banker's/round-half rounding via f-string)
+    field_by_name = {f["name"]: f["value"] for f in embeds[0][0]["fields"]}
+    assert field_by_name["Avg Price"] == "$2.08"
+    assert field_by_name["Shares"] == "400"
+
+
+def test_send_entry_summary_frames_second_lot_as_addon(monkeypatch):
+    pm = FakePositionManager(lots={"GDC": [(1, 2.00)]})  # an existing open lot, signal_id=1, avg $2.00
+    om = make_order_manager(position_manager=pm)
+    embeds = _capture_embeds(monkeypatch, om)
+    _seed_entry_state(om, signal_id=1, symbol="GDC")
+    om._accumulate_entry_fill(1, fill_qty=200.0, fill_price=2.00)
+    flush_entry_summary(om, 1)  # settles lot 1's own accumulator (avg_price=2.00) first
+    embeds.clear()
+
+    _seed_entry_state(om, signal_id=2, symbol="GDC")
+    om._accumulate_entry_fill(2, fill_qty=100.0, fill_price=2.20)
+    flush_entry_summary(om, 2)
+
+    assert len(embeds) == 1
+    embed = embeds[0][0]
+    assert "ADD TO POSITION" in embed["title"]
+
+
+def test_send_entry_summary_first_lot_is_new_position_not_addon(monkeypatch):
+    om = make_order_manager(position_manager=FakePositionManager())  # no other lots anywhere
+    embeds = _capture_embeds(monkeypatch, om)
+    _seed_entry_state(om, signal_id=1, symbol="GDC")
+
+    om._accumulate_entry_fill(1, fill_qty=100.0, fill_price=2.00)
+    flush_entry_summary(om, 1)
+
+    assert "NEW POSITION" in embeds[0][0]["title"]
+
+
+def test_send_entry_summary_falls_back_to_new_position_if_prior_state_missing(monkeypatch):
+    # other_open_lot reports a second lot, but this OrderManager instance
+    # never saw its fills (e.g. process restarted mid-day) -- must degrade
+    # gracefully to a plain "new position" framing, not crash or fabricate
+    # a prior average.
+    pm = FakePositionManager(lots={"GDC": [(99, 2.00)]})  # signal_id 99 unknown to this OrderManager
+    om = make_order_manager(position_manager=pm)
+    embeds = _capture_embeds(monkeypatch, om)
+    _seed_entry_state(om, signal_id=1, symbol="GDC")
+
+    om._accumulate_entry_fill(1, fill_qty=100.0, fill_price=2.00)
+    flush_entry_summary(om, 1)
+
+    assert "NEW POSITION" in embeds[0][0]["title"]
+
+
+def test_send_entry_summary_respects_notify_on_entry_summary_toggle(monkeypatch):
+    om = make_order_manager(notify_on_entry_summary=False)
+    embeds = _capture_embeds(monkeypatch, om)
+    _seed_entry_state(om, signal_id=1, symbol="X")
+
+    om._accumulate_entry_fill(1, fill_qty=100.0, fill_price=2.0)
+    flush_entry_summary(om, 1)
+
+    assert embeds == []
+
+
+def test_send_entry_summary_noop_when_notifications_disabled(monkeypatch):
+    om = make_order_manager(notifications_enabled=False)
+    embeds = _capture_embeds(monkeypatch, om)
+    _seed_entry_state(om, signal_id=1, symbol="X")
+
+    om._accumulate_entry_fill(1, fill_qty=100.0, fill_price=2.0)
+    flush_entry_summary(om, 1)
+
+    assert embeds == []
+
+
+def test_attach_tracking_without_signal_id_does_not_accumulate(monkeypatch):
+    # resync_open_orders' path (a parent order still working across a
+    # process restart) calls _attach_tracking with no signal_id -- must not
+    # touch _entry_fill_state or crash on a missing accumulator.
+    om = make_order_manager()
+    embeds = _capture_embeds(monkeypatch, om)
+    trade = FakeTrade(FakeOrder(action="BUY"))
+
+    om._attach_tracking(trade, row_id=1, role="parent")  # no signal_id
+    trade.fillEvent.emit(trade, make_fill(shares=100, price=2.0))
+
+    assert om._entry_fill_state == {}
+    assert embeds == []
+
+
+def test_accumulate_entry_fill_noop_for_unknown_signal_id():
+    om = make_order_manager()
+    om._accumulate_entry_fill(999, fill_qty=100.0, fill_price=2.0)  # never seeded -- must not raise
+    assert om._entry_fill_state == {}
+
+
+def test_non_parent_fill_does_not_accumulate_or_send_embed(monkeypatch):
+    om = make_order_manager()
+    embeds = _capture_embeds(monkeypatch, om)
+    trade = FakeTrade(FakeOrder(action="SELL"))
+    _seed_entry_state(om, signal_id=1, symbol="X")
+
+    om._attach_tracking(trade, row_id=1, role="stop", signal_id=1)
+    trade.fillEvent.emit(trade, make_fill(shares=100, price=2.0))
+
+    assert om._entry_fill_state[1]["qty"] == 0.0  # stop fill never touches the entry accumulator
+    assert embeds == []

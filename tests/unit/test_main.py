@@ -783,8 +783,20 @@ def test_loss_limit_flatten_does_not_suppress_later_eod_sweep(tmp_path, monkeypa
     triggered = []
     monkeypatch.setattr("warrior_bot.main.panic_stop", lambda *a, **k: triggered.append("flatten"))
     bot = WarriorBot(make_config(tmp_path))
-    bot.risk_manager.should_flatten_for_loss_limit = lambda snapshot: False
     bot.account_state.snapshot = lambda: _fake_snapshot()
+
+    # Frozen well before the 15:55 ET EOD cutoff -- otherwise this test is
+    # only correct if it happens to run before 15:55 ET wall-clock itself,
+    # which made it flaky (real failure seen running the suite at 16:37 ET:
+    # the very first _check_flatten_triggers() call took the EOD branch
+    # before ever reaching the loss-limit branch this test means to
+    # exercise "mid-morning").
+    class _MorningDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 21, 14, 0, 0, tzinfo=timezone.utc)  # 10:00 ET
+
+    monkeypatch.setattr("warrior_bot.main.datetime", _MorningDatetime)
 
     # An early loss-limit flatten fires mid-morning.
     bot.risk_manager.should_flatten_for_loss_limit = lambda snapshot: True

@@ -85,6 +85,7 @@ class WarriorBot:
             execution_config=config.execution,
             notifications_config=config.notifications,
             account_state=self.account_state,
+            trading_mode=config.trading.mode,
         )
 
         float_provider = FloatProvider(config.resolve_path("config/float_list.csv"))

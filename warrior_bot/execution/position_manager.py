@@ -125,6 +125,17 @@ class PositionManager:
     def tracked_symbols(self) -> set[str]:
         return set(self._positions.keys())
 
+    def other_open_lot(self, symbol: str, exclude_signal_id: int) -> ManagedPosition | None:
+        """The other currently-tracked lot for `symbol`, if any, besides
+        `exclude_signal_id` -- used by OrderManager's entry-summary notifier
+        to detect a pyramid add-on (a second lot landing on a symbol that
+        already has one open) and find the prior lot's signal_id to frame
+        it as "added to position" rather than a fresh "new position"."""
+        for pos in self._positions.get(symbol, []):
+            if pos.signal_id != exclude_signal_id:
+                return pos
+        return None
+
     def drop_symbol(self, symbol: str) -> None:
         """Used by main.py's position-reconciliation watchdog when IBKR's
         real position for `symbol` is flat but this class still shows

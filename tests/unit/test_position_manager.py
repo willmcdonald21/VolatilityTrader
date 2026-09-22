@@ -1234,3 +1234,36 @@ def test_open_lot_strategies_drops_a_strategy_once_its_lot_closes():
     first_stop.fillEvent.emit(first_stop, make_fill(100))
 
     assert pm.open_lot_strategies("TEST") == {"vwap_reversion"}
+
+
+# -- other_open_lot: used by OrderManager's entry-summary notifier to
+# detect a pyramid add-on and find the prior lot's signal_id.
+
+
+def test_other_open_lot_finds_the_other_tracked_lot():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, signal_id=1, order_id_offset=0)
+    track_position(pm, signal, signal_id=2, order_id_offset=10)
+
+    other = pm.other_open_lot("TEST", exclude_signal_id=2)
+
+    assert other is not None
+    assert other.signal_id == 1
+
+
+def test_other_open_lot_none_when_only_one_lot_tracked():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, signal_id=1)
+
+    assert pm.other_open_lot("TEST", exclude_signal_id=1) is None
+
+
+def test_other_open_lot_none_for_untracked_symbol():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+
+    assert pm.other_open_lot("GHOST", exclude_signal_id=1) is None

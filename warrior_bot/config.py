@@ -431,12 +431,19 @@ class LoggingConfig(BaseModel):
 
 
 class NotificationsConfig(BaseModel):
-    # Posts to four separate Discord channels, each its own webhook URL
+    # Posts to five separate Discord channels, each its own webhook URL
     # read from an env var (see .env.example) -- never stored here, since
     # config.yaml is tracked in git.
     enabled: bool = False
     notify_on_signal: bool = True  # -> trade_activity: an entry signal was accepted and sized
-    notify_on_fill: bool = True  # -> trade_activity: every buy/sell/trim fill
+    notify_on_fill: bool = True  # -> trade_activity: every buy/sell/trim fill, raw/unbatched
+    # -> trade_activity_summary: one curated embed per completed entry (or
+    # pyramid add-on) fill burst, debounced/coalesced across that burst's
+    # individual partial fills -- see OrderManager._send_entry_summary.
+    # Independent of notify_on_fill: the two channels serve different
+    # purposes (raw audit trail vs. a clean per-entry summary) and are
+    # each toggleable on their own.
+    notify_on_entry_summary: bool = True
     notify_on_kill_switch: bool = True  # -> kill_switch: manual kill switch, IBKR connection loss
     notify_on_limits: bool = True  # -> limits: daily-loss-limit halt, EOD flatten, IBKR session failure
     notify_on_pnl: bool = True  # -> pnl: per-trade and running daily realized P&L on every closing/trim fill

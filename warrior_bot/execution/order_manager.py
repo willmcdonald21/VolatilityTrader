@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 
@@ -8,7 +9,12 @@ from ib_async import IB, Contract, Trade
 from warrior_bot.config import ExecutionConfig, ExitsConfig, NotificationsConfig
 from warrior_bot.execution.bracket_builder import Bracket, build_bracket
 from warrior_bot.execution.position_manager import PositionManager
-from warrior_bot.notify.discord import build_pnl_message, send_discord_message
+from warrior_bot.notify.discord import (
+    build_entry_summary_embed,
+    build_pnl_message,
+    send_discord_embed,
+    send_discord_message,
+)
 from warrior_bot.persistence.journal import Journal
 from warrior_bot.risk.account_state import AccountState
 from warrior_bot.signals.signal import Signal
@@ -21,6 +27,15 @@ logger = logging.getLogger("warrior_bot.execution.order_manager")
 # a full sell; "scale_out" is a partial close ("trim"); "parent" is the
 # opening entry.
 _FILL_LABELS = {"parent": "BUY", "scale_out": "TRIM"}
+
+# Same rationale as position_manager.py's _STOP_RESIZE_DEBOUNCE_SECONDS: a
+# single parent order for this bot's thin/low-float universe routinely
+# lands as a burst of several small partial fills a fraction of a second
+# apart (confirmed live, 2026-09-22: JTAI's 1,482-share entry arrived as 6
+# separate fills, one 842 shares, the rest 100-200). Without coalescing,
+# the trade_activity_summary channel would get one "NEW POSITION" embed per
+# partial fill instead of one per entry.
+_ENTRY_SUMMARY_DEBOUNCE_SECONDS = 1.5
 
 
 class OrderManager:
@@ -40,6 +55,7 @@ class OrderManager:
         execution_config: ExecutionConfig | None = None,
         notifications_config: NotificationsConfig | None = None,
         account_state: AccountState | None = None,
+        trading_mode: str = "paper",
     ):
         self.ib = ib
         self.journal = journal
@@ -48,7 +64,16 @@ class OrderManager:
         self.execution_config = execution_config or ExecutionConfig()
         self.notifications_config = notifications_config or NotificationsConfig()
         self.account_state = account_state
+        # Only for the trade_activity_summary embed's footer (build_entry_summary_embed) --
+        # never used for any trading decision, so a bad value here means a
+        # mislabeled Discord message, not a wrong trade.
+        self.trading_mode = trading_mode
         self._order_row_ids: dict[int, int] = {}  # ib order id -> journal orders.id
+        # signal_id -> accumulator for the trade_activity_summary embed (see
+        # _accumulate_entry_fill/_send_entry_summary). Kept around (not
+        # popped) after a summary is sent so a later pyramid add-on on the
+        # same symbol can read this lot's finished avg_price as "prior avg".
+        self._entry_fill_state: dict[int, dict] = {}
 
     def submit_signal(self, contract: Contract, signal: Signal, quantity: int, signal_id: int) -> Bracket:
         profit_tiers = self._profit_tier_specs(signal, quantity)
@@ -62,6 +87,17 @@ class OrderManager:
         role_by_order_id = {bracket.parent.orderId: "parent", bracket.stop_loss.orderId: "stop"}
         for take_profit, role in zip(bracket.take_profits, bracket.target_roles):
             role_by_order_id[take_profit.orderId] = role
+
+        self._entry_fill_state[signal_id] = {
+            "symbol": signal.symbol,
+            "strategy": signal.strategy,
+            "stop_price": signal.stop_price,
+            "trim_targets": self._trim_target_display(signal, quantity),
+            "qty": 0.0,
+            "notional": 0.0,
+            "avg_price": None,
+            "task": None,
+        }
 
         parent_trade: Trade | None = None
         stop_trade: Trade | None = None
@@ -83,7 +119,7 @@ class OrderManager:
                 status=trade.orderStatus.status,
             )
             self._order_row_ids[order.orderId] = row_id
-            self._attach_tracking(trade, row_id, role, signal.entry_price)
+            self._attach_tracking(trade, row_id, role, signal.entry_price, signal_id=signal_id)
             if role == "parent":
                 parent_trade = trade
             elif role == "stop":
@@ -128,7 +164,29 @@ class OrderManager:
             specs.append((qty, price))
         return specs
 
-    def _attach_tracking(self, trade: Trade, row_id: int, role: str, entry_price: float | None = None) -> None:
+    def _trim_target_display(self, signal: Signal, quantity: int) -> list[tuple[float, float]]:
+        """(pct_of_position, price) per configured profit tier, for the
+        trade_activity_summary embed (build_entry_summary_embed) -- mirrors
+        _profit_tier_specs' own skip-if-floors-to-zero filtering and
+        empty-list fallback exactly, so what's displayed always matches the
+        real orders _profit_tier_specs produced for this same (signal,
+        quantity), just carrying the configured fraction through instead of
+        an absolute share count."""
+        targets = [
+            (tier.pct, round_to_tick(signal.entry_price + signal.risk_per_share * tier.r_multiple))
+            for tier in self.exits_config.profit_tiers
+            if math.floor(quantity * tier.pct) > 0
+        ]
+        return targets or [(1.0, signal.target_price)]
+
+    def _attach_tracking(
+        self,
+        trade: Trade,
+        row_id: int,
+        role: str,
+        entry_price: float | None = None,
+        signal_id: int | None = None,
+    ) -> None:
         def on_status(t: Trade) -> None:
             self.journal.update_order_status(row_id, t.orderStatus.status)
 
@@ -170,9 +228,65 @@ class OrderManager:
                 send_discord_message(
                     build_pnl_message(trade.contract.symbol, realized_pnl, daily_pnl), channel="pnl"
                 )
+            if role == "parent" and signal_id is not None:
+                self._accumulate_entry_fill(signal_id, fill.execution.shares, fill.execution.price)
 
         trade.statusEvent += on_status
         trade.fillEvent += on_fill
+
+    def _accumulate_entry_fill(self, signal_id: int, fill_qty: float, fill_price: float) -> None:
+        """Folds one parent-order partial fill into signal_id's running
+        total and (re)schedules the debounced trade_activity_summary embed
+        -- see _ENTRY_SUMMARY_DEBOUNCE_SECONDS. A no-op if this signal_id's
+        accumulator is missing (only resync_open_orders' path can leave it
+        unset, for a parent order still working across a process restart --
+        that edge case just doesn't get a summary embed, journaling and the
+        raw trade_activity line are unaffected)."""
+        state = self._entry_fill_state.get(signal_id)
+        if state is None:
+            return
+        state["qty"] += fill_qty
+        state["notional"] += fill_qty * fill_price
+        if state["task"] is not None:
+            state["task"].cancel()
+
+        async def _debounced() -> None:
+            try:
+                await asyncio.sleep(_ENTRY_SUMMARY_DEBOUNCE_SECONDS)
+            except asyncio.CancelledError:
+                return
+            state["task"] = None
+            self._send_entry_summary(signal_id)
+
+        state["task"] = asyncio.ensure_future(_debounced())
+
+    def _send_entry_summary(self, signal_id: int) -> None:
+        if not (self.notifications_config.enabled and self.notifications_config.notify_on_entry_summary):
+            return
+        state = self._entry_fill_state.get(signal_id)
+        if state is None or state["qty"] <= 0:
+            return
+        state["avg_price"] = state["notional"] / state["qty"]
+
+        prior_qty = prior_avg_price = None
+        other = self.position_manager.other_open_lot(state["symbol"], exclude_signal_id=signal_id)
+        if other is not None:
+            prior_state = self._entry_fill_state.get(other.signal_id)
+            if prior_state is not None and prior_state.get("avg_price") is not None:
+                prior_qty, prior_avg_price = prior_state["qty"], prior_state["avg_price"]
+
+        embed = build_entry_summary_embed(
+            symbol=state["symbol"],
+            strategy=state["strategy"],
+            qty=state["qty"],
+            avg_price=state["avg_price"],
+            stop_price=state["stop_price"],
+            trim_targets=state["trim_targets"],
+            mode=self.trading_mode,
+            prior_qty=prior_qty,
+            prior_avg_price=prior_avg_price,
+        )
+        send_discord_embed(embed, channel="trade_activity_summary")
 
     def resync_open_orders(self, force: bool = False, skip_order_ids: frozenset[int] = frozenset()) -> None:
         """Re-attaches fill/status tracking (journal writes + Discord
