@@ -180,10 +180,10 @@ class FakeCtx:
         return self._atr_value
 
 
-def make_signal(entry=10.0, stop=9.0, target=12.0) -> Signal:
+def make_signal(entry=10.0, stop=9.0, target=12.0, strategy="gap_and_go") -> Signal:
     return Signal(
         symbol="TEST",
-        strategy="gap_and_go",
+        strategy=strategy,
         side="BUY",
         entry_price=entry,
         stop_price=stop,
@@ -1194,3 +1194,43 @@ def test_fully_filled_entry_is_never_cancelled_however_old():
     pm.cancel_stale_entries(timeout_seconds=300)
 
     assert pos.parent_order not in ib.cancelled
+
+
+def test_open_lot_strategies_empty_for_untracked_symbol():
+    pm = PositionManager(FakeIB(), FakeJournal(), make_exits_config())
+    assert pm.open_lot_strategies("TEST") == set()
+
+
+def test_open_lot_strategies_reflects_the_signals_own_strategy():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config())
+    signal = make_signal(entry=10.0, stop=9.0, strategy="vwap_reversion")
+    track_position(pm, signal, quantity=100, target_role="target", target_qty=100)
+
+    assert pm.open_lot_strategies("TEST") == {"vwap_reversion"}
+
+
+def test_open_lot_strategies_includes_every_distinct_holder():
+    # RiskManager's cross-strategy gate keys off this set having more than
+    # one member once the new signal's own strategy is excluded from it.
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    first = make_signal(entry=10.0, stop=9.0, strategy="gap_and_go")
+    second = make_signal(entry=11.0, stop=10.5, strategy="vwap_reversion")
+    track_position(pm, first, quantity=100, target_qty=100)
+    track_position(pm, second, quantity=50, target_qty=50, order_id_offset=10)
+
+    assert pm.open_lot_strategies("TEST") == {"gap_and_go", "vwap_reversion"}
+
+
+def test_open_lot_strategies_drops_a_strategy_once_its_lot_closes():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    first = make_signal(entry=10.0, stop=9.0, strategy="gap_and_go")
+    second = make_signal(entry=11.0, stop=10.5, strategy="vwap_reversion")
+    first_stop, _ = track_position(pm, first, quantity=100, target_qty=100)
+    track_position(pm, second, quantity=50, target_qty=50, order_id_offset=10)
+
+    first_stop.fillEvent.emit(first_stop, make_fill(100))
+
+    assert pm.open_lot_strategies("TEST") == {"vwap_reversion"}

@@ -106,6 +106,14 @@ class PositionManager:
     def open_lot_count(self, symbol: str) -> int:
         return len(self._positions.get(symbol, []))
 
+    def open_lot_strategies(self, symbol: str) -> set[str]:
+        """Which strategy(ies) currently hold a lot in this symbol -- lets
+        RiskManager tell "I'm adding to my own idea" (every existing lot is
+        the same strategy as the new signal) apart from "a different idea
+        just walked in on my position" (see cross_strategy_lot_conflict in
+        risk_manager.py)."""
+        return {pos.signal.strategy for pos in self._positions.get(symbol, [])}
+
     def seconds_since_first_entry(self, symbol: str) -> float | None:
         """Age of the symbol's oldest tracked lot, None if none is tracked."""
         lots = self._positions.get(symbol)
