@@ -162,3 +162,45 @@ def test_snapshot_exposes_open_symbols_and_unrealized():
     assert snap.open_symbols == frozenset({"GTEC"})
     assert snap.daily_unrealized_pnl == -300.0
     assert snap.open_positions_count == 1
+
+
+# -- _session_start construction: regression coverage for the 2026-09-23
+# finding that a mid-day restart silently reset daily_realized_pnl to ~$0
+# and lifted the daily-loss-limit halt, because AccountState previously
+# stamped _session_start at "now" (the moment the process happened to
+# start) instead of the actual start of the ET trading day.
+
+
+def test_fresh_account_state_anchors_session_start_to_today_not_now():
+    from warrior_bot.utils.time_utils import session_date_start
+
+    before_construction = session_date_start().astimezone(timezone.utc)
+    state = AccountState(FakeIB([]))
+
+    # Anchored to midnight ET today, not "now" -- must be exactly today's
+    # ET day-start (allowing no drift at all, since both sides compute it
+    # the same way), and nowhere near datetime.now(timezone.utc).
+    assert state._session_start == before_construction
+    assert (datetime.now(timezone.utc) - state._session_start) > timedelta(hours=1)
+
+
+def test_reset_session_also_anchors_to_today_not_now():
+    from warrior_bot.utils.time_utils import session_date_start
+
+    state = AccountState(FakeIB([]))
+    state._session_start = datetime.now(timezone.utc)  # simulate the old, buggy behavior
+
+    state.reset_session()
+
+    assert state._session_start == session_date_start().astimezone(timezone.utc)
+
+
+def test_fresh_account_state_still_sees_a_fill_from_earlier_today():
+    # The actual restart scenario: a real loss happened hours before the
+    # process (re)started -- a brand-new AccountState, with no manual
+    # _session_start override, must still count it.
+    old_fill = make_fill("AAPL", "SLD", 100, 9.0, minutes_ago=180, realized_pnl=0.0)  # 3 hours ago
+    entry_fill = make_fill("AAPL", "BOT", 100, 10.0, minutes_ago=185, realized_pnl=None)
+    state = AccountState(FakeIB([entry_fill, old_fill]))
+
+    assert state.daily_realized_pnl() == pytest.approx(-100.0)  # (9.0 - 10.0) * 100

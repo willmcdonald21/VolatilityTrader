@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from ib_async import IB
 from ib_async.util import UNSET_DOUBLE
 
+from warrior_bot.utils.time_utils import session_date_start
+
 
 @dataclass
 class AccountSnapshot:
@@ -21,6 +23,26 @@ class AccountSnapshot:
     daily_unrealized_pnl: float = 0.0
 
 
+def _today_start_utc() -> datetime:
+    """Midnight ET today, in UTC -- the boundary _todays_fills() uses to
+    decide which of IBKR's cached fills count toward daily_realized_pnl.
+
+    Deliberately NOT datetime.now(timezone.utc): that was the bug.
+    AccountState is reconstructed fresh on every WarriorBot.__init__, i.e.
+    every process restart (routine ones too -- the supervisor loop
+    restarts on any crash). Using "now" as the fill-lookback boundary
+    means a mid-day restart silently drops every fill from before the
+    restart out of daily_realized_pnl, which RiskManager's daily-loss-halt
+    check reads directly -- confirmed live, 2026-09-23: a restart minutes
+    after the daily loss limit halted the bot for the day would have reset
+    the realized P&L calculation to ~$0 and lifted the halt, letting it
+    resume trading past the point it was supposed to stop. Anchoring to
+    the actual start of the ET calendar day instead means daily_realized_pnl
+    -- and therefore the halt -- self-heals correctly on the very next
+    risk check after any restart, whatever caused it."""
+    return session_date_start().astimezone(timezone.utc)
+
+
 class AccountState:
     """Polls IBKR for ground truth rather than trusting local counters.
 
@@ -32,10 +54,10 @@ class AccountState:
     def __init__(self, ib: IB, account: str = ""):
         self.ib = ib
         self.account = account
-        self._session_start = datetime.now(timezone.utc)
+        self._session_start = _today_start_utc()
 
     def reset_session(self) -> None:
-        self._session_start = datetime.now(timezone.utc)
+        self._session_start = _today_start_utc()
 
     def _account_value(self, tag: str) -> float:
         for av in self.ib.accountValues(self.account):
