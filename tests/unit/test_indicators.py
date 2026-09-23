@@ -9,6 +9,7 @@ from warrior_bot.strategies.indicators import (
     gap_pct,
     has_rising_volume_on_advance,
     is_bottoming_tail,
+    is_entry_too_extended,
     is_high_volume_red_bar,
     is_lower_low,
     is_momentum_exhausted,
@@ -406,3 +407,44 @@ def test_is_lower_low_false_when_low_holds():
     prior = make_bars([(10.0, 10.5, 9.9, 10.2, 1000)])[0]
     current = make_bars([(10.2, 10.3, 9.95, 10.1, 1000)])[0]
     assert is_lower_low(current, prior) is False
+
+
+# -- is_entry_too_extended: regression coverage for the 2026-09-22 finding
+# that gap_and_go/vwap_reversion entered on a bar that had already run
+# 3-40% past its own trigger level within that single 1-minute bar (GDC,
+# DCOY, EDBL), then reversed and hit the stop within minutes with zero
+# favorable excursion -- an entry-quality problem, not a stop-placement one.
+
+
+def test_is_entry_too_extended_true_for_a_parabolic_bar():
+    # Mirrors DCOY, 2026-09-22 11:34 ET: a bar that closed far beyond its
+    # trigger level relative to recent volatility.
+    bar = make_bars([(4.41, 5.26, 4.38, 4.73, 1000)])[0]
+    trigger_level = 4.19  # roughly the prior bar's close
+    atr = 0.15  # a much calmer recent range than this bar's own move
+    assert is_entry_too_extended(bar, trigger_level, atr, max_atr_multiple=2.5) is True
+
+
+def test_is_entry_too_extended_false_for_a_controlled_breakout():
+    bar = make_bars([(5.8, 6.0, 5.78, 5.95, 1000)])[0]
+    trigger_level = 5.9
+    atr = 0.3
+    # extension = 5.95 - 5.9 = 0.05, well under 2.5 * 0.3 = 0.75
+    assert is_entry_too_extended(bar, trigger_level, atr, max_atr_multiple=2.5) is False
+
+
+def test_is_entry_too_extended_fails_open_without_atr():
+    bar = make_bars([(4.41, 5.26, 4.38, 4.73, 1000)])[0]
+    assert is_entry_too_extended(bar, trigger_level=4.19, atr=None, max_atr_multiple=2.5) is False
+
+
+def test_is_entry_too_extended_fails_open_for_zero_atr():
+    bar = make_bars([(4.41, 5.26, 4.38, 4.73, 1000)])[0]
+    assert is_entry_too_extended(bar, trigger_level=4.19, atr=0.0, max_atr_multiple=2.5) is False
+
+
+def test_is_entry_too_extended_respects_configured_multiple():
+    bar = make_bars([(4.41, 5.26, 4.38, 4.73, 1000)])[0]
+    # extension = 4.73 - 4.19 = 0.54; at atr=0.15, 0.54 / 0.15 = 3.6x
+    assert is_entry_too_extended(bar, 4.19, atr=0.15, max_atr_multiple=3.6) is False  # exactly at the line -- not over
+    assert is_entry_too_extended(bar, 4.19, atr=0.15, max_atr_multiple=3.5) is True  # a hair looser -- now over

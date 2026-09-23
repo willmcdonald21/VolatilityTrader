@@ -263,6 +263,46 @@ def test_float_rotation_skips_symbol_missing_from_csv(tmp_path):
     assert strategy.evaluate(ctx, NOW) is not None
 
 
+def test_no_signal_when_breakout_bar_too_extended():
+    # Mirrors GDC, 2026-09-22: a breakout bar that already ran far past the
+    # opening-range high within that single 1-minute bar, then reversed and
+    # hit the stop within minutes -- an entry-quality problem the older
+    # min_breakout_candle_strength check doesn't catch (this bar is a clean,
+    # full-bodied green candle; it's just already extended too far).
+    ctx = make_ctx(
+        [
+            (5.5, 5.55, 5.45, 5.5, 1000),
+            (5.5, 5.55, 5.45, 5.5, 1000),
+            (5.5, 5.55, 5.45, 5.5, 1000),
+            (5.5, 5.55, 5.45, 5.5, 1000),  # calm bars -> small ATR
+            (5.5, 7.0, 5.5, 7.0, 1000),  # breakout bar rips far past the 5.55 opening-range high
+        ]
+    )
+    strategy = GapAndGoStrategy(default_config())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_signal_when_extension_gate_loosened_enough():
+    ctx = make_ctx(
+        [
+            (5.5, 5.55, 5.45, 5.5, 1000),
+            (5.5, 5.55, 5.45, 5.5, 1000),
+            (5.5, 5.55, 5.45, 5.5, 1000),
+            (5.5, 5.55, 5.45, 5.5, 1000),
+            (5.5, 7.0, 5.5, 7.0, 1000),
+        ]
+    )
+    strategy = GapAndGoStrategy(default_config(max_extension_atr_multiple=100.0))
+    assert strategy.evaluate(ctx, NOW) is not None
+
+
+def test_signal_when_breakout_bar_close_to_the_level():
+    # A controlled breakout -- closes just past the level, not blocked.
+    ctx = make_ctx(BREAKOUT_BARS)
+    strategy = GapAndGoStrategy(default_config())
+    assert strategy.evaluate(ctx, NOW) is not None
+
+
 def test_reset_daily_allows_retrigger():
     ctx = make_ctx(
         [

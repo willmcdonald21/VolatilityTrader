@@ -6,7 +6,12 @@ from warrior_bot.config import GapAndGoConfig
 from warrior_bot.scanner.float_provider import FloatProvider
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
-from warrior_bot.strategies.indicators import candle_strength, crossed_round_number, opening_range
+from warrior_bot.strategies.indicators import (
+    candle_strength,
+    crossed_round_number,
+    is_entry_too_extended,
+    opening_range,
+)
 from warrior_bot.utils.time_utils import session_elapsed_fraction
 
 
@@ -70,6 +75,9 @@ class GapAndGoStrategy(BaseStrategy):
 
         if candle_strength(current_bar) < cfg.min_breakout_candle_strength:
             return self._reject(ctx, "weak_breakout_candle")
+
+        if is_entry_too_extended(current_bar, breakout_high, ctx.atr(), cfg.max_extension_atr_multiple):
+            return self._reject(ctx, "breakout_too_extended")
 
         entry_price = current_bar.close
         stop_price = breakout_high * (1 - cfg.stop_buffer_pct / 100.0)

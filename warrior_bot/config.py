@@ -176,6 +176,13 @@ class GapAndGoConfig(BaseModel):
     max_float_shares: float = 10_000_000
     min_float_rotation: float = 0.0  # today's cumulative volume / float; 0 = disabled (needs float_list.csv data)
     min_breakout_candle_strength: float = Field(default=0.0, ge=-1.0, le=1.0)
+    # Rejects a breakout whose bar has already closed more than this many
+    # ATRs past the opening-range high -- confirmed live, 2026-09-22: GDC
+    # and other losers that week were entered on a bar that had already run
+    # well past the breakout level before the signal even fired, then
+    # reversed and hit the stop within minutes with zero favorable
+    # excursion. See is_entry_too_extended in strategies/indicators.py.
+    max_extension_atr_multiple: float = Field(default=2.5, gt=0)
 
 
 class PullbackQualityConfig(BaseModel):
@@ -240,6 +247,12 @@ class VwapReversionConfig(BaseModel):
     min_rel_volume: float = 5.0  # applies to the vwap_bounce setup, which previously had no relative-volume gate at all
     stop_buffer_pct: float = 0.5
     target_r_multiple: float = 1.5
+    # Same guard as gap_and_go's field of the same name, applied to both
+    # sub-setups' own trigger level (VWAP for the bounce, prior day's close
+    # for red-to-green) -- confirmed live, 2026-09-22: DCOY and EDBL both
+    # entered on a bar that had already run 10-40% past its trigger level
+    # within that single 1-minute bar. See is_entry_too_extended.
+    max_extension_atr_multiple: float = Field(default=2.5, gt=0)
 
 
 class InvertedHeadAndShouldersConfig(BaseModel):

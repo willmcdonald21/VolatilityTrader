@@ -335,3 +335,30 @@ def average_true_range(bars: list[Bar], period: int = 14) -> float | None:
     if not trs:
         return None
     return sum(trs) / len(trs)
+
+
+def is_entry_too_extended(current_bar: Bar, trigger_level: float, atr: float | None, max_atr_multiple: float) -> bool:
+    """True when the bar being entered on has already travelled too far
+    past its own trigger level (an opening-range high, VWAP, or a
+    crossing level -- whatever the calling strategy is breaking out
+    of/bouncing from) to be a controlled entry rather than a chase into an
+    already-parabolic move.
+
+    Confirmed live, 2026-09-22: three of that week's biggest losers (GDC,
+    DCOY, EDBL) each entered on a bar that had already run 3-40% past its
+    own trigger level within that single 1-minute bar -- gap_and_go and
+    vwap_reversion both set entry_price to the triggering bar's close with
+    no check on how far the bar had already moved to get there. All three
+    reversed and hit their stop within minutes with zero favorable
+    excursion first: not a stop-placement problem, an entry-quality one --
+    buying the exact top of an already-exhausted spike.
+
+    Measured in ATR, not a fixed percentage, since a "big" move means
+    something different on a $1 stock than a $15 one, and something
+    different on a quiet day than a wild one -- ATR already captures both.
+    Unmeasurable (no ATR yet, e.g. too few bars) fails open (returns
+    False) rather than blocking every early-session signal."""
+    if atr is None or atr <= 0:
+        return False
+    extension = current_bar.close - trigger_level
+    return extension > atr * max_atr_multiple

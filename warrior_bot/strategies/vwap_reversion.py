@@ -5,7 +5,7 @@ from datetime import datetime
 from warrior_bot.config import VwapReversionConfig
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
-from warrior_bot.strategies.indicators import is_red_to_green
+from warrior_bot.strategies.indicators import is_entry_too_extended, is_red_to_green
 from warrior_bot.utils.time_utils import session_elapsed_fraction
 
 
@@ -47,6 +47,9 @@ class VwapReversionStrategy(BaseStrategy):
         if rel_vol is None or rel_vol < cfg.red_to_green_volume_multiple:
             return self._reject(ctx, "red_to_green_relative_volume")
 
+        if is_entry_too_extended(current_bar, ctx.prior_close, ctx.atr(), cfg.max_extension_atr_multiple):
+            return self._reject(ctx, "red_to_green_too_extended")
+
         entry_price = current_bar.close
         lookback_low = min(b.low for b in ctx.bars[-3:])
         stop_price = lookback_low * (1 - cfg.stop_buffer_pct / 100.0)
@@ -82,6 +85,9 @@ class VwapReversionStrategy(BaseStrategy):
         rel_vol = ctx.relative_volume(session_elapsed_fraction(now))
         if rel_vol is None or rel_vol < cfg.min_rel_volume:
             return self._reject(ctx, "vwap_bounce_relative_volume")
+
+        if is_entry_too_extended(current_bar, vwap_price, ctx.atr(), cfg.max_extension_atr_multiple):
+            return self._reject(ctx, "vwap_bounce_too_extended")
 
         entry_price = current_bar.close
         stop_price = min(prev_bar.low, current_bar.low) * (1 - cfg.stop_buffer_pct / 100.0)

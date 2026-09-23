@@ -98,6 +98,72 @@ def test_vwap_bounce_skipped_when_relative_volume_too_low():
     assert strategy.evaluate(ctx, NOW) is None
 
 
+_CALM_RED_TO_GREEN_BARS = [(9.5, 9.51, 9.49, 9.5, 1000)] * 15  # tight range -> tiny ATR, doesn't itself trip red-to-green
+
+
+def test_no_signal_when_red_to_green_bar_too_extended():
+    # Mirrors EDBL, 2026-09-22: the crossing bar itself was an already-
+    # parabolic spike relative to recent (calm) volatility, then reversed
+    # and hit the stop within minutes. Many calm bars first so the spike's
+    # own true range doesn't dominate its own rolling ATR average.
+    ctx = make_ctx(
+        bar_specs=_CALM_RED_TO_GREEN_BARS + [(9.5, 11.0, 9.5, 11.0, 5000)],  # crossing bar rips far past prior_close
+        prior_close=10.0,
+        avg_daily_volume=10_000,
+    )
+    strategy = VwapReversionStrategy(VwapReversionConfig())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_red_to_green_signal_when_extension_gate_loosened_enough():
+    ctx = make_ctx(
+        bar_specs=_CALM_RED_TO_GREEN_BARS + [(9.5, 11.0, 9.5, 11.0, 5000)],
+        prior_close=10.0,
+        avg_daily_volume=10_000,
+    )
+    strategy = VwapReversionStrategy(VwapReversionConfig(max_extension_atr_multiple=1000.0))
+    signal = strategy.evaluate(ctx, NOW)
+    assert signal is not None
+    assert signal.context["setup"] == "red_to_green"
+
+
+_CALM_VWAP_BOUNCE_BARS = [(10.0, 10.01, 9.99, 10.0, 1000)] * 18  # tight range, holds VWAP near 10.0
+
+
+def test_no_signal_when_vwap_bounce_bar_too_extended():
+    # Mirrors DCOY, 2026-09-22: the bounce bar itself already ran far past
+    # VWAP relative to recent volatility. Many calm bars first so VWAP
+    # stays anchored near 10.0 (not dragged off by the bounce bar itself)
+    # and the bounce's own true range doesn't dominate its own ATR average.
+    ctx = make_ctx(
+        bar_specs=_CALM_VWAP_BOUNCE_BARS
+        + [
+            (10.0, 10.05, 9.95, 9.98, 1000),  # dips to touch VWAP
+            (9.98, 10.8, 9.98, 10.8, 1000),  # bounce bar rips far past VWAP
+        ],
+        prior_close=5.0,
+        avg_daily_volume=5_000,
+    )
+    strategy = VwapReversionStrategy(VwapReversionConfig())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_vwap_bounce_signal_when_extension_gate_loosened_enough():
+    ctx = make_ctx(
+        bar_specs=_CALM_VWAP_BOUNCE_BARS
+        + [
+            (10.0, 10.05, 9.95, 9.98, 1000),
+            (9.98, 10.8, 9.98, 10.8, 1000),
+        ],
+        prior_close=5.0,
+        avg_daily_volume=5_000,
+    )
+    strategy = VwapReversionStrategy(VwapReversionConfig(max_extension_atr_multiple=1000.0))
+    signal = strategy.evaluate(ctx, NOW)
+    assert signal is not None
+    assert signal.context["setup"] == "vwap_bounce"
+
+
 def test_does_not_retrigger_same_symbol_same_day():
     bar_specs = [
         (9.5, 9.6, 9.4, 9.5, 1000),
