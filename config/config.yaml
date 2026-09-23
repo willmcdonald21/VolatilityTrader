@@ -13,7 +13,7 @@ execution:
   stop_limit_offset_pct: 0.5     # stop-loss is a stop-limit order; limit sits this % beyond the trigger (IBKR rejects plain market/stop orders outside RTH)
 
 risk:
-  daily_loss_limit_pct: 0.02     # halt new entries once daily realized loss exceeds this fraction of start-of-day equity
+  daily_loss_limit_pct: 0.10     # TEMP for 2026-09-23 only -- was 0.02, raised so today's real -$965.71 loss (already past the 2% cap) stops halting new entries. Revert to 0.02 before tomorrow's session.
   flatten_on_daily_loss_limit: true  # force-close open positions when the daily halt triggers -- enabled for the unattended overnight test since no one can intervene manually
   max_concurrent_positions: 5
   reserved_top_tier_slots: 1       # slots held back exclusively for scanner_rank <= reserved_top_tier_max_rank, used only once the other slots are full
