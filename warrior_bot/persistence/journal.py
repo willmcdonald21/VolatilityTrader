@@ -166,3 +166,33 @@ class Journal:
             (_now(), triggered_by, action_taken),
         )
         self.conn.commit()
+
+    def save_daily_risk_state(self, trading_date: str, start_of_day_equity: float, loss_limit_halted: bool) -> None:
+        """Upserts today's risk baseline/halt state -- see db.py's
+        daily_risk_state schema comment for why this exists. Called both
+        the moment a fresh trading day's baseline is established and
+        periodically thereafter (main.py's risk loop) so a halt that trips
+        mid-day is persisted promptly, not just at start-of-day."""
+        self.conn.execute(
+            """INSERT INTO daily_risk_state (trading_date, start_of_day_equity, loss_limit_halted, ts_updated)
+               VALUES (?, ?, ?, ?)
+               ON CONFLICT(trading_date) DO UPDATE SET
+                   start_of_day_equity = excluded.start_of_day_equity,
+                   loss_limit_halted = excluded.loss_limit_halted,
+                   ts_updated = excluded.ts_updated""",
+            (trading_date, start_of_day_equity, int(loss_limit_halted), _now()),
+        )
+        self.conn.commit()
+
+    def load_daily_risk_state(self, trading_date: str) -> dict | None:
+        """The persisted baseline/halt state for `trading_date` (an ET
+        date's isoformat string), or None if this process has never
+        established one for that date yet -- the caller's cue to compute a
+        fresh baseline instead of restoring one."""
+        row = self.conn.execute(
+            "SELECT start_of_day_equity, loss_limit_halted FROM daily_risk_state WHERE trading_date = ?",
+            (trading_date,),
+        ).fetchone()
+        if row is None:
+            return None
+        return {"start_of_day_equity": row[0], "loss_limit_halted": bool(row[1])}

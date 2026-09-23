@@ -1044,3 +1044,93 @@ def test_loss_limit_flatten_does_not_suppress_later_eod_sweep(tmp_path, monkeypa
     bot._check_flatten_triggers()
     assert bot._eod_flatten_fired is True
     assert len(triggered) == 2
+
+
+def test_restore_or_start_daily_risk_state_starts_fresh_when_nothing_persisted(tmp_path):
+    bot = WarriorBot(make_config(tmp_path))
+    bot.account_state.snapshot = lambda: _fake_snapshot()
+    bot.account_state.snapshot = lambda: AccountSnapshot(
+        net_liquidation=45_000.0, available_funds=45_000.0, buying_power=45_000.0,
+        open_positions_count=0, daily_realized_pnl=0.0,
+    )
+    bot._trading_day = _today_et()
+
+    bot._restore_or_start_daily_risk_state()
+
+    assert bot.risk_manager.start_of_day_equity == 45_000.0
+    assert bot.risk_manager.loss_limit_halted_today is False
+    # Persisted immediately, not just held in memory -- a restart seconds
+    # later must see this same baseline.
+    persisted = bot.journal.load_daily_risk_state(_today_et().isoformat())
+    assert persisted == {"start_of_day_equity": 45_000.0, "loss_limit_halted": False}
+
+
+def test_restore_or_start_daily_risk_state_restores_an_active_halt(tmp_path):
+    # The live incident this whole feature fixes: a same-day restart must
+    # not un-halt an already-breached day.
+    bot = WarriorBot(make_config(tmp_path))
+    bot._trading_day = _today_et()
+    bot.journal.save_daily_risk_state(
+        _today_et().isoformat(), start_of_day_equity=45_000.0, loss_limit_halted=True
+    )
+    bot.account_state.snapshot = lambda: AccountSnapshot(
+        net_liquidation=44_000.0, available_funds=44_000.0, buying_power=44_000.0,
+        open_positions_count=0, daily_realized_pnl=0.0,  # recovered back to "not breached" -- must not matter
+    )
+
+    bot._restore_or_start_daily_risk_state()
+
+    assert bot.risk_manager.start_of_day_equity == 45_000.0  # the ORIGINAL baseline, not current equity
+    assert bot.risk_manager.loss_limit_halted_today is True
+    assert not bot.risk_manager.evaluate(make_signal()).accepted
+
+
+def test_check_flatten_triggers_persists_risk_state_every_tick(tmp_path):
+    bot = WarriorBot(make_config(tmp_path))
+    bot._trading_day = _today_et()
+    bot.risk_manager.mark_start_of_day(45_000.0)
+    bot.account_state.snapshot = lambda: _fake_snapshot()
+    bot.risk_manager.should_flatten_for_loss_limit = lambda snapshot: False
+
+    class _MorningDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 9, 23, 14, 0, 0, tzinfo=timezone.utc)  # 10:00 ET, before EOD cutoff
+
+    import warrior_bot.main as main_module
+    original_datetime = main_module.datetime
+    main_module.datetime = _MorningDatetime
+    try:
+        assert bot.journal.load_daily_risk_state(_today_et().isoformat()) is None
+        bot._check_flatten_triggers()
+    finally:
+        main_module.datetime = original_datetime
+
+    assert bot.journal.load_daily_risk_state(_today_et().isoformat()) == {
+        "start_of_day_equity": 45_000.0,
+        "loss_limit_halted": False,
+    }
+
+
+def test_new_trading_day_persists_fresh_state_under_todays_date_not_yesterdays(tmp_path):
+    # Regression guard for the ordering bug: reset_daily_state() persists
+    # keyed by self._trading_day, which must already be TODAY's date by
+    # the time it runs, not yesterday's (the date _check_new_trading_day
+    # was about to replace).
+    bot = WarriorBot(make_config(tmp_path))
+    bot.account_state.snapshot = lambda: _fake_snapshot()
+    yesterday = _yesterday_et()
+    bot._trading_day = yesterday
+    bot.journal.save_daily_risk_state(yesterday.isoformat(), start_of_day_equity=40_000.0, loss_limit_halted=True)
+
+    bot._check_new_trading_day()
+
+    assert bot._trading_day == _today_et()
+    today_state = bot.journal.load_daily_risk_state(_today_et().isoformat())
+    assert today_state is not None
+    assert today_state["loss_limit_halted"] is False  # fresh day, not carried over from yesterday
+    # Yesterday's own row is untouched, not overwritten by today's reset.
+    assert bot.journal.load_daily_risk_state(yesterday.isoformat()) == {
+        "start_of_day_equity": 40_000.0,
+        "loss_limit_halted": True,
+    }

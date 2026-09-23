@@ -86,12 +86,33 @@ class RiskManager:
         return self._manual_kill_switch or self.kill_switch_path.exists()
 
     def mark_start_of_day(self, equity: float) -> None:
+        """Establishes a FRESH baseline for a genuinely new trading day --
+        always clears the halt. Never call this to resume a process
+        mid-day; use load_state for that (see its docstring for why the
+        distinction matters)."""
         self._start_of_day_equity = equity
         self._loss_limit_halted_today = False
+
+    def load_state(self, start_of_day_equity: float, loss_limit_halted: bool) -> None:
+        """Restores a previously-established baseline/halt as-is -- used
+        when this process is restarting partway through a trading day that
+        already has persisted state (see Journal.load_daily_risk_state),
+        as opposed to mark_start_of_day's unconditional fresh start.
+        Deliberately does NOT reset the halt: a restart mid-day must not be
+        able to undo an already-tripped daily loss limit. Confirmed live,
+        2026-09-23: three same-day restarts each called mark_start_of_day
+        instead of this, silently re-arming a halt that had already fired
+        and re-exposing the account to new entries each time."""
+        self._start_of_day_equity = start_of_day_equity
+        self._loss_limit_halted_today = loss_limit_halted
 
     @property
     def start_of_day_equity(self) -> float | None:
         return self._start_of_day_equity
+
+    @property
+    def loss_limit_halted_today(self) -> bool:
+        return self._loss_limit_halted_today
 
     def _loss_limit_breached(self, snapshot: AccountSnapshot) -> bool:
         if self._start_of_day_equity is None:

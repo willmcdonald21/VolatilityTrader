@@ -79,6 +79,22 @@ CREATE TABLE IF NOT EXISTS kill_switch_events (
     triggered_by TEXT NOT NULL,
     action_taken TEXT NOT NULL
 );
+
+-- One row per ET trading date: the day's start-of-day equity baseline and
+-- whether the daily loss limit has already halted new entries for it.
+-- Restored on every process start (see WarriorBot.start) so a same-day
+-- restart -- crash, supervisor, or a manual one mid-session -- can't reset
+-- an active halt back to False, or the baseline to whatever equity happens
+-- to be at restart time. Confirmed live, 2026-09-23: three restarts in
+-- quick succession (07:57, 10:52, 11:01 ET) each undid the prior breach's
+-- halt, re-exposing the account to new entries three separate times on a
+-- day already over its loss limit.
+CREATE TABLE IF NOT EXISTS daily_risk_state (
+    trading_date TEXT PRIMARY KEY,
+    start_of_day_equity REAL NOT NULL,
+    loss_limit_halted INTEGER NOT NULL DEFAULT 0,
+    ts_updated TEXT NOT NULL
+);
 """
 
 

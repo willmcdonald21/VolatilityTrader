@@ -136,9 +136,9 @@ class WarriorBot:
         await self.ib_client.connect()
         self.order_manager.resync_open_orders()
         snapshot = self.account_state.snapshot()
-        self.risk_manager.mark_start_of_day(snapshot.net_liquidation)
-        self.journal.record_account_snapshot(snapshot)
         self._trading_day = to_eastern(datetime.now(timezone.utc)).date()
+        self._restore_or_start_daily_risk_state()
+        self.journal.record_account_snapshot(snapshot)
         if self.config.news.enabled and not self._news_provider_codes:
             try:
                 self._news_provider_codes = await discover_provider_codes(self.ib)
@@ -299,10 +299,47 @@ class WarriorBot:
                 "check IBKR directly.",
                 channel="limits",
             )
-        self.reset_daily_state()
+        # Set BEFORE reset_daily_state(), not after -- that method persists
+        # the new day's risk baseline keyed by self._trading_day, and must
+        # see today's date, not the one that just ended.
         self._trading_day = now_et_date
+        self.reset_daily_state()
+
+    def _restore_or_start_daily_risk_state(self) -> None:
+        """Restores today's persisted risk baseline/halt if this process
+        has already established one (a same-day restart), otherwise
+        establishes a fresh one -- the first genuine start of this trading
+        day. The distinction matters: mark_start_of_day always clears the
+        halt, which is correct once per real trading day and wrong on
+        every other restart within it (see RiskManager.load_state's
+        docstring for the live incident this fixes)."""
+        persisted = self.journal.load_daily_risk_state(self._trading_day.isoformat())
+        if persisted is not None:
+            self.risk_manager.load_state(**persisted)
+            self.logger.info(
+                "Restored daily risk state for %s: start_of_day_equity=%.2f halted=%s",
+                self._trading_day,
+                persisted["start_of_day_equity"],
+                persisted["loss_limit_halted"],
+            )
+        else:
+            snapshot = self.account_state.snapshot()
+            self.risk_manager.mark_start_of_day(snapshot.net_liquidation)
+            self._persist_daily_risk_state()
+
+    def _persist_daily_risk_state(self) -> None:
+        equity = self.risk_manager.start_of_day_equity
+        if equity is None:
+            return
+        self.journal.save_daily_risk_state(
+            self._trading_day.isoformat(), equity, self.risk_manager.loss_limit_halted_today
+        )
 
     def _check_flatten_triggers(self) -> None:
+        # Cheap and idempotent -- run every tick so a halt that trips this
+        # cycle is on disk before the next same-day restart, whatever
+        # triggers it.
+        self._persist_daily_risk_state()
         now_et = to_eastern(datetime.now(timezone.utc))
         if not self._eod_flatten_fired and now_et.time() >= self.config.exits.eod_flatten_time:
             self._trigger_flatten("eod_flatten")
@@ -842,6 +879,7 @@ class WarriorBot:
         self.account_state.reset_session()
         snapshot = self.account_state.snapshot()
         self.risk_manager.mark_start_of_day(snapshot.net_liquidation)
+        self._persist_daily_risk_state()
         self.position_manager.clear()
         self._eod_flatten_fired = False
         self._loss_limit_flatten_fired = False

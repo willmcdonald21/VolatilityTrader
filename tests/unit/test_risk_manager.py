@@ -668,3 +668,37 @@ def test_no_loss_limit_halt_when_never_breached(tmp_path):
 
     assert rm.evaluate(make_signal()).accepted
     assert rm._loss_limit_halted_today is False
+
+
+def test_load_state_restores_equity_and_halt_without_clearing_it(tmp_path):
+    # The entire point of load_state vs. mark_start_of_day: restoring a
+    # persisted halt must not un-halt it.
+    rm = make_risk_manager(tmp_path, default_snapshot(net_liquidation=100_000, daily_realized_pnl=0.0))
+
+    rm.load_state(start_of_day_equity=100_000.0, loss_limit_halted=True)
+
+    assert rm.start_of_day_equity == 100_000.0
+    assert rm.loss_limit_halted_today is True
+    assert not rm.evaluate(make_signal()).accepted
+
+
+def test_load_state_restores_a_clean_unhalted_day_too(tmp_path):
+    rm = make_risk_manager(tmp_path, default_snapshot(net_liquidation=100_000, daily_realized_pnl=0.0))
+
+    rm.load_state(start_of_day_equity=100_000.0, loss_limit_halted=False)
+
+    assert rm.loss_limit_halted_today is False
+    assert rm.evaluate(make_signal()).accepted
+
+
+def test_mark_start_of_day_always_clears_the_halt(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, daily_realized_pnl=-2500)
+    rm = make_risk_manager(tmp_path, snapshot, daily_loss_limit_pct=0.02)
+    assert not rm.evaluate(make_signal()).accepted
+    assert rm.loss_limit_halted_today is True
+
+    rm.account_state = FakeAccountState(default_snapshot(net_liquidation=100_000, daily_realized_pnl=0.0))
+    rm.mark_start_of_day(100_000.0)  # a genuine new trading day, not a same-day restart
+
+    assert rm.loss_limit_halted_today is False
+    assert rm.evaluate(make_signal()).accepted
