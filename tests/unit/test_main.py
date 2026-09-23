@@ -369,13 +369,62 @@ def test_bar_update_handler_invokes_on_new_bar_when_has_new_bar(tmp_path):
     contract = SimpleNamespace()
     calls = []
     bot._on_new_bar = lambda c, x: calls.append((c, x))
+    # Two bars: bars[-2] (closed) is the one _make_bar_update_handler must
+    # add -- see test_bar_update_handler_adds_the_closed_bar_not_the_new_one
+    # for the regression this guards against.
+    closed_bar = SimpleNamespace(date=None, open=1, high=1, low=1, close=1, volume=1)
+    forming_bar = SimpleNamespace(date=None, open=2, high=2, low=2, close=2, volume=1)
+    handler = bot._make_bar_update_handler("AAA", contract, ctx)
+
+    handler([closed_bar, forming_bar], True)
+
+    assert len(added_bars) == 1
+    assert calls == [(contract, ctx)]
+
+
+def test_bar_update_handler_adds_the_closed_bar_not_the_new_one(tmp_path):
+    # ib_async's historicalDataUpdate appends a bar and sets has_new_bar=True
+    # the instant a new minute STARTS -- that new bar (bars[-1]) carries only
+    # whatever's printed so far (often a single tick), while bars[-2] is the
+    # bar that just fully closed. Feeding strategies bars[-1] here means
+    # every "current bar" they see is really the barely-started next one,
+    # permanently frozen at its first-tick snapshot (see main.py's
+    # _make_bar_update_handler docstring). Confirmed against
+    # ib_async/wrapper.py's historicalDataUpdate.
+    bot = WarriorBot(make_config(tmp_path))
+    added_bars = []
+    ctx = SimpleNamespace(add_bar=lambda b: added_bars.append(b))
+    contract = SimpleNamespace()
+    bot._on_new_bar = lambda c, x: None
+    closed_bar = SimpleNamespace(date="closed", open=1.0, high=1.5, low=0.9, close=1.4, volume=500)
+    forming_bar = SimpleNamespace(date="forming", open=1.4, high=1.4, low=1.4, close=1.4, volume=1)
+    handler = bot._make_bar_update_handler("AAA", contract, ctx)
+
+    handler([closed_bar, forming_bar], True)
+
+    assert len(added_bars) == 1
+    assert added_bars[0].time == "closed"
+    assert added_bars[0].volume == 500
+
+
+def test_bar_update_handler_skips_first_bar_with_nothing_closed_yet(tmp_path):
+    # A has_new_bar event with only one bar in the list means that lone bar
+    # is itself the brand-new, still-forming one -- there is no bars[-2] yet
+    # with a real, complete range to add. Adding bars[-1] here would just
+    # reintroduce the bug for the very first bar of a subscription.
+    bot = WarriorBot(make_config(tmp_path))
+    added_bars = []
+    ctx = SimpleNamespace(add_bar=lambda b: added_bars.append(b))
+    contract = SimpleNamespace()
+    calls = []
+    bot._on_new_bar = lambda c, x: calls.append((c, x))
     fake_bar = SimpleNamespace(date=None, open=1, high=1, low=1, close=1, volume=1)
     handler = bot._make_bar_update_handler("AAA", contract, ctx)
 
     handler([fake_bar], True)
 
-    assert len(added_bars) == 1
-    assert calls == [(contract, ctx)]
+    assert added_bars == []
+    assert calls == []
 
 
 def test_bar_update_handler_swallows_exception_without_propagating(tmp_path):

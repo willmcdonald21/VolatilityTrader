@@ -549,14 +549,34 @@ class WarriorBot:
         able to silently kill this listener inside eventkit with nothing
         in the log to explain the symbol going quiet -- exactly the
         failure mode under investigation, so this path doesn't get to be
-        the one place in the callback chain without a safety net."""
+        the one place in the callback chain without a safety net.
+
+        bars[-2], not bars[-1], on a new-bar event: ib_async's own
+        historicalDataUpdate (wrapper.py) appends a bar and sets
+        has_new_bar=True the instant a new minute STARTS, with that new
+        bar carrying only whatever trades have printed so far (often just
+        one tick -- open==high==low==close). bars[-1] at that moment is
+        that brand-new, still-forming bar; bars[-2] is the one that just
+        finished and is the only one with a real, complete OHLCV. Every
+        strategy reads ctx.bars[-1] as "the current/just-closed bar", and
+        this array is never revisited after being appended (in-place
+        updates to bars[-1] arrive with has_new_bar=False and are ignored
+        above) -- feeding bars[-1] here permanently froze every bar in
+        ctx.bars at its first-tick snapshot instead of its true range,
+        corrupting entry price, breakout levels, ATR/EMA/VWAP, and
+        relative volume alike. Confirmed against ib_async's wrapper.py
+        (historicalDataUpdate: `if hasNewBar: bars.append(bar)`) and against
+        warrior_bot/backtest/replay.py, which uses keepUpToDate=False and
+        so only ever sees fully-closed bars -- the reason this was invisible
+        to backtesting despite driving most of the strategy's quick,
+        zero-favorable-excursion stop-outs live."""
 
         def on_update(bars, has_new_bar) -> None:
             self._last_bar_at[symbol] = datetime.now(timezone.utc)
-            if not has_new_bar or not bars:
+            if not has_new_bar or len(bars) < 2:
                 return
             try:
-                ctx.add_bar(_bar_from_ib(bars[-1]))
+                ctx.add_bar(_bar_from_ib(bars[-2]))
                 self._on_new_bar(contract, ctx)
             except Exception:
                 self.logger.exception("Live bar callback failed for %s", symbol)
