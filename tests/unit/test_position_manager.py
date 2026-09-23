@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from tests.unit.fixtures import make_bars
-from warrior_bot.config import BreakevenConfig, ExitsConfig, ReversalExitConfig, TrailingConfig
+from warrior_bot.config import BreakevenConfig, ExitsConfig, NotificationsConfig, ReversalExitConfig, TrailingConfig
 from warrior_bot.execution import position_manager as position_manager_module
 from warrior_bot.execution.position_manager import PositionManager
 from warrior_bot.signals.signal import Signal
@@ -1291,3 +1291,77 @@ def test_lots_for_symbol_empty_for_untracked_symbol():
     pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
 
     assert pm.lots_for_symbol("GHOST") == []
+
+
+def _capture_stop_fill_sends(monkeypatch):
+    sent = []
+    monkeypatch.setattr(
+        "warrior_bot.execution.position_manager.send_discord_message",
+        lambda content, channel: sent.append((content, channel)),
+    )
+    return sent
+
+
+def test_replaced_stop_fill_sends_trade_activity_notification(monkeypatch):
+    # journal_fill=True (the default _wire_stop_fill uses for any
+    # cancel-and-replace) means OrderManager never saw this order -- it
+    # only ever attaches its own Discord-sending listener to the ORIGINAL
+    # bracket stop at submit_signal time. Before this fix, a fill here was
+    # journaled but never reached trade_activity at all.
+    ib = FakeIB()
+    pm = PositionManager(
+        ib,
+        FakeJournal(),
+        make_exits_config(trailing_enabled=False),
+        notifications_config=NotificationsConfig(enabled=True, notify_on_fill=True),
+    )
+    sent = _capture_stop_fill_sends(monkeypatch)
+    signal = make_signal(entry=10.0, stop=9.0)
+    # entry_filled=True's debounced resize already cancel-and-replaces the
+    # original stop once -- pos.stop_order is a replacement by the time
+    # track_position returns, exactly the case this fix covers.
+    track_position(pm, signal, quantity=100)
+
+    replaced_stop = pm._positions["TEST"][0].stop_order
+    replaced_trade = find_trade(ib, replaced_stop)
+    replaced_trade.fillEvent.emit(replaced_trade, make_fill(100, price=8.95))
+
+    assert len(sent) == 1
+    content, channel = sent[0]
+    assert channel == "trade_activity"
+    assert "SELL TEST 100 @ $8.95" in content
+    assert "P&L $-105.00" in content  # (8.95 - 10.00) * 100
+
+
+def test_original_unreplaced_stop_fill_is_not_double_notified(monkeypatch):
+    # journal_fill=False is track()'s original bracket stop -- already
+    # covered by OrderManager._attach_tracking's own listener on that same
+    # Trade object, so this path must stay silent for it.
+    ib = FakeIB()
+    pm = PositionManager(
+        ib,
+        FakeJournal(),
+        make_exits_config(trailing_enabled=False),
+        notifications_config=NotificationsConfig(enabled=True, notify_on_fill=True),
+    )
+    sent = _capture_stop_fill_sends(monkeypatch)
+    signal = make_signal(entry=10.0, stop=9.0)
+    stop_trade, _ = track_position(pm, signal, quantity=100, entry_filled=False)
+
+    stop_trade.fillEvent.emit(stop_trade, make_fill(100, price=8.95))
+
+    assert sent == []
+
+
+def test_replaced_stop_fill_notification_respects_notifications_disabled(monkeypatch):
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))  # notifications off by default
+    sent = _capture_stop_fill_sends(monkeypatch)
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, quantity=100)
+
+    replaced_stop = pm._positions["TEST"][0].stop_order
+    replaced_trade = find_trade(ib, replaced_stop)
+    replaced_trade.fillEvent.emit(replaced_trade, make_fill(100, price=8.95))
+
+    assert sent == []

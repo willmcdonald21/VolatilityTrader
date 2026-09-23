@@ -68,7 +68,11 @@ class WarriorBot:
         self.journal = Journal(conn)
         self.account_state = AccountState(self.ib)
         self.position_manager = PositionManager(
-            self.ib, self.journal, config.exits, stop_limit_offset_pct=config.execution.stop_limit_offset_pct
+            self.ib,
+            self.journal,
+            config.exits,
+            stop_limit_offset_pct=config.execution.stop_limit_offset_pct,
+            notifications_config=config.notifications,
         )
         self.risk_manager = RiskManager(
             config.risk,

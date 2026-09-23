@@ -7,7 +7,8 @@ from datetime import datetime, timedelta, timezone
 
 from ib_async import IB, Contract, MarketOrder, Order, StopLimitOrder, StopOrder, Trade
 
-from warrior_bot.config import ExitsConfig
+from warrior_bot.config import ExitsConfig, NotificationsConfig
+from warrior_bot.notify.discord import send_discord_message
 from warrior_bot.persistence.journal import Journal
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import SymbolContext
@@ -96,11 +97,19 @@ class PositionManager:
     and doesn't disturb existing journaling behavior.
     """
 
-    def __init__(self, ib: IB, journal: Journal, config: ExitsConfig, stop_limit_offset_pct: float = 0.5):
+    def __init__(
+        self,
+        ib: IB,
+        journal: Journal,
+        config: ExitsConfig,
+        stop_limit_offset_pct: float = 0.5,
+        notifications_config: NotificationsConfig | None = None,
+    ):
         self.ib = ib
         self.journal = journal
         self.config = config
         self.stop_limit_offset_pct = stop_limit_offset_pct
+        self.notifications_config = notifications_config or NotificationsConfig()
         self._positions: dict[str, list[ManagedPosition]] = {}
 
     def open_lot_count(self, symbol: str) -> int:
@@ -669,11 +678,38 @@ class PositionManager:
                 commission=commission,
                 realized_pnl=realized_pnl,
             )
+            # journal_fill=True means this stop was cancel-and-replaced at
+            # least once (breakeven/trailing) -- track()'s ORIGINAL stop is
+            # the only one OrderManager._attach_tracking ever sees, so its
+            # on_fill is the sole place a stop-loss fill normally reaches
+            # Discord. Every replacement stop's Trade object is wired only
+            # here, in PositionManager, which never sent anything to
+            # Discord at all -- a stop-loss hit on a position that had
+            # already moved to breakeven or was trailing (i.e. most winning
+            # or scratched trades) was silently invisible in trade_activity,
+            # journaled but never notified.
+            self._notify_stop_fill(pos, fill, commission)
 
         filled_qty = fill.execution.shares
         pos.remaining_qty = max(0, pos.remaining_qty - filled_qty)
         if pos.remaining_qty <= 0:
             self._close_out(pos, cancel_stop=False, cancel_target=True)
+
+    def _notify_stop_fill(self, pos: ManagedPosition, fill, commission: float | None) -> None:
+        """Raw trade_activity line for a fill on a replaced stop -- same
+        message shape and same (exit - entry) * shares P&L computation
+        OrderManager.on_fill already uses for every other exit fill, so
+        the channel reads consistently regardless of which class happened
+        to be holding the listener when the order filled."""
+        if not (self.notifications_config.enabled and self.notifications_config.notify_on_fill):
+            return
+        commission_cost = commission if commission is not None and abs(commission) < 1e15 else 0.0
+        trade_pnl = (fill.execution.price - pos.signal.entry_price) * fill.execution.shares - commission_cost
+        send_discord_message(
+            f"💰 SELL {pos.symbol} {fill.execution.shares:g} @ ${fill.execution.price:.2f} "
+            f"(P&L ${trade_pnl:.2f})",
+            channel="trade_activity",
+        )
 
     def _close_out(self, pos: ManagedPosition, cancel_stop: bool, cancel_target: bool) -> None:
         """Everything bought so far has also been sold -- best-effort
