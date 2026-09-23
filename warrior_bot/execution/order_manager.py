@@ -207,9 +207,27 @@ class OrderManager:
                 commission=commission,
                 realized_pnl=realized_pnl,
             )
+            # Not realized_pnl (above): IBKR's paper simulator reports
+            # commissionReport.realizedPNL as ~0.0 on every genuine closing
+            # fill (see account_state.py's daily_realized_pnl docstring --
+            # confirmed against 2,500+ fills), which is why that method
+            # recomputes P&L from raw fill prices instead of trusting the
+            # field. This trade-level notification had the same bug: every
+            # closing fill showed "+$0.00" here while Daily P&L (fed from
+            # the already-fixed daily_realized_pnl) correctly kept dropping
+            # -- two P&L sources in one message, only one of them honest.
+            # Computed the same way: (exit - entry) * shares, net of
+            # commission. entry_price is this specific lot's own entry (the
+            # signal that opened it), not a symbol-wide blend, so an add-on
+            # lot's trim/stop is priced against its own cost, not the
+            # other lot's -- correct even with two lots open at once.
+            trade_pnl = None
+            if role != "parent" and entry_price is not None:
+                commission_cost = commission if commission is not None and abs(commission) < 1e15 else 0.0
+                trade_pnl = (fill.execution.price - entry_price) * fill.execution.shares - commission_cost
             if self.notifications_config.enabled and self.notifications_config.notify_on_fill:
                 label = _FILL_LABELS.get(role, "SELL")
-                pnl_str = f" (P&L ${realized_pnl:.2f})" if realized_pnl is not None else ""
+                pnl_str = f" (P&L ${trade_pnl:.2f})" if trade_pnl is not None else ""
                 pct_str = ""
                 if role == "scale_out" and entry_price:
                     pct_change = (fill.execution.price - entry_price) / entry_price * 100.0
@@ -220,13 +238,13 @@ class OrderManager:
                     channel="trade_activity",
                 )
             if (
-                realized_pnl is not None
+                trade_pnl is not None
                 and self.notifications_config.enabled
                 and self.notifications_config.notify_on_pnl
             ):
-                daily_pnl = self.account_state.snapshot().daily_realized_pnl if self.account_state else realized_pnl
+                daily_pnl = self.account_state.snapshot().daily_realized_pnl if self.account_state else trade_pnl
                 send_discord_message(
-                    build_pnl_message(trade.contract.symbol, realized_pnl, daily_pnl), channel="pnl"
+                    build_pnl_message(trade.contract.symbol, trade_pnl, daily_pnl), channel="pnl"
                 )
             if role == "parent" and signal_id is not None:
                 self._accumulate_entry_fill(signal_id, fill.execution.shares, fill.execution.price)

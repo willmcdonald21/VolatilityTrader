@@ -127,10 +127,12 @@ class FakeAccountState:
         return self._snapshot
 
 
-def make_fill(shares=100, price=10.0, realized_pnl=None):
+def make_fill(shares=100, price=10.0, commission=None, realized_pnl=None):
     commission_report = None
-    if realized_pnl is not None:
-        commission_report = SimpleNamespace(commission=1.0, realizedPNL=realized_pnl)
+    if commission is not None or realized_pnl is not None:
+        commission_report = SimpleNamespace(
+            commission=commission if commission is not None else 1.0, realizedPNL=realized_pnl
+        )
     return SimpleNamespace(execution=SimpleNamespace(shares=shares, price=price), commissionReport=commission_report)
 
 
@@ -199,32 +201,57 @@ def test_entry_fill_labeled_buy_no_pnl_message(monkeypatch):
 
 
 def test_full_exit_fill_labeled_sell_with_pnl(monkeypatch):
+    # commissionReport.realizedPNL (114.0 here) must NOT drive the message --
+    # see test_pnl_message_ignores_brokers_realized_pnl_field below for the
+    # regression this guards against. The P&L shown is computed from
+    # entry_price vs. the fill, net of commission: (6.08 - 5.0) * 100 - 1.0.
     om = make_order_manager(daily_realized_pnl=340.5)
     sent = _capture_sends(monkeypatch, om)
     trade = FakeTrade(FakeOrder(action="SELL"))
-    om._attach_tracking(trade, row_id=1, role="target")
+    om._attach_tracking(trade, row_id=1, role="target", entry_price=5.0)
 
-    trade.fillEvent.emit(trade, make_fill(shares=100, price=6.08, realized_pnl=114.0))
+    trade.fillEvent.emit(trade, make_fill(shares=100, price=6.08, commission=1.0, realized_pnl=114.0))
 
     trade_activity = _by_channel(sent, "trade_activity")
-    assert "SELL AAPL 100 @ $6.08 (P&L $114.00)" in trade_activity[0]
+    assert "SELL AAPL 100 @ $6.08 (P&L $107.00)" in trade_activity[0]
 
     pnl_messages = _by_channel(sent, "pnl")
-    assert pnl_messages == ["📈 AAPL: +$114.00\n📈 Daily P&L: +$340.50"]
+    assert pnl_messages == ["📈 AAPL: +$107.00\n📈 Daily P&L: +$340.50"]
+
+
+def test_pnl_message_ignores_brokers_realized_pnl_field(monkeypatch):
+    # The exact bug from 2026-09-23's trade log: IBKR's paper simulator
+    # reports commissionReport.realizedPNL as ~0.0 on every genuine closing
+    # fill (see account_state.py's daily_realized_pnl docstring), which
+    # made every per-trade Discord line read "+$0.00" while Daily P&L (fed
+    # from the already-fixed daily_realized_pnl) correctly kept dropping.
+    # A real loss here (entry 5.00, exit 4.50) must show as a real loss,
+    # even though the broker's own field claims exactly zero.
+    om = make_order_manager()
+    sent = _capture_sends(monkeypatch, om)
+    trade = FakeTrade(FakeOrder(action="SELL"))
+    om._attach_tracking(trade, row_id=1, role="stop", entry_price=5.0)
+
+    trade.fillEvent.emit(trade, make_fill(shares=100, price=4.5, commission=1.0, realized_pnl=0.0))
+
+    trade_activity = _by_channel(sent, "trade_activity")
+    assert "(P&L $-51.00)" in trade_activity[0]
+    pnl_messages = _by_channel(sent, "pnl")
+    assert pnl_messages[0].startswith("📉 AAPL: -$51.00")
 
 
 def test_stop_exit_fill_also_labeled_sell(monkeypatch):
     om = make_order_manager()
     sent = _capture_sends(monkeypatch, om)
     trade = FakeTrade(FakeOrder(action="SELL"))
-    om._attach_tracking(trade, row_id=1, role="stop")
+    om._attach_tracking(trade, row_id=1, role="stop", entry_price=10.0)
 
-    trade.fillEvent.emit(trade, make_fill(realized_pnl=-50.0))
+    trade.fillEvent.emit(trade, make_fill(price=9.5, commission=1.0))
 
     trade_activity = _by_channel(sent, "trade_activity")
     assert "SELL AAPL" in trade_activity[0]
     pnl_messages = _by_channel(sent, "pnl")
-    assert pnl_messages[0].startswith("📉 AAPL: -$50.00")
+    assert pnl_messages[0].startswith("📉 AAPL: -$51.00")
 
 
 def test_scale_out_fill_labeled_trim(monkeypatch):
@@ -233,7 +260,7 @@ def test_scale_out_fill_labeled_trim(monkeypatch):
     trade = FakeTrade(FakeOrder(action="SELL"))
     om._attach_tracking(trade, row_id=1, role="scale_out", entry_price=5.0)
 
-    trade.fillEvent.emit(trade, make_fill(shares=50, price=6.0, realized_pnl=25.0))
+    trade.fillEvent.emit(trade, make_fill(shares=50, price=6.0))
 
     trade_activity = _by_channel(sent, "trade_activity")
     assert "TRIM AAPL 50 @ $6.00" in trade_activity[0]
@@ -246,7 +273,7 @@ def test_trim_message_includes_pct_gain_from_entry(monkeypatch):
     trade = FakeTrade(FakeOrder(action="SELL"))
     om._attach_tracking(trade, row_id=1, role="scale_out", entry_price=1.79)
 
-    trade.fillEvent.emit(trade, make_fill(shares=1000, price=1.93, realized_pnl=140.0))
+    trade.fillEvent.emit(trade, make_fill(shares=1000, price=1.93))
 
     trade_activity = _by_channel(sent, "trade_activity")
     assert "(+7.8% from entry)" in trade_activity[0]
@@ -258,7 +285,7 @@ def test_trim_message_pct_gain_negative_when_below_entry(monkeypatch):
     trade = FakeTrade(FakeOrder(action="SELL"))
     om._attach_tracking(trade, row_id=1, role="scale_out", entry_price=10.0)
 
-    trade.fillEvent.emit(trade, make_fill(shares=50, price=9.0, realized_pnl=-50.0))
+    trade.fillEvent.emit(trade, make_fill(shares=50, price=9.0))
 
     trade_activity = _by_channel(sent, "trade_activity")
     assert "(-10.0% from entry)" in trade_activity[0]
@@ -270,10 +297,40 @@ def test_non_trim_fills_do_not_include_pct_gain(monkeypatch):
     trade = FakeTrade(FakeOrder(action="SELL"))
     om._attach_tracking(trade, row_id=1, role="target", entry_price=5.0)
 
-    trade.fillEvent.emit(trade, make_fill(shares=100, price=6.0, realized_pnl=100.0))
+    trade.fillEvent.emit(trade, make_fill(shares=100, price=6.0))
 
     trade_activity = _by_channel(sent, "trade_activity")
     assert "from entry" not in trade_activity[0]
+
+
+def test_no_pnl_message_on_entry_fill_even_with_entry_price(monkeypatch):
+    # role="parent" (the opening BUY) must never produce a P&L line, however
+    # entry_price is wired -- there's nothing closed yet to have a P&L.
+    om = make_order_manager()
+    sent = _capture_sends(monkeypatch, om)
+    trade = FakeTrade(FakeOrder(action="BUY"))
+    om._attach_tracking(trade, row_id=1, role="parent", entry_price=5.0)
+
+    trade.fillEvent.emit(trade, make_fill(shares=100, price=5.0))
+
+    assert _by_channel(sent, "pnl") == []
+
+
+def test_no_pnl_message_when_entry_price_unknown(monkeypatch):
+    # resync_open_orders' path can attach tracking without ever learning the
+    # lot's entry price (see _attach_tracking's callers) -- a closing fill
+    # then has nothing to compute P&L against, so it must not fabricate one
+    # (e.g. treating entry_price as 0.0) rather than just posting no P&L.
+    om = make_order_manager()
+    sent = _capture_sends(monkeypatch, om)
+    trade = FakeTrade(FakeOrder(action="SELL"))
+    om._attach_tracking(trade, row_id=1, role="stop")
+
+    trade.fillEvent.emit(trade, make_fill(shares=100, price=6.0))
+
+    trade_activity = _by_channel(sent, "trade_activity")
+    assert "P&L" not in trade_activity[0]
+    assert _by_channel(sent, "pnl") == []
 
 
 def test_no_messages_when_notifications_disabled(monkeypatch):
@@ -291,9 +348,9 @@ def test_pnl_channel_respects_its_own_flag(monkeypatch):
     om = make_order_manager(notify_on_pnl=False)
     sent = _capture_sends(monkeypatch, om)
     trade = FakeTrade(FakeOrder(action="SELL"))
-    om._attach_tracking(trade, row_id=1, role="target")
+    om._attach_tracking(trade, row_id=1, role="target", entry_price=9.0)
 
-    trade.fillEvent.emit(trade, make_fill(realized_pnl=10.0))
+    trade.fillEvent.emit(trade, make_fill(price=10.0))
 
     assert len(_by_channel(sent, "trade_activity")) == 1  # trade_activity still fires
     assert _by_channel(sent, "pnl") == []  # pnl channel does not
