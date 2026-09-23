@@ -1267,3 +1267,27 @@ def test_other_open_lot_none_for_untracked_symbol():
     pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
 
     assert pm.other_open_lot("GHOST", exclude_signal_id=1) is None
+
+
+# -- lots_for_symbol: used by main.py to attribute an emergency-flatten
+# fill back to the signal_id(s) that opened it (see
+# WarriorBot._journal_flatten_fill).
+
+
+def test_lots_for_symbol_returns_all_tracked_lots():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, signal_id=1, order_id_offset=0)
+    track_position(pm, signal, signal_id=2, order_id_offset=10)
+
+    lots = pm.lots_for_symbol("TEST")
+
+    assert {lot.signal_id for lot in lots} == {1, 2}
+
+
+def test_lots_for_symbol_empty_for_untracked_symbol():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+
+    assert pm.lots_for_symbol("GHOST") == []

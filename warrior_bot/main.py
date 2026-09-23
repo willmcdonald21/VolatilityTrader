@@ -4,7 +4,7 @@ import asyncio
 import logging
 from datetime import date, datetime, timedelta, timezone
 
-from ib_async import Contract
+from ib_async import Contract, Order, Trade
 
 from warrior_bot.broker.historical import fetch_prior_close, fetch_warmup_bars
 from warrior_bot.broker.ib_client import IBClient
@@ -315,10 +315,79 @@ class WarriorBot:
         self.logger.warning("Flattening all positions: reason=%s", reason)
         alert(f"Flattening all positions and stopping for the day: reason={reason}", channel="limits")
         panic_stop(
-            self.ib, flatten=True, channel="limits", limit_offset_pct=self.config.execution.flatten_limit_offset_pct
+            self.ib,
+            flatten=True,
+            channel="limits",
+            limit_offset_pct=self.config.execution.flatten_limit_offset_pct,
+            on_order_placed=self._journal_flatten_fill,
         )
         self.position_manager.clear()
         self.journal.record_kill_switch_event(triggered_by=reason, action_taken="cancel_all+flatten_all")
+
+    def _journal_flatten_fill(self, symbol: str, trade: Trade, order: Order) -> None:
+        """Wired as panic.py's on_order_placed hook for every emergency/EOD
+        flatten order -- without this, that order's fill was completely
+        invisible to the journal (no orders/fills row at all, since it
+        bypasses OrderManager.submit_signal entirely), so any position
+        force-closed by the reconciliation watchdog or a routine EOD
+        flatten showed up in dashboard_report.py as "still open, $0
+        realized" forever, no matter what it actually closed at --
+        confirmed live 2026-09-23 while investigating a run of losing days,
+        where this made the true damage from the 2026-09-21 premarket
+        blowup unrecoverable after the fact.
+
+        Pre-creates one `orders` row per currently-tracked lot for this
+        symbol (there can be two, from a pyramid add-on), split by each
+        lot's remaining_qty -- IBKR doesn't know about "lots", only a
+        single aggregate position, so this is a best-effort proportional
+        split, not a precise per-lot attribution. Good enough for P&L:
+        dashboard_report.py sums by signal_id across all of a signal's
+        fills regardless of which physical execution produced them.
+        Silently skipped (logged) if PositionManager has no tracked lot for
+        this symbol at all -- there's no signal_id to journal against
+        (orders.signal_id is NOT NULL), e.g. a position the reconciliation
+        watchdog already found completely orphaned."""
+        lots = self.position_manager.lots_for_symbol(symbol)
+        total_qty = sum(lot.remaining_qty for lot in lots)
+        if not lots or total_qty <= 0:
+            self.logger.warning(
+                "Flatten fill for %s has no tracked lot to journal against -- its exit won't appear in dashboard P&L",
+                symbol,
+            )
+            return
+
+        row_shares = [
+            (
+                self.journal.record_order(
+                    signal_id=lot.signal_id,
+                    ib_order_id=order.orderId,
+                    role="emergency_flatten",
+                    action=order.action,
+                    qty=round(order.totalQuantity * (lot.remaining_qty / total_qty), 4),
+                    order_type=order.orderType,
+                    limit_price=getattr(order, "lmtPrice", None),
+                    stop_price=None,
+                    oca_group=None,
+                    status=trade.orderStatus.status,
+                ),
+                lot.remaining_qty / total_qty,
+            )
+            for lot in lots
+        ]
+
+        def on_fill(t, fill) -> None:
+            commission = fill.commissionReport.commission if fill.commissionReport is not None else None
+            for row_id, share in row_shares:
+                self.journal.record_fill(
+                    order_row_id=row_id,
+                    ib_order_id=order.orderId,
+                    fill_qty=fill.execution.shares * share,
+                    fill_price=fill.execution.price,
+                    commission=commission * share if commission is not None else None,
+                    realized_pnl=None,
+                )
+
+        trade.fillEvent += on_fill
 
     async def _position_reconciliation_loop(self) -> None:
         cfg = self.config.position_reconciliation
@@ -392,6 +461,7 @@ class WarriorBot:
             position,
             channel="limits",
             limit_offset_pct=self.config.execution.flatten_limit_offset_pct,
+            on_order_placed=self._journal_flatten_fill,
         )
         if not placed:
             # A flatten for this symbol is already working -- nothing new to

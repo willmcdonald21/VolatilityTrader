@@ -136,6 +136,15 @@ class PositionManager:
                 return pos
         return None
 
+    def lots_for_symbol(self, symbol: str) -> list[ManagedPosition]:
+        """Every currently-tracked lot for `symbol` -- used by main.py to
+        attribute an emergency-flatten fill (reconciliation watchdog or
+        routine EOD flatten, see warrior_bot/utils/panic.py's
+        on_order_placed hook) back to the signal_id(s) that opened it, so
+        the exit actually lands in the journal instead of leaving that
+        trade showing as "still open, $0 realized" forever."""
+        return list(self._positions.get(symbol, []))
+
     def drop_symbol(self, symbol: str) -> None:
         """Used by main.py's position-reconciliation watchdog when IBKR's
         real position for `symbol` is flat but this class still shows

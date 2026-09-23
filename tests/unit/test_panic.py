@@ -213,3 +213,69 @@ def test_panic_flatten_replaces_orders_that_reqglobalcancel_just_killed(monkeypa
     panic.flatten_all_positions(ib)
 
     assert len(ib.placed) == 1
+
+
+# -- on_order_placed: regression coverage for the 2026-09-23 finding that
+# emergency/EOD flatten fills were never journaled at all (ib.placeOrder()
+# called with no listener attached), so a position force-closed by the
+# reconciliation watchdog or a routine EOD flatten showed up in
+# dashboard_report.py as "still open, $0 realized" forever.
+
+
+def test_flatten_position_calls_on_order_placed_hook(monkeypatch):
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    ib = FakeIB([])
+    calls = []
+
+    panic.flatten_position(
+        ib, make_position("GTEC", 500.0), on_order_placed=lambda symbol, trade, order: calls.append((symbol, order))
+    )
+
+    assert len(calls) == 1
+    symbol, order = calls[0]
+    assert symbol == "GTEC"
+    assert order.totalQuantity == 500.0
+
+
+def test_flatten_position_does_not_call_hook_when_nothing_placed(monkeypatch):
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    ib = FakeIB([])
+    calls = []
+
+    panic.flatten_position(
+        ib, make_position("FLAT", 0.0), on_order_placed=lambda symbol, trade, order: calls.append(symbol)
+    )
+
+    assert calls == []
+
+
+def test_flatten_position_does_not_call_hook_when_flatten_already_pending(monkeypatch):
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    ib = FakeIB([], open_trades=[_open_flatten("GTEC", 500.0)])
+    calls = []
+
+    panic.flatten_position(
+        ib, make_position("GTEC", 500.0), on_order_placed=lambda symbol, trade, order: calls.append(symbol)
+    )
+
+    assert calls == []
+
+
+def test_flatten_all_positions_threads_hook_to_every_position(monkeypatch):
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    ib = FakeIB([make_position("AAA", 100.0), make_position("BBB", 200.0)])
+    calls = []
+
+    panic.flatten_all_positions(ib, on_order_placed=lambda symbol, trade, order: calls.append(symbol))
+
+    assert calls == ["AAA", "BBB"]
+
+
+def test_panic_stop_threads_hook_through_to_flatten(monkeypatch):
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    ib = FakeIB([make_position("AAA", 100.0)])
+    calls = []
+
+    panic.panic_stop(ib, flatten=True, on_order_placed=lambda symbol, trade, order: calls.append(symbol))
+
+    assert calls == ["AAA"]

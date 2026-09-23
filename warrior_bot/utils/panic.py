@@ -3,12 +3,24 @@ from __future__ import annotations
 import copy
 import logging
 from datetime import datetime, time, timezone
+from typing import Callable
 
-from ib_async import IB, LimitOrder, MarketOrder
+from ib_async import IB, LimitOrder, MarketOrder, Order, Trade
 
 from warrior_bot.logging_setup import alert
 from warrior_bot.utils.rounding import round_to_tick
 from warrior_bot.utils.time_utils import to_eastern
+
+# Called (symbol, Trade, Order) right after an emergency-flatten order is
+# placed, so a caller that has a Journal/PositionManager (main.py) can
+# attach fill journaling -- this module deliberately stays free of those
+# dependencies itself (see flatten_position's docstring for why that
+# matters: without a listener here, an emergency-flatten fill was
+# invisible to the journal/dashboard entirely, confirmed live 2026-09-23
+# while investigating a run of losing days -- any position force-closed by
+# the reconciliation watchdog or routine EOD flatten showed as "still
+# open, $0 realized" no matter what it actually closed at).
+OnOrderPlaced = Callable[[str, Trade, Order], None]
 
 logger = logging.getLogger("warrior_bot.utils.panic")
 
@@ -59,6 +71,7 @@ def flatten_position(
     limit_offset_pct: float = 5.0,
     skip_if_pending: bool = True,
     now: datetime | None = None,
+    on_order_placed: OnOrderPlaced | None = None,
 ) -> bool:
     """Closes a single position (one element of ib.positions()); returns
     True if an order was placed, False if there was nothing to do.
@@ -112,12 +125,16 @@ def flatten_position(
     # positions() isn't mutated.
     contract = copy.copy(position.contract)
     contract.exchange = "SMART"
-    ib.placeOrder(contract, order)
+    trade = ib.placeOrder(contract, order)
     alert(f"Flattening {symbol} qty={qty} via {kind} {action}", channel=channel)
+    if on_order_placed is not None:
+        on_order_placed(symbol, trade, order)
     return True
 
 
-def flatten_all_positions(ib: IB, channel: str = "kill_switch", limit_offset_pct: float = 5.0) -> None:
+def flatten_all_positions(
+    ib: IB, channel: str = "kill_switch", limit_offset_pct: float = 5.0, on_order_placed: OnOrderPlaced | None = None
+) -> None:
     """Close every open position. Used by the manual kill switch
     (scripts/kill_switch.py) and by WarriorBot's automatic EOD/daily-loss
     flatten triggers -- intentionally the one place in the bot that sends
@@ -130,13 +147,24 @@ def flatten_all_positions(ib: IB, channel: str = "kill_switch", limit_offset_pct
     cancelled and must be replaced, not respected."""
     positions = ib.positions()
     for pos in positions:
-        flatten_position(ib, pos, channel=channel, limit_offset_pct=limit_offset_pct, skip_if_pending=False)
+        flatten_position(
+            ib,
+            pos,
+            channel=channel,
+            limit_offset_pct=limit_offset_pct,
+            skip_if_pending=False,
+            on_order_placed=on_order_placed,
+        )
     logger.warning("Flatten requested for %d position(s)", len(positions))
 
 
 def panic_stop(
-    ib: IB, flatten: bool = True, channel: str = "kill_switch", limit_offset_pct: float = 5.0
+    ib: IB,
+    flatten: bool = True,
+    channel: str = "kill_switch",
+    limit_offset_pct: float = 5.0,
+    on_order_placed: OnOrderPlaced | None = None,
 ) -> None:
     cancel_all_orders(ib, channel=channel)
     if flatten:
-        flatten_all_positions(ib, channel=channel, limit_offset_pct=limit_offset_pct)
+        flatten_all_positions(ib, channel=channel, limit_offset_pct=limit_offset_pct, on_order_placed=on_order_placed)

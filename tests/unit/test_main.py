@@ -638,6 +638,44 @@ class _FakeTrade:
         self.orderStatus = SimpleNamespace(remaining=remaining if remaining is not None else totalQuantity)
 
 
+class _FakeFillEvent:
+    """Unlike _FakeEventForMain, actually keeps listeners so a test can
+    call .emit() to simulate the flatten order's fill arriving."""
+
+    def __init__(self):
+        self._listeners = []
+
+    def __iadd__(self, listener):
+        self._listeners.append(listener)
+        return self
+
+    def emit(self, *args) -> None:
+        for listener in list(self._listeners):
+            listener(*args)
+
+
+def _fake_placed_trade(action="SELL", orderType="MKT", totalQuantity=770.0, orderId=555):
+    """A placeOrder return value realistic enough for _journal_flatten_fill
+    to wire onto -- has the order/status/fillEvent shape it reads."""
+    order = SimpleNamespace(
+        action=action, orderType=orderType, totalQuantity=totalQuantity, orderId=orderId, lmtPrice=None
+    )
+    trade = SimpleNamespace(orderStatus=SimpleNamespace(status="Submitted"), fillEvent=_FakeFillEvent())
+    return trade, order
+
+
+def _fake_lot(bot, symbol, strategy="gap_and_go", remaining_qty=100.0):
+    """A real signals row (satisfies orders.signal_id's NOT NULL foreign
+    key) plus a duck-typed ManagedPosition stand-in carrying just the two
+    fields _journal_flatten_fill actually reads."""
+    signal = Signal(
+        symbol=symbol, strategy=strategy, side="BUY", entry_price=10.0, stop_price=9.0, target_price=12.0,
+        ts=datetime.now(timezone.utc),
+    )
+    signal_id = bot.journal.record_signal(signal)
+    return SimpleNamespace(signal_id=signal_id, remaining_qty=remaining_qty)
+
+
 def test_reconciliation_drops_stale_local_tracking_when_broker_flat(tmp_path, monkeypatch):
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
@@ -733,14 +771,149 @@ def test_reconciliation_sums_partial_stop_coverage_across_multiple_orders(tmp_pa
 def test_reconciliation_untracks_symbol_after_emergency_flatten(tmp_path, monkeypatch):
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
-    bot.position_manager._positions["UCAR"] = [object()]
+    bot.position_manager._positions["UCAR"] = [_fake_lot(bot, "UCAR", remaining_qty=770.0)]
     bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
     bot.ib.openTrades = lambda: []
-    bot.ib.placeOrder = lambda contract, order: None
+    bot.ib.placeOrder = lambda contract, order: _fake_placed_trade()[0]
 
     bot._check_position_reconciliation()
 
     assert "UCAR" not in bot.position_manager.tracked_symbols()
+
+
+# -- _journal_flatten_fill: regression coverage for the 2026-09-23 finding
+# that emergency/EOD flatten orders were never journaled at all (no
+# orders/fills row -- ib.placeOrder() called directly with no listener),
+# so any position force-closed by the reconciliation watchdog or a routine
+# EOD flatten showed up in dashboard_report.py as "still open, $0
+# realized" forever, understating the true damage on days like 2026-09-21.
+
+
+def _fetch_fills_for_signal(bot, signal_id):
+    columns = ["role", "action", "order_qty", "fill_qty", "fill_price", "commission"]
+    rows = bot.journal.conn.execute(
+        "SELECT o.role, o.action, o.qty AS order_qty, f.fill_qty, f.fill_price, f.commission "
+        "FROM orders o JOIN fills f ON f.order_id = o.id WHERE o.signal_id = ?",
+        (signal_id,),
+    ).fetchall()
+    return [dict(zip(columns, row)) for row in rows]
+
+
+def test_journal_flatten_fill_records_order_and_fill_for_single_lot(tmp_path, monkeypatch):
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    lot = _fake_lot(bot, "UCAR", remaining_qty=770.0)
+    bot.position_manager._positions["UCAR"] = [lot]
+    trade, order = _fake_placed_trade(action="SELL", totalQuantity=770.0)
+
+    bot._journal_flatten_fill("UCAR", trade, order)
+    trade.fillEvent.emit(trade, SimpleNamespace(execution=SimpleNamespace(shares=770.0, price=4.5), commissionReport=None))
+
+    fills = _fetch_fills_for_signal(bot, lot.signal_id)
+    assert len(fills) == 1
+    assert fills[0]["role"] == "emergency_flatten"
+    assert fills[0]["action"] == "SELL"
+    assert fills[0]["fill_qty"] == 770.0
+    assert fills[0]["fill_price"] == 4.5
+
+
+def test_journal_flatten_fill_splits_proportionally_across_two_lots(tmp_path, monkeypatch):
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    lot_a = _fake_lot(bot, "UCAR", remaining_qty=300.0)  # 30% of the combined position
+    lot_b = _fake_lot(bot, "UCAR", remaining_qty=700.0)  # 70%
+    bot.position_manager._positions["UCAR"] = [lot_a, lot_b]
+    trade, order = _fake_placed_trade(action="SELL", totalQuantity=1000.0)
+
+    bot._journal_flatten_fill("UCAR", trade, order)
+    trade.fillEvent.emit(trade, SimpleNamespace(execution=SimpleNamespace(shares=1000.0, price=2.0), commissionReport=None))
+
+    fills_a = _fetch_fills_for_signal(bot, lot_a.signal_id)
+    fills_b = _fetch_fills_for_signal(bot, lot_b.signal_id)
+    assert fills_a[0]["fill_qty"] == 300.0
+    assert fills_b[0]["fill_qty"] == 700.0
+    # both lots' order rows reflect the same real order size, split the same way
+    assert fills_a[0]["order_qty"] == 300.0
+    assert fills_b[0]["order_qty"] == 700.0
+
+
+def test_journal_flatten_fill_splits_commission_proportionally(tmp_path, monkeypatch):
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    lot_a = _fake_lot(bot, "UCAR", remaining_qty=250.0)  # 25%
+    lot_b = _fake_lot(bot, "UCAR", remaining_qty=750.0)  # 75%
+    bot.position_manager._positions["UCAR"] = [lot_a, lot_b]
+    trade, order = _fake_placed_trade(action="SELL", totalQuantity=1000.0)
+
+    bot._journal_flatten_fill("UCAR", trade, order)
+    trade.fillEvent.emit(
+        trade,
+        SimpleNamespace(
+            execution=SimpleNamespace(shares=1000.0, price=2.0),
+            commissionReport=SimpleNamespace(commission=4.0, realizedPNL=None),
+        ),
+    )
+
+    fills_a = _fetch_fills_for_signal(bot, lot_a.signal_id)
+    fills_b = _fetch_fills_for_signal(bot, lot_b.signal_id)
+    assert fills_a[0]["commission"] == 1.0
+    assert fills_b[0]["commission"] == 3.0
+
+
+def test_journal_flatten_fill_skips_when_no_tracked_lot(tmp_path, monkeypatch):
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    trade, order = _fake_placed_trade()
+
+    bot._journal_flatten_fill("GHOST", trade, order)  # nothing tracked for GHOST -- must not raise
+
+    assert bot.journal.conn.execute("SELECT count(*) FROM orders").fetchone()[0] == 0
+
+
+def test_journal_flatten_fill_wired_through_emergency_flatten_end_to_end(tmp_path, monkeypatch):
+    # Exercises the real call path: _check_position_reconciliation ->
+    # _emergency_flatten_symbol -> flatten_position -> on_order_placed.
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    lot = _fake_lot(bot, "UCAR", remaining_qty=770.0)
+    bot.position_manager._positions["UCAR"] = [lot]
+    bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
+    bot.ib.openTrades = lambda: []
+    placed_trade, _ = _fake_placed_trade(action="SELL", totalQuantity=770.0)
+    bot.ib.placeOrder = lambda contract, order: placed_trade
+
+    bot._check_position_reconciliation()
+    placed_trade.fillEvent.emit(
+        placed_trade, SimpleNamespace(execution=SimpleNamespace(shares=770.0, price=4.5), commissionReport=None)
+    )
+
+    fills = _fetch_fills_for_signal(bot, lot.signal_id)
+    assert len(fills) == 1
+    assert fills[0]["role"] == "emergency_flatten"
+
+
+def test_journal_flatten_fill_wired_through_trigger_flatten_end_to_end(tmp_path, monkeypatch):
+    # Exercises the routine EOD/loss-limit path: _trigger_flatten ->
+    # panic_stop -> flatten_all_positions -> flatten_position -> on_order_placed.
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    monkeypatch.setattr("warrior_bot.utils.panic.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    lot = _fake_lot(bot, "UCAR", remaining_qty=770.0)
+    bot.position_manager._positions["UCAR"] = [lot]
+    bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
+    bot.ib.openTrades = lambda: []
+    placed_trade, _ = _fake_placed_trade(action="SELL", totalQuantity=770.0)
+    bot.ib.placeOrder = lambda contract, order: placed_trade
+    bot.ib.reqGlobalCancel = lambda: None
+
+    bot._trigger_flatten("eod_flatten")
+    placed_trade.fillEvent.emit(
+        placed_trade, SimpleNamespace(execution=SimpleNamespace(shares=770.0, price=4.5), commissionReport=None)
+    )
+
+    fills = _fetch_fills_for_signal(bot, lot.signal_id)
+    assert len(fills) == 1
+    assert fills[0]["role"] == "emergency_flatten"
 
 
 class _RankCtx:
