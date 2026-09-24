@@ -73,6 +73,7 @@ class WarriorBot:
             config.exits,
             stop_limit_offset_pct=config.execution.stop_limit_offset_pct,
             notifications_config=config.notifications,
+            account_state=self.account_state,
         )
         self.risk_manager = RiskManager(
             config.risk,

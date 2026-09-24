@@ -1302,6 +1302,17 @@ def _capture_stop_fill_sends(monkeypatch):
     return sent
 
 
+def _replaced_stop_fill(ib, pm, signal, price=8.95, qty=100):
+    """Fills pm's current (already cancel-and-replaced, per the debounced
+    resize on entry_filled=True) stop order at `price` and returns the fill
+    for assertions. Factored out since every test below needs exactly this
+    setup to reach _notify_stop_fill's journal_fill=True branch."""
+    track_position(pm, signal, quantity=qty)
+    replaced_stop = pm._positions[signal.symbol][0].stop_order
+    replaced_trade = find_trade(ib, replaced_stop)
+    replaced_trade.fillEvent.emit(replaced_trade, make_fill(qty, price=price))
+
+
 def test_replaced_stop_fill_sends_trade_activity_notification(monkeypatch):
     # journal_fill=True (the default _wire_stop_fill uses for any
     # cancel-and-replace) means OrderManager never saw this order -- it
@@ -1313,18 +1324,14 @@ def test_replaced_stop_fill_sends_trade_activity_notification(monkeypatch):
         ib,
         FakeJournal(),
         make_exits_config(trailing_enabled=False),
-        notifications_config=NotificationsConfig(enabled=True, notify_on_fill=True),
+        notifications_config=NotificationsConfig(enabled=True, notify_on_fill=True, notify_on_pnl=False),
     )
     sent = _capture_stop_fill_sends(monkeypatch)
     signal = make_signal(entry=10.0, stop=9.0)
     # entry_filled=True's debounced resize already cancel-and-replaces the
     # original stop once -- pos.stop_order is a replacement by the time
     # track_position returns, exactly the case this fix covers.
-    track_position(pm, signal, quantity=100)
-
-    replaced_stop = pm._positions["TEST"][0].stop_order
-    replaced_trade = find_trade(ib, replaced_stop)
-    replaced_trade.fillEvent.emit(replaced_trade, make_fill(100, price=8.95))
+    _replaced_stop_fill(ib, pm, signal)
 
     assert len(sent) == 1
     content, channel = sent[0]
@@ -1333,16 +1340,65 @@ def test_replaced_stop_fill_sends_trade_activity_notification(monkeypatch):
     assert "P&L $-105.00" in content  # (8.95 - 10.00) * 100
 
 
-def test_original_unreplaced_stop_fill_is_not_double_notified(monkeypatch):
-    # journal_fill=False is track()'s original bracket stop -- already
-    # covered by OrderManager._attach_tracking's own listener on that same
-    # Trade object, so this path must stay silent for it.
+def test_replaced_stop_fill_sends_pnl_channel_message(monkeypatch):
+    # Confirmed live, 2026-09-24: the 2026-09-23 fix only ever called
+    # send_discord_message for trade_activity -- nothing here ever built or
+    # sent a pnl-channel message, so a replaced stop's fill (most stop-outs,
+    # since breakeven/trailing replace the stop almost immediately after
+    # entry) stayed just as invisible in the pnl channel as it was before
+    # that fix, even though trade_activity now showed it correctly.
     ib = FakeIB()
     pm = PositionManager(
         ib,
         FakeJournal(),
         make_exits_config(trailing_enabled=False),
-        notifications_config=NotificationsConfig(enabled=True, notify_on_fill=True),
+        notifications_config=NotificationsConfig(enabled=True, notify_on_fill=False, notify_on_pnl=True),
+    )
+    sent = _capture_stop_fill_sends(monkeypatch)
+    signal = make_signal(entry=10.0, stop=9.0)
+    _replaced_stop_fill(ib, pm, signal)
+
+    assert len(sent) == 1
+    content, channel = sent[0]
+    assert channel == "pnl"
+    assert "TEST: -$105.00" in content  # (8.95 - 10.00) * 100
+
+
+def test_replaced_stop_fill_pnl_message_uses_account_states_running_daily_total(monkeypatch):
+    ib = FakeIB()
+
+    class FakeAccountState:
+        def snapshot(self):
+            from types import SimpleNamespace
+
+            return SimpleNamespace(daily_realized_pnl=-842.50)
+
+    pm = PositionManager(
+        ib,
+        FakeJournal(),
+        make_exits_config(trailing_enabled=False),
+        notifications_config=NotificationsConfig(enabled=True, notify_on_fill=False, notify_on_pnl=True),
+        account_state=FakeAccountState(),
+    )
+    sent = _capture_stop_fill_sends(monkeypatch)
+    signal = make_signal(entry=10.0, stop=9.0)
+    _replaced_stop_fill(ib, pm, signal)
+
+    content, _ = sent[0]
+    assert "Daily P&L: -$842.50" in content  # the account's running total, not just this one fill
+
+
+def test_original_unreplaced_stop_fill_is_not_double_notified(monkeypatch):
+    # journal_fill=False is track()'s original bracket stop -- already
+    # covered by OrderManager._attach_tracking's own listener on that same
+    # Trade object, so this path must stay silent for it (trade_activity
+    # AND pnl -- OrderManager sends both for this fill already).
+    ib = FakeIB()
+    pm = PositionManager(
+        ib,
+        FakeJournal(),
+        make_exits_config(trailing_enabled=False),
+        notifications_config=NotificationsConfig(enabled=True, notify_on_fill=True, notify_on_pnl=True),
     )
     sent = _capture_stop_fill_sends(monkeypatch)
     signal = make_signal(entry=10.0, stop=9.0)
@@ -1358,10 +1414,21 @@ def test_replaced_stop_fill_notification_respects_notifications_disabled(monkeyp
     pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))  # notifications off by default
     sent = _capture_stop_fill_sends(monkeypatch)
     signal = make_signal(entry=10.0, stop=9.0)
-    track_position(pm, signal, quantity=100)
+    _replaced_stop_fill(ib, pm, signal)
 
-    replaced_stop = pm._positions["TEST"][0].stop_order
-    replaced_trade = find_trade(ib, replaced_stop)
-    replaced_trade.fillEvent.emit(replaced_trade, make_fill(100, price=8.95))
+    assert sent == []
+
+
+def test_replaced_stop_fill_pnl_message_respects_notify_on_pnl_toggle(monkeypatch):
+    ib = FakeIB()
+    pm = PositionManager(
+        ib,
+        FakeJournal(),
+        make_exits_config(trailing_enabled=False),
+        notifications_config=NotificationsConfig(enabled=True, notify_on_fill=False, notify_on_pnl=False),
+    )
+    sent = _capture_stop_fill_sends(monkeypatch)
+    signal = make_signal(entry=10.0, stop=9.0)
+    _replaced_stop_fill(ib, pm, signal)
 
     assert sent == []
