@@ -13,7 +13,8 @@ execution:
   stop_limit_offset_pct: 0.5     # stop-loss is a stop-limit order; limit sits this % beyond the trigger (IBKR rejects plain market/stop orders outside RTH)
 
 risk:
-  daily_loss_limit_pct: 0.10     # TEMP for 2026-09-23 only -- was 0.02, raised so today's real -$965.71 loss (already past the 2% cap) stops halting new entries. Revert to 0.02 before tomorrow's session.
+  daily_loss_limit_pct: 0.5      # Deliberately off (2026-09-24, user request): paper account, collecting more data post the 09-23 bar-timing/P&L-reporting fixes. Was 0.02 -> 0.10 (temp, 09-23) -> 0.5, the config's own upper bound (gt=0, le=0.5) -- as close to fully disabled as this field allows.
+                                   # Every other risk control stays on: per-trade risk sizing, max_stop_distance_pct, max_concurrent_positions, EOD flatten, position reconciliation watchdog. Revert this one when done collecting data.
   flatten_on_daily_loss_limit: true  # force-close open positions when the daily halt triggers -- enabled for the unattended overnight test since no one can intervene manually
   max_concurrent_positions: 5
   reserved_top_tier_slots: 1       # slots held back exclusively for scanner_rank <= reserved_top_tier_max_rank, used only once the other slots are full
