@@ -116,15 +116,31 @@ def test_no_signal_when_red_to_green_bar_too_extended():
 
 
 def test_red_to_green_signal_when_extension_gate_loosened_enough():
+    # Two independent gates now (see is_entry_too_extended) -- both must be
+    # loosened for this bar (10% past prior_close) to get through.
     ctx = make_ctx(
         bar_specs=_CALM_RED_TO_GREEN_BARS + [(9.5, 11.0, 9.5, 11.0, 5000)],
         prior_close=10.0,
         avg_daily_volume=10_000,
     )
-    strategy = VwapReversionStrategy(VwapReversionConfig(max_extension_atr_multiple=1000.0))
+    strategy = VwapReversionStrategy(
+        VwapReversionConfig(max_extension_atr_multiple=1000.0, max_extension_pct=1000.0)
+    )
     signal = strategy.evaluate(ctx, NOW)
     assert signal is not None
     assert signal.context["setup"] == "red_to_green"
+
+
+def test_no_red_to_green_signal_when_only_the_atr_gate_is_loosened():
+    # Confirmed live, 2026-09-25: the ATR gate alone fired zero times ever
+    # -- max_extension_pct is the gate that actually has to hold here.
+    ctx = make_ctx(
+        bar_specs=_CALM_RED_TO_GREEN_BARS + [(9.5, 11.0, 9.5, 11.0, 5000)],
+        prior_close=10.0,
+        avg_daily_volume=10_000,
+    )
+    strategy = VwapReversionStrategy(VwapReversionConfig(max_extension_atr_multiple=1000.0))  # pct left at default (3.0)
+    assert strategy.evaluate(ctx, NOW) is None
 
 
 _CALM_VWAP_BOUNCE_BARS = [(10.0, 10.01, 9.99, 10.0, 1000)] * 18  # tight range, holds VWAP near 10.0
@@ -158,10 +174,26 @@ def test_vwap_bounce_signal_when_extension_gate_loosened_enough():
         prior_close=5.0,
         avg_daily_volume=5_000,
     )
-    strategy = VwapReversionStrategy(VwapReversionConfig(max_extension_atr_multiple=1000.0))
+    strategy = VwapReversionStrategy(
+        VwapReversionConfig(max_extension_atr_multiple=1000.0, max_extension_pct=1000.0)
+    )
     signal = strategy.evaluate(ctx, NOW)
     assert signal is not None
     assert signal.context["setup"] == "vwap_bounce"
+
+
+def test_no_vwap_bounce_signal_when_only_the_atr_gate_is_loosened():
+    ctx = make_ctx(
+        bar_specs=_CALM_VWAP_BOUNCE_BARS
+        + [
+            (10.0, 10.05, 9.95, 9.98, 1000),
+            (9.98, 10.8, 9.98, 10.8, 1000),
+        ],
+        prior_close=5.0,
+        avg_daily_volume=5_000,
+    )
+    strategy = VwapReversionStrategy(VwapReversionConfig(max_extension_atr_multiple=1000.0))  # pct left at default (3.0)
+    assert strategy.evaluate(ctx, NOW) is None
 
 
 def test_does_not_retrigger_same_symbol_same_day():

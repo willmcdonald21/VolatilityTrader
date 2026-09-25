@@ -76,7 +76,9 @@ class GapAndGoStrategy(BaseStrategy):
         if candle_strength(current_bar) < cfg.min_breakout_candle_strength:
             return self._reject(ctx, "weak_breakout_candle")
 
-        if is_entry_too_extended(current_bar, breakout_high, ctx.atr(), cfg.max_extension_atr_multiple):
+        if is_entry_too_extended(
+            current_bar, breakout_high, ctx.atr(), cfg.max_extension_atr_multiple, cfg.max_extension_pct
+        ):
             return self._reject(ctx, "breakout_too_extended")
 
         entry_price = current_bar.close

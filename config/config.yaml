@@ -75,6 +75,9 @@ strategies:
     min_float_rotation: 0.0        # day's cumulative volume / float; 0 = disabled (also needs float_list.csv data)
     min_breakout_candle_strength: 0.0  # (close-open)/(high-low) of the breakout bar; 0.0 = must close net-bullish, not just above the level
     max_extension_atr_multiple: 2.5  # reject if the breakout bar already closed this many ATRs past the opening-range high -- GDC/DCOY/EDBL (2026-09-22) all chased a bar that had already run 3-40% past the level and reversed within minutes
+    max_extension_pct: 3.0  # PRIMARY guard -- the ATR check above has fired zero times ever (a stock's own trailing ATR inflates as it spikes,
+                             # loosening the multiple right when it should tighten). Flat % of the breakout level instead: 1-3% extended was the
+                             # single most profitable bucket in the strategy (+$1,474.57/27 trades); 6%+ extended was 0-for-12.
   bull_flag:
     enabled: true
     min_spike_pct: 5.0            # minimum initial move (over lookback) to qualify as a spike
@@ -102,6 +105,7 @@ strategies:
     stop_buffer_pct: 0.5
     target_r_multiple: 1.5
     max_extension_atr_multiple: 2.5  # same guard as gap_and_go's field of the same name, applied to both sub-setups' own trigger level (VWAP / prior day's close)
+    max_extension_pct: 3.0  # PRIMARY guard -- see gap_and_go's field of the same name
   inverted_head_and_shoulders:
     enabled: false                 # secondary/non-primary pattern from a live trade recap, not one of the four core taught setups -- off until validated against real sessions
     min_rel_volume: 5.0            # same hard floor -- blanket five-pillars criterion

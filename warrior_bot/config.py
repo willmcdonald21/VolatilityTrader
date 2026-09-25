@@ -183,6 +183,15 @@ class GapAndGoConfig(BaseModel):
     # reversed and hit the stop within minutes with zero favorable
     # excursion. See is_entry_too_extended in strategies/indicators.py.
     max_extension_atr_multiple: float = Field(default=2.5, gt=0)
+    # PRIMARY guard against the same chase -- the ATR check above has fired
+    # zero times, ever (confirmed live, 2026-09-25): a stock's own trailing
+    # ATR inflates right as it spikes, since the spike bars are themselves
+    # in the lookback, which loosens the ATR multiple exactly when it
+    # should tighten. A flat % of the breakout level has no such feedback
+    # loop. Calibrated directly off the journal: entries within 1-3% of the
+    # breakout level were the single most profitable bucket in the whole
+    # strategy (+$1,474.57 over 27 trades); entries 6%+ past it were 0-for-12.
+    max_extension_pct: float = Field(default=3.0, gt=0)
 
 
 class PullbackQualityConfig(BaseModel):
@@ -253,6 +262,9 @@ class VwapReversionConfig(BaseModel):
     # entered on a bar that had already run 10-40% past its trigger level
     # within that single 1-minute bar. See is_entry_too_extended.
     max_extension_atr_multiple: float = Field(default=2.5, gt=0)
+    # PRIMARY guard -- see gap_and_go's field of the same name for why the
+    # ATR check above has never once fired live.
+    max_extension_pct: float = Field(default=3.0, gt=0)
 
 
 class InvertedHeadAndShouldersConfig(BaseModel):

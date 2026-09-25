@@ -31,7 +31,7 @@ def test_breakout_triggers_signal():
             (5.6, 5.8, 5.5, 5.7, 1000),
             (5.7, 5.9, 5.6, 5.75, 1000),
             (5.75, 5.85, 5.7, 5.8, 1000),
-            (5.8, 6.5, 5.8, 6.5, 1000),  # breakout bar
+            (5.8, 6.0, 5.8, 6.0, 1000),  # breakout bar -- controlled: ~1.7% past the 5.9 opening-range high, under the 3% extension cap
         ]
     )
     strategy = GapAndGoStrategy(default_config())
@@ -39,7 +39,7 @@ def test_breakout_triggers_signal():
     assert signal is not None
     assert signal.symbol == "GOGO"
     assert signal.strategy == "gap_and_go"
-    assert signal.entry_price == 6.5
+    assert signal.entry_price == 6.0
     assert signal.stop_price < signal.entry_price
     assert signal.target_price > signal.entry_price
     assert signal.context["round_number_breakout"] is True  # crosses $6.0 on the breakout bar
@@ -155,7 +155,7 @@ def test_does_not_retrigger_same_symbol_same_day():
             (5.6, 5.8, 5.5, 5.7, 1000),
             (5.7, 5.9, 5.6, 5.75, 1000),
             (5.75, 5.85, 5.7, 5.8, 1000),
-            (5.8, 6.5, 5.8, 6.5, 1000),
+            (5.8, 6.0, 5.8, 6.0, 1000),
         ]
     )
     strategy = GapAndGoStrategy(default_config())
@@ -170,7 +170,7 @@ BREAKOUT_BARS = [
     (5.6, 5.8, 5.5, 5.7, 1000),
     (5.7, 5.9, 5.6, 5.75, 1000),
     (5.75, 5.85, 5.7, 5.8, 1000),
-    (5.8, 6.5, 5.8, 6.5, 1000),  # breakout bar
+    (5.8, 6.0, 5.8, 6.0, 1000),  # breakout bar
 ]
 
 
@@ -283,6 +283,9 @@ def test_no_signal_when_breakout_bar_too_extended():
 
 
 def test_signal_when_extension_gate_loosened_enough():
+    # Two independent gates now (see is_entry_too_extended) -- both must be
+    # loosened for an extended bar like this one (26% past the level) to
+    # get through.
     ctx = make_ctx(
         [
             (5.5, 5.55, 5.45, 5.5, 1000),
@@ -292,8 +295,26 @@ def test_signal_when_extension_gate_loosened_enough():
             (5.5, 7.0, 5.5, 7.0, 1000),
         ]
     )
-    strategy = GapAndGoStrategy(default_config(max_extension_atr_multiple=100.0))
+    strategy = GapAndGoStrategy(default_config(max_extension_atr_multiple=100.0, max_extension_pct=100.0))
     assert strategy.evaluate(ctx, NOW) is not None
+
+
+def test_no_signal_when_only_the_atr_gate_is_loosened():
+    # Confirmed live, 2026-09-25: this was exactly the live bug -- the ATR
+    # gate alone fired zero times ever (a stock's own trailing ATR inflates
+    # as it spikes, loosening the multiple right when it should tighten).
+    # max_extension_pct is the gate that actually has to hold here.
+    ctx = make_ctx(
+        [
+            (5.5, 5.55, 5.45, 5.5, 1000),
+            (5.5, 5.55, 5.45, 5.5, 1000),
+            (5.5, 5.55, 5.45, 5.5, 1000),
+            (5.5, 5.55, 5.45, 5.5, 1000),
+            (5.5, 7.0, 5.5, 7.0, 1000),  # 26% past the 5.55 opening-range high
+        ]
+    )
+    strategy = GapAndGoStrategy(default_config(max_extension_atr_multiple=100.0))  # max_extension_pct left at its default (3.0)
+    assert strategy.evaluate(ctx, NOW) is None
 
 
 def test_signal_when_breakout_bar_close_to_the_level():
@@ -310,7 +331,7 @@ def test_reset_daily_allows_retrigger():
             (5.6, 5.8, 5.5, 5.7, 1000),
             (5.7, 5.9, 5.6, 5.75, 1000),
             (5.75, 5.85, 5.7, 5.8, 1000),
-            (5.8, 6.5, 5.8, 6.5, 1000),
+            (5.8, 6.0, 5.8, 6.0, 1000),
         ]
     )
     strategy = GapAndGoStrategy(default_config())

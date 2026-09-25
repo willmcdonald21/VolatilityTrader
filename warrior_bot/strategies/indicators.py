@@ -337,7 +337,13 @@ def average_true_range(bars: list[Bar], period: int = 14) -> float | None:
     return sum(trs) / len(trs)
 
 
-def is_entry_too_extended(current_bar: Bar, trigger_level: float, atr: float | None, max_atr_multiple: float) -> bool:
+def is_entry_too_extended(
+    current_bar: Bar,
+    trigger_level: float,
+    atr: float | None,
+    max_atr_multiple: float,
+    max_extension_pct: float | None = None,
+) -> bool:
     """True when the bar being entered on has already travelled too far
     past its own trigger level (an opening-range high, VWAP, or a
     crossing level -- whatever the calling strategy is breaking out
@@ -353,12 +359,31 @@ def is_entry_too_extended(current_bar: Bar, trigger_level: float, atr: float | N
     excursion first: not a stop-placement problem, an entry-quality one --
     buying the exact top of an already-exhausted spike.
 
-    Measured in ATR, not a fixed percentage, since a "big" move means
-    something different on a $1 stock than a $15 one, and something
-    different on a quiet day than a wild one -- ATR already captures both.
-    Unmeasurable (no ATR yet, e.g. too few bars) fails open (returns
-    False) rather than blocking every early-session signal."""
+    Two independent checks, either one enough to reject:
+
+    - `max_extension_pct` (checked first, whenever a positive trigger_level
+      is available): a flat % of the trigger level. Confirmed live,
+      2026-09-25: the ATR check below fired ZERO times, ever, across the
+      full journal, including the two days since it shipped (2026-09-23)
+      -- not because entries stopped chasing (four more 6-9%-extended
+      gap_and_go fills landed after it deployed, all losers, one of them
+      part of a 0-for-12 bucket at that extension level) but because ATR
+      is computed from the same trailing
+      bars the spike itself is now part of: the more violently a stock is
+      running, the more its own recent-bar ATR inflates, loosening the
+      multiple right when it should tighten. A flat percentage has no such
+      feedback loop.
+    - `max_atr_multiple` (the original check): kept as a second,
+      complementary signal for symbols where ATR is a meaningful measure
+      of normal noise rather than a reflection of the spike itself.
+      Unmeasurable ATR (too few bars) fails open on this check specifically
+      -- the percentage check above already provides a hard floor
+      regardless, so failing open here no longer means failing open
+      entirely."""
+    extension = current_bar.close - trigger_level
+    if max_extension_pct is not None and trigger_level > 0:
+        if extension > trigger_level * (max_extension_pct / 100.0):
+            return True
     if atr is None or atr <= 0:
         return False
-    extension = current_bar.close - trigger_level
     return extension > atr * max_atr_multiple

@@ -47,7 +47,9 @@ class VwapReversionStrategy(BaseStrategy):
         if rel_vol is None or rel_vol < cfg.red_to_green_volume_multiple:
             return self._reject(ctx, "red_to_green_relative_volume")
 
-        if is_entry_too_extended(current_bar, ctx.prior_close, ctx.atr(), cfg.max_extension_atr_multiple):
+        if is_entry_too_extended(
+            current_bar, ctx.prior_close, ctx.atr(), cfg.max_extension_atr_multiple, cfg.max_extension_pct
+        ):
             return self._reject(ctx, "red_to_green_too_extended")
 
         entry_price = current_bar.close
@@ -86,7 +88,9 @@ class VwapReversionStrategy(BaseStrategy):
         if rel_vol is None or rel_vol < cfg.min_rel_volume:
             return self._reject(ctx, "vwap_bounce_relative_volume")
 
-        if is_entry_too_extended(current_bar, vwap_price, ctx.atr(), cfg.max_extension_atr_multiple):
+        if is_entry_too_extended(
+            current_bar, vwap_price, ctx.atr(), cfg.max_extension_atr_multiple, cfg.max_extension_pct
+        ):
             return self._reject(ctx, "vwap_bounce_too_extended")
 
         entry_price = current_bar.close

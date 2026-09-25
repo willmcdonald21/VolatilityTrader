@@ -448,3 +448,50 @@ def test_is_entry_too_extended_respects_configured_multiple():
     # extension = 4.73 - 4.19 = 0.54; at atr=0.15, 0.54 / 0.15 = 3.6x
     assert is_entry_too_extended(bar, 4.19, atr=0.15, max_atr_multiple=3.6) is False  # exactly at the line -- not over
     assert is_entry_too_extended(bar, 4.19, atr=0.15, max_atr_multiple=3.5) is True  # a hair looser -- now over
+
+
+def test_is_entry_too_extended_pct_rejects_even_when_atr_check_would_pass():
+    # Confirmed live, 2026-09-25: the ATR check alone fired zero times
+    # ever, because a stock's own trailing ATR inflates as it spikes --
+    # the spike bars are themselves in its lookback window, loosening the
+    # multiple right when it should tighten. max_extension_pct has no such
+    # feedback loop: it's a flat % of the trigger level, independent of ATR.
+    bar = make_bars([(4.41, 5.26, 4.38, 4.73, 1000)])[0]
+    trigger_level = 4.19
+    huge_atr = 10.0  # so loose the ATR check alone would never fire
+    assert is_entry_too_extended(bar, trigger_level, huge_atr, max_atr_multiple=2.5) is False
+    # extension = 4.73 - 4.19 = 0.54 -> 12.9% of 4.19, over a 3% cap
+    assert (
+        is_entry_too_extended(bar, trigger_level, huge_atr, max_atr_multiple=2.5, max_extension_pct=3.0)
+        is True
+    )
+
+
+def test_is_entry_too_extended_pct_passes_a_controlled_breakout():
+    bar = make_bars([(5.8, 6.0, 5.78, 5.95, 1000)])[0]
+    trigger_level = 5.9
+    # extension = 5.95 - 5.9 = 0.05 -> 0.85% of 5.9, under a 3% cap
+    assert (
+        is_entry_too_extended(bar, trigger_level, atr=None, max_atr_multiple=2.5, max_extension_pct=3.0)
+        is False
+    )
+
+
+def test_is_entry_too_extended_pct_none_disables_the_check():
+    bar = make_bars([(4.41, 5.26, 4.38, 4.73, 1000)])[0]
+    # Same extended bar as the rejection test above, but max_extension_pct
+    # omitted -- falls through to the ATR check alone (loose enough here to
+    # pass), exactly the pre-2026-09-25 behavior for any caller not yet
+    # passing the new parameter.
+    assert is_entry_too_extended(bar, 4.19, atr=10.0, max_atr_multiple=2.5) is False
+
+
+def test_is_entry_too_extended_pct_ignored_for_a_non_positive_trigger_level():
+    # Guards the division: a trigger_level of 0 (or negative, which
+    # shouldn't occur for a real price level but must not crash) skips the
+    # percentage check and falls through to the ATR one.
+    bar = make_bars([(4.41, 5.26, 4.38, 4.73, 1000)])[0]
+    assert (
+        is_entry_too_extended(bar, trigger_level=0.0, atr=10.0, max_atr_multiple=2.5, max_extension_pct=3.0)
+        is False
+    )
