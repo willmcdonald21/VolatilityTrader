@@ -97,7 +97,13 @@ class WarriorBot:
 
         self.strategies: list[BaseStrategy] = []
         if config.strategies.gap_and_go.enabled:
-            self.strategies.append(GapAndGoStrategy(config.strategies.gap_and_go, float_provider=float_provider))
+            self.strategies.append(
+                GapAndGoStrategy(
+                    config.strategies.gap_and_go,
+                    float_provider=float_provider,
+                    pullback_quality_config=config.pullback_quality,
+                )
+            )
         if config.strategies.bull_flag.enabled:
             self.strategies.append(BullFlagStrategy(config.strategies.bull_flag, config.pullback_quality))
         if config.strategies.abcd.enabled:
@@ -796,9 +802,26 @@ class WarriorBot:
                 self.logger.exception("Data watchdog iteration failed")
             await asyncio.sleep(cfg.check_interval_seconds)
 
+    def _eligible_for_new_signals(self, ctx: SymbolContext) -> bool:
+        """Ross Cameron explicitly trades only the top 2-3 (occasionally top
+        5) most obvious gainers each morning -- until now, every onboarded
+        scanner candidate was equally eligible for every strategy regardless
+        of rank (see ScannerConfig.max_eligible_rank). A symbol whose rank
+        moves outside the cutoff (or that isn't currently ranked at all --
+        e.g. it dropped out of the scanner's top-N) simply stops producing
+        NEW signals; on_bar above still manages any already-open position on
+        it normally, since this gate only runs on the strategy-evaluation
+        path below."""
+        max_rank = self.config.scanner.max_eligible_rank
+        if max_rank is None:
+            return True
+        return ctx.scanner_rank is not None and ctx.scanner_rank <= max_rank
+
     def _on_new_bar(self, contract: Contract, ctx: SymbolContext) -> None:
         now = datetime.now(timezone.utc)
         self.position_manager.on_bar(ctx)
+        if not self._eligible_for_new_signals(ctx):
+            return
         for strategy in self.strategies:
             try:
                 signal = strategy.evaluate(ctx, now)

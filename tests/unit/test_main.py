@@ -23,7 +23,9 @@ from warrior_bot.signals.signal import Signal
 from warrior_bot.utils.time_utils import to_eastern
 
 
-def make_config(tmp_path, data_watchdog: DataWatchdogConfig | None = None) -> AppConfig:
+def make_config(
+    tmp_path, data_watchdog: DataWatchdogConfig | None = None, scanner: ScannerConfig | None = None
+) -> AppConfig:
     return AppConfig(
         trading=TradingConfig(),
         risk=RiskConfig(
@@ -34,7 +36,7 @@ def make_config(tmp_path, data_watchdog: DataWatchdogConfig | None = None) -> Ap
         strategies=StrategiesConfig(),
         exits=ExitsConfig(),
         notifications=NotificationsConfig(),
-        scanner=ScannerConfig(),
+        scanner=scanner or ScannerConfig(),
         data_watchdog=data_watchdog or DataWatchdogConfig(),
         journal=JournalConfig(db_path=str(tmp_path / "journal.sqlite3")),
         kill_switch=KillSwitchConfig(flag_file=str(tmp_path / "KILL_SWITCH")),
@@ -993,6 +995,77 @@ def test_symbols_dropping_out_of_the_scan_lose_their_rank(tmp_path):
 
     assert bot.contexts["AAA"].scanner_rank == 1
     assert bot.contexts["BBB"].scanner_rank is None
+
+
+# -- _eligible_for_new_signals: 2026-09-26, Ross trades only the top 2-3 most
+# obvious gainers each morning -- until now every onboarded scanner
+# candidate was equally eligible for every strategy regardless of rank.
+
+
+def test_eligible_for_new_signals_true_within_rank_cutoff(tmp_path):
+    bot = WarriorBot(make_config(tmp_path, scanner=ScannerConfig(max_eligible_rank=3)))
+
+    assert bot._eligible_for_new_signals(_RankCtx(1)) is True
+    assert bot._eligible_for_new_signals(_RankCtx(3)) is True
+
+
+def test_eligible_for_new_signals_false_outside_rank_cutoff(tmp_path):
+    bot = WarriorBot(make_config(tmp_path, scanner=ScannerConfig(max_eligible_rank=3)))
+
+    assert bot._eligible_for_new_signals(_RankCtx(4)) is False
+
+
+def test_eligible_for_new_signals_false_when_rank_missing(tmp_path):
+    # A symbol with no current rank (never ranked, or dropped out of the
+    # scanner's top-N -- see _demote_symbols_absent_from_scan) is not
+    # eligible for a cutoff reserved for the day's most obvious names.
+    bot = WarriorBot(make_config(tmp_path, scanner=ScannerConfig(max_eligible_rank=3)))
+
+    assert bot._eligible_for_new_signals(_RankCtx(None)) is False
+
+
+def test_eligible_for_new_signals_always_true_when_cutoff_disabled(tmp_path):
+    bot = WarriorBot(make_config(tmp_path, scanner=ScannerConfig(max_eligible_rank=None)))
+
+    assert bot._eligible_for_new_signals(_RankCtx(None)) is True
+    assert bot._eligible_for_new_signals(_RankCtx(50)) is True
+
+
+def test_on_new_bar_skips_strategy_evaluation_for_ineligible_rank(tmp_path):
+    bot = WarriorBot(make_config(tmp_path, scanner=ScannerConfig(max_eligible_rank=3)))
+    ctx = _RankCtx(5)
+    ctx.symbol = "AAA"
+    bot.position_manager.on_bar = lambda c: None
+    called = []
+
+    class _FakeStrategy:
+        name = "fake"
+
+        def evaluate(self, c, now):
+            called.append(c)
+            return None
+
+    bot.strategies = [_FakeStrategy()]
+
+    bot._on_new_bar(SimpleNamespace(), ctx)
+
+    assert called == []  # rank 5 is outside the top-3 cutoff -- never even evaluated
+
+
+def test_on_new_bar_still_manages_existing_position_for_ineligible_rank(tmp_path):
+    # A symbol whose rank slips outside the cutoff must keep having its
+    # already-open position managed normally -- only NEW signal generation
+    # stops.
+    bot = WarriorBot(make_config(tmp_path, scanner=ScannerConfig(max_eligible_rank=3)))
+    ctx = _RankCtx(5)
+    ctx.symbol = "AAA"
+    on_bar_calls = []
+    bot.position_manager.on_bar = lambda c: on_bar_calls.append(c)
+    bot.strategies = []
+
+    bot._on_new_bar(SimpleNamespace(), ctx)
+
+    assert on_bar_calls == [ctx]
 
 
 def test_loss_limit_flatten_does_not_suppress_later_eod_sweep(tmp_path, monkeypatch):
