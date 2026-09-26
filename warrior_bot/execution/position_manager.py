@@ -4,8 +4,9 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
-from ib_async import IB, Contract, MarketOrder, Order, StopLimitOrder, StopOrder, Trade
+from ib_async import IB, Contract, Order, StopLimitOrder, StopOrder, Trade
 
 from warrior_bot.config import ExitsConfig, NotificationsConfig
 from warrior_bot.notify.discord import build_pnl_message, send_discord_message
@@ -21,6 +22,7 @@ from warrior_bot.strategies.indicators import (
     is_topping_tail,
     trailing_candidate,
 )
+from warrior_bot.utils.panic import flatten_position
 from warrior_bot.utils.rounding import round_to_tick
 
 logger = logging.getLogger("warrior_bot.execution.position_manager")
@@ -529,8 +531,23 @@ class PositionManager:
         self.ib.cancelOrder(pos.stop_order)
         for target_order in pos.target_orders:
             self.ib.cancelOrder(target_order)
-        order = MarketOrder("SELL", pos.remaining_qty)
-        self.ib.placeOrder(pos.contract, order)
+        # Was a bare MarketOrder with no outsideRth handling -- IBKR ignores
+        # outsideRth on a market order and just queues it until 09:30 (the
+        # same plumbing bug already fixed everywhere else this bot force-
+        # closes a position; see panic.py's own docstring), which is exactly
+        # backwards for an exit meant to happen NOW. flatten_position
+        # already does the right thing: a market order in regular hours, a
+        # marketable limit outside them. This is also why reversal_exit
+        # stayed disabled in config until now (docs/strategy_decisions.md,
+        # "Deferred: marketable-limit conversion...") -- the signals
+        # themselves were never in question, only this order-placement gap.
+        # Note: unlike a normal stop-loss fill, this fill is not journaled
+        # to data/journal.sqlite3 (flatten_position's order isn't any of
+        # this lot's own tracked orders, so there's no correct existing row
+        # to attribute it to) -- same follow-up gap main.py's
+        # _journal_flatten_fill closed for the account-wide emergency/EOD
+        # flatten path, not yet done here.
+        flatten_position(self.ib, SimpleNamespace(contract=pos.contract, position=pos.remaining_qty), channel="limits")
         reason_str = ",".join(reasons)
         logger.warning("Reversal exit for %s: %s (qty=%d)", pos.symbol, reason_str, pos.remaining_qty)
         self.journal.record_kill_switch_event(

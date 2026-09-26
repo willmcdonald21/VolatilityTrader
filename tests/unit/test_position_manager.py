@@ -128,6 +128,14 @@ class FakeIB:
     def openTrades(self):
         return self.open_trades
 
+    def portfolio(self, account=""):
+        # flatten_position (see _reversal_exit) reads this for a last-price
+        # fallback when placing an outside-RTH marketable limit -- empty by
+        # default, matching real IBKR's report for a symbol it has no
+        # portfolio item for, and harmless when the test runs during RTH
+        # (that branch is never reached).
+        return []
+
 
 def find_trade(ib: FakeIB, order: FakeOrder) -> FakeTrade:
     """Looks up the FakeTrade wrapping `order` -- used to reach the fresh
@@ -240,8 +248,11 @@ def track_position(
     if target_role == "target":
         target_order.ocaGroup = f"TEST-{order_id_offset}-OCA"
     target_trade = FakeTrade(target_order)
+    # A bare object() (no .symbol) used to be enough here since nothing read
+    # pos.contract directly -- flatten_position (see _reversal_exit) now
+    # does, for its own pending-flatten dedup and SMART-routing logic.
     pm.track(
-        contract=object(),
+        contract=SimpleNamespace(symbol=signal.symbol),
         signal=signal,
         signal_id=signal_id,
         parent_trade=parent_trade,
@@ -382,8 +393,28 @@ def test_full_target_fill_untracks_position_and_on_bar_is_a_noop_after():
     assert len(ib.placed) == placed_before
 
 
-def test_reversal_exit_on_topping_tail_triggers_market_exit():
+def capture_flatten_calls(monkeypatch):
+    """_reversal_exit now routes through panic.py's flatten_position (RTH-
+    aware: market order in regular hours, marketable limit outside them --
+    see position_manager.py) instead of placing a bare MarketOrder directly.
+    That order-type decision is panic.py's own concern and already covered
+    by test_panic.py; these tests only need to confirm _reversal_exit calls
+    it with the right position, not which order type came out, which would
+    otherwise make these tests depend on the real wall-clock time they run
+    at."""
+    calls = []
+
+    def fake_flatten_position(ib, position, channel="kill_switch", **kwargs):
+        calls.append(SimpleNamespace(position=position, channel=channel))
+        return True
+
+    monkeypatch.setattr(position_manager_module, "flatten_position", fake_flatten_position)
+    return calls
+
+
+def test_reversal_exit_on_topping_tail_triggers_market_exit(monkeypatch):
     ib = FakeIB()
+    flatten_calls = capture_flatten_calls(monkeypatch)
     pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=True))
     signal = make_signal(entry=10.0, stop=9.0)
     stop_trade, target_trade = track_position(pm, signal, quantity=100)
@@ -400,14 +431,14 @@ def test_reversal_exit_on_topping_tail_triggers_market_exit():
     assert stop_trade.order in ib.cancelled
     assert target_trade.order in ib.cancelled
     assert "TEST" not in pm._positions
-    market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
-    assert len(market_orders) == 1
-    assert market_orders[0].totalQuantity == 100
-    assert market_orders[0].action == "SELL"
+    assert len(flatten_calls) == 1
+    assert flatten_calls[0].position.contract.symbol == "TEST"
+    assert flatten_calls[0].position.position == 100
 
 
-def test_reversal_exit_on_red_after_green_triggers_market_exit():
+def test_reversal_exit_on_red_after_green_triggers_market_exit(monkeypatch):
     ib = FakeIB()
+    flatten_calls = capture_flatten_calls(monkeypatch)
     pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=True))
     signal = make_signal(entry=10.0, stop=9.0)
     stop_trade, target_trade = track_position(pm, signal, quantity=100)
@@ -421,13 +452,13 @@ def test_reversal_exit_on_red_after_green_triggers_market_exit():
 
     pm.on_bar(FakeCtx("TEST", last_price=10.25, bars=bars))
 
-    market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
-    assert len(market_orders) == 1
+    assert len(flatten_calls) == 1
     assert "TEST" not in pm._positions
 
 
-def test_reversal_exit_on_volume_burst_triggers_market_exit():
+def test_reversal_exit_on_volume_burst_triggers_market_exit(monkeypatch):
     ib = FakeIB()
+    flatten_calls = capture_flatten_calls(monkeypatch)
     pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=True))
     signal = make_signal(entry=10.0, stop=9.0)
     stop_trade, target_trade = track_position(pm, signal, quantity=100)
@@ -442,13 +473,13 @@ def test_reversal_exit_on_volume_burst_triggers_market_exit():
 
     pm.on_bar(FakeCtx("TEST", last_price=9.95, bars=bars))
 
-    market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
-    assert len(market_orders) == 1
+    assert len(flatten_calls) == 1
     assert "TEST" not in pm._positions
 
 
-def test_reversal_exit_on_momentum_exhaustion_triggers_market_exit():
+def test_reversal_exit_on_momentum_exhaustion_triggers_market_exit(monkeypatch):
     ib = FakeIB()
+    flatten_calls = capture_flatten_calls(monkeypatch)
     pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=True))
     signal = make_signal(entry=10.0, stop=9.0)
     stop_trade, target_trade = track_position(pm, signal, quantity=100)
@@ -469,8 +500,7 @@ def test_reversal_exit_on_momentum_exhaustion_triggers_market_exit():
     assert stop_trade.order in ib.cancelled
     assert target_trade.order in ib.cancelled
     assert "TEST" not in pm._positions
-    market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
-    assert len(market_orders) == 1
+    assert len(flatten_calls) == 1
 
 
 def test_reversal_exit_disabled_does_not_trigger():
@@ -543,8 +573,9 @@ def test_trailing_updates_stop_limit_price_when_order_is_stop_limit():
     assert pos.stop_order.lmtPrice == 11.0 * 0.99
 
 
-def test_reversal_exit_on_lower_low_after_breakeven_triggers_market_exit():
+def test_reversal_exit_on_lower_low_after_breakeven_triggers_market_exit(monkeypatch):
     ib = FakeIB()
+    flatten_calls = capture_flatten_calls(monkeypatch)
     pm = PositionManager(ib, FakeJournal(), make_exits_config(reversal_exit_enabled=True, trailing_enabled=False))
     signal = make_signal(entry=10.0, stop=9.0)
     stop_trade, target_trade = track_position(pm, signal, quantity=100)
@@ -561,8 +592,7 @@ def test_reversal_exit_on_lower_low_after_breakeven_triggers_market_exit():
     bars2 = make_bars([(10.4, 10.5, 10.2, 10.3, 1000), (10.3, 10.35, 10.1, 10.25, 1000)])
     pm.on_bar(FakeCtx("TEST", last_price=10.25, bars=bars2))
 
-    market_orders = [o for _, o in ib.placed if getattr(o, "orderType", None) == "MKT"]
-    assert len(market_orders) == 1
+    assert len(flatten_calls) == 1
     assert "TEST" not in pm._positions
 
 
@@ -748,7 +778,7 @@ def test_management_resumes_once_entry_fill_arrives():
     stop_trade = FakeTrade(FakeOrder("SELL", 100, auxPrice=signal.stop_price, orderId=2, parentId=1))
     target_trade = FakeTrade(FakeOrder("SELL", 100, lmtPrice=signal.target_price, orderId=3))
     pm.track(
-        contract=object(),
+        contract=SimpleNamespace(symbol=signal.symbol),
         signal=signal,
         signal_id=1,
         parent_trade=parent_trade,
@@ -854,7 +884,7 @@ def test_replacement_stop_sized_to_actual_fills_not_full_order_size():
     target_order = FakeOrder("SELL", quantity, lmtPrice=signal.target_price, orderId=3)
     target_trade = FakeTrade(target_order)
     pm.track(
-        contract=object(),
+        contract=SimpleNamespace(symbol=signal.symbol),
         signal=signal,
         signal_id=1,
         parent_trade=parent_trade,
@@ -887,7 +917,7 @@ def test_remaining_qty_grows_with_each_partial_entry_fill():
     target_order = FakeOrder("SELL", quantity, lmtPrice=signal.target_price, orderId=3)
     target_trade = FakeTrade(target_order)
     pm.track(
-        contract=object(),
+        contract=SimpleNamespace(symbol=signal.symbol),
         signal=signal,
         signal_id=1,
         parent_trade=parent_trade,
@@ -925,7 +955,7 @@ def test_position_stays_tracked_when_flat_but_parent_still_filling():
     target_order = FakeOrder("SELL", 1000, lmtPrice=signal.target_price, orderId=3)
     target_trade = FakeTrade(target_order)
     pm.track(
-        contract=object(),
+        contract=SimpleNamespace(symbol=signal.symbol),
         signal=signal,
         signal_id=1,
         parent_trade=parent_trade,
@@ -970,7 +1000,7 @@ def test_on_bar_skips_flat_lot_still_tracked_for_pending_parent_fills():
     target_order = FakeOrder("SELL", 1000, lmtPrice=signal.target_price, orderId=3)
     target_trade = FakeTrade(target_order)
     pm.track(
-        contract=object(),
+        contract=SimpleNamespace(symbol=signal.symbol),
         signal=signal,
         signal_id=1,
         parent_trade=parent_trade,
@@ -1147,7 +1177,7 @@ def test_stale_partially_filled_entry_cancels_remainder_but_keeps_the_position()
     stop_trade = FakeTrade(FakeOrder("SELL", 1000, auxPrice=signal.stop_price, orderId=2, parentId=1))
     target_trade = FakeTrade(FakeOrder("SELL", 1000, lmtPrice=signal.target_price, orderId=3))
     pm.track(
-        contract=object(),
+        contract=SimpleNamespace(symbol=signal.symbol),
         signal=signal,
         signal_id=1,
         parent_trade=parent_trade,
