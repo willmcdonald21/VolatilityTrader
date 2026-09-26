@@ -83,6 +83,8 @@ def make_risk_manager(tmp_path, snapshot, open_lots: int = 0, **risk_overrides) 
         addon_risk_pct=risk_overrides.get("addon_risk_pct"),
         max_stop_distance_pct=risk_overrides.get("max_stop_distance_pct", 2.0),
         allow_cross_strategy_stacking=risk_overrides.get("allow_cross_strategy_stacking", False),
+        round_number_size_multiplier=risk_overrides.get("round_number_size_multiplier", 1.15),
+        flat_top_size_multiplier=risk_overrides.get("flat_top_size_multiplier", 1.15),
     )
     account_state = FakeAccountState(snapshot)
     position_manager = FakePositionManager(open_lots)
@@ -454,6 +456,69 @@ def test_risk_budget_uses_start_of_day_equity_not_the_drawn_down_snapshot(tmp_pa
     decision = rm.evaluate(signal)
 
     assert decision.sized_qty == 5000  # off 100k start-of-day, not the 90k now
+
+
+def test_round_number_breakout_boosts_risk_based_size(tmp_path):
+    # Generous available_funds/buying_power so the notional caps don't bind
+    # and mask the multiplier's effect -- isolates the boost on the
+    # risk-based figure specifically. Added 2026-09-26: round_number_breakout
+    # was computed on every breakout-style signal well before this but never
+    # actually wired to sizing anywhere.
+    snapshot = default_snapshot(net_liquidation=100_000, available_funds=500_000, buying_power=1_000_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.005, round_number_size_multiplier=1.15)
+    rm.mark_start_of_day(100_000)
+    signal = make_signal(entry=2.00, stop=1.96, context={"round_number_breakout": True})  # $0.04 risk/share -> 12,500 by risk
+
+    decision = rm.evaluate(signal)
+
+    assert decision.sized_qty == 14374  # floor(12,500 * 1.15) -- float residue (14374.999...) floors down one share
+
+
+def test_size_multiplier_absent_when_context_flag_not_set(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, available_funds=500_000, buying_power=1_000_000)
+    rm = make_risk_manager(tmp_path, snapshot, risk_per_trade_pct=0.005, round_number_size_multiplier=1.15)
+    rm.mark_start_of_day(100_000)
+    signal = make_signal(entry=2.00, stop=1.96)  # no context at all
+
+    decision = rm.evaluate(signal)
+
+    assert decision.sized_qty == 12_500  # unboosted
+
+
+def test_size_multiplier_never_exceeds_notional_cap(tmp_path):
+    # Same numbers as test_notional_cap_still_binds_when_risk_budget_would_buy_more:
+    # a very tight stop makes the risk budget enormous in share terms, and the
+    # %-of-funds notional cap already binds even before any multiplier -- the
+    # boost must not be a way to exceed that hard ceiling.
+    snapshot = default_snapshot(net_liquidation=100_000, available_funds=100_000, buying_power=1_000_000)
+    rm = make_risk_manager(
+        tmp_path, snapshot, risk_per_trade_pct=0.005, first_entry_pct_of_funds=0.10, round_number_size_multiplier=1.15
+    )
+    rm.mark_start_of_day(100_000)
+    signal = make_signal(entry=10.0, stop=9.99, context={"round_number_breakout": True})
+
+    decision = rm.evaluate(signal)
+
+    assert decision.sized_qty == 1000  # floor(100_000 * 0.10 / 10) -- unchanged, multiplier can't exceed this
+
+
+def test_round_number_and_flat_top_multipliers_compound(tmp_path):
+    snapshot = default_snapshot(net_liquidation=100_000, available_funds=500_000, buying_power=1_000_000)
+    rm = make_risk_manager(
+        tmp_path,
+        snapshot,
+        risk_per_trade_pct=0.005,
+        round_number_size_multiplier=1.15,
+        flat_top_size_multiplier=1.15,
+    )
+    rm.mark_start_of_day(100_000)
+    signal = make_signal(
+        entry=2.00, stop=1.96, context={"round_number_breakout": True, "flat_top_breakout": True}
+    )
+
+    decision = rm.evaluate(signal)
+
+    assert decision.sized_qty == 16531  # floor(12,500 * 1.15 * 1.15)
 
 
 def test_sizing_falls_back_to_notional_when_risk_sizing_is_disabled(tmp_path):

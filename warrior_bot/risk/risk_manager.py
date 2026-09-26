@@ -279,19 +279,38 @@ class RiskManager:
         cap_by_pct_of_buying_power = math.floor(
             (snapshot.buying_power * self.config.max_position_pct_of_buying_power) / signal.entry_price
         )
+        notional_caps = [raw_shares, cap_by_pct_of_buying_power]
 
-        caps = [raw_shares, cap_by_pct_of_buying_power]
-
+        caps = list(notional_caps)
         shares_by_risk = self._shares_by_risk_budget(signal, snapshot, open_lots)
         if shares_by_risk is not None:
             caps.append(shares_by_risk)
 
         sized_qty = max(0, min(caps))
 
+        multiplier = self._quality_size_multiplier(signal)
+        if multiplier > 1.0 and sized_qty > 0:
+            boosted = math.floor(sized_qty * multiplier)
+            sized_qty = min(boosted, *notional_caps)
+
         if self.config.daily_profit_goal_usd and not self._cushion_met(snapshot):
             sized_qty = math.floor(sized_qty * self.config.cushion_size_fraction)
 
         return sized_qty
+
+    def _quality_size_multiplier(self, signal: Signal) -> float:
+        """Soft size boost for entry-quality signals computed at signal time
+        (round_number_breakout, flat_top_breakout) but never previously
+        acted on anywhere downstream -- see RiskConfig's fields of the same
+        name. Boosts the risk-based figure specifically; the notional/
+        buying-power ceilings in _size_position stay hard caps regardless of
+        quality."""
+        multiplier = 1.0
+        if signal.context.get("round_number_breakout"):
+            multiplier *= self.config.round_number_size_multiplier
+        if signal.context.get("flat_top_breakout"):
+            multiplier *= self.config.flat_top_size_multiplier
+        return multiplier
 
     def _shares_by_risk_budget(
         self, signal: Signal, snapshot: AccountSnapshot, open_lots: int
