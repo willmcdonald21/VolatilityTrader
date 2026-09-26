@@ -100,6 +100,21 @@ class RiskConfig(BaseModel):
     # null disables it and restores pure notional sizing.
     risk_per_trade_pct: float | None = Field(default=None, gt=0, le=0.1)
     addon_risk_pct: float | None = Field(default=None, gt=0, le=0.1)
+    # Soft size boosts for entry-quality signals computed at signal time but
+    # never previously acted on anywhere downstream. round_number_breakout
+    # has existed since well before this and was documented, but never
+    # wired, as a sizing input (see docs/strategy_decisions.md);
+    # flat_top_breakout is new (bull_flag.py, 2026-09-26). Multiplicative and
+    # compounding when both are present, since each is an independent, only
+    # weakly-correlated signal of setup quality. Applied to the risk-based
+    # share count specifically (a bit more $ risked on a higher-quality
+    # setup) -- see RiskManager._size_position -- never past the notional/
+    # buying-power ceilings below, which stay hard caps regardless of
+    # quality. Both default modest (1.15x) since neither has been validated
+    # against this bot's own trade history yet; revisit once enough
+    # boosted-vs-unboosted trades accumulate.
+    round_number_size_multiplier: float = Field(default=1.15, ge=1.0)
+    flat_top_size_multiplier: float = Field(default=1.15, ge=1.0)
 
     @model_validator(mode="after")
     def _guard_risk_sizing(self) -> "RiskConfig":
@@ -181,7 +196,20 @@ class GapAndGoConfig(BaseModel):
     # thin-liquidity/momentum-exhaustion chases rather than a controlled
     # five-pillars setup. None disables it (pre-existing behavior).
     max_rel_volume: float | None = Field(default=200.0, gt=0)
-    breakout_lookback_bars: int = 30
+    # Reworked 2026-09-26: gap_and_go used to enter on a straight breakout of
+    # the opening-range high (breakout_lookback_bars). Ross Cameron's own
+    # documented beginner rule is different -- buy the *first pullback*
+    # (ideally holding VWAP and the 9 EMA), not the initial breakout -- and
+    # this bot's own version had no pullback-detection logic at all. Now
+    # mirrors bull_flag.py's spike -> consolidation -> breakout structure
+    # exactly (these four fields parallel BullFlagConfig's fields of the
+    # same name), reusing validate_pullback for the VWAP/9EMA-hold check
+    # instead of writing new logic. breakout_lookback_bars is gone -- the
+    # pullback high (not the opening-range high) is now the trigger level.
+    min_spike_pct: float = 5.0
+    min_consolidation_bars: int = 1  # "1 or more red candles" -- a single-bar micro pullback is the ideal case
+    max_consolidation_bars: int = 15
+    max_pullback_pct: float = 50.0
     stop_buffer_pct: float = 1.0
     target_r_multiple: float = 2.0
     enable_float_filter: bool = True
@@ -260,6 +288,22 @@ class BullFlagConfig(BaseModel):
     # specifically. See is_entry_too_extended in strategies/indicators.py.
     max_extension_atr_multiple: float = Field(default=2.5, gt=0)
     max_extension_pct: float = Field(default=3.0, gt=0)
+    # Ross's micro-pullback rule is a very tight, cents-below-the-low stop
+    # (e.g. a $4.91 pullback low gets a stop around $4.89) -- distinctly
+    # tighter than a multi-bar consolidation's stop, which this bot never
+    # distinguished before. Applied only when the pullback is exactly 1 bar
+    # (the literal micro-pullback case); None disables the special case and
+    # falls back to the uniform stop_buffer_pct above for every pullback
+    # length, matching pre-2026-09-26 behavior.
+    micro_pullback_stop_buffer_pct: float | None = Field(default=0.15, gt=0)
+    # Ross's "flat-top breakout": a pullback whose bar highs sit within this
+    # % of each other (sellers stacked at ~one price) breaks out more
+    # explosively once cleared than a normally-declining pullback, since
+    # short stops and buy orders trigger together. Context/quality flag only
+    # (see RiskConfig.flat_top_size_multiplier) -- not a hard entry gate,
+    # since this is a brand-new, uncalibrated dimension with no historical
+    # data yet.
+    flat_top_max_spread_pct: float = Field(default=0.3, gt=0)
 
 
 class AbcdConfig(BaseModel):
@@ -347,6 +391,13 @@ class ProfitTierConfig(BaseModel):
 
 class BreakevenConfig(BaseModel):
     enabled: bool = False
+    # Only actually used when a lot's brackets have no "scale_out"-role
+    # profit tier (e.g. exits.profit_tiers is empty for a given signal) --
+    # PositionManager._check_breakeven instead sequences breakeven after the
+    # first profit-tier fill in that (normal) case, matching Ross's rule
+    # (sell first, then de-risk to breakeven as a consequence) rather than
+    # racing it independently against the same R-multiple. This field
+    # remains as the sole trigger for the tiers-disabled fallback path.
     trigger_r_multiple: float = Field(default=1.0, gt=0)
 
 
@@ -370,9 +421,17 @@ class ExitsConfig(BaseModel):
     # *original* position size once price reaches `r_multiple`. Whatever
     # fraction remains after all tiers (1 - sum(pct)) rides on the
     # breakeven/trailing-stop logic below rather than a fixed final target.
+    #
+    # Reworked 2026-09-26 to match Ross Cameron's actual documented rule --
+    # "sell half at the first profit target, move the stop to breakeven,
+    # hold the rest" -- rather than the prior 34%@1R + 33%@2R three-way
+    # split, which diluted that fast-lock-in behavior and didn't match any
+    # documented profile. The remaining 50% is not sold at a second fixed
+    # target; it rides the ATR/EMA trailing stop up toward each strategy's
+    # own target_r_multiple. See BreakevenConfig below for the matching
+    # sequencing fix (breakeven now waits for this tier's fill).
     profit_tiers: list[ProfitTierConfig] = [
-        ProfitTierConfig(r_multiple=1.0, pct=0.34),
-        ProfitTierConfig(r_multiple=2.0, pct=0.33),
+        ProfitTierConfig(r_multiple=1.0, pct=0.50),
     ]
     breakeven: BreakevenConfig = BreakevenConfig()
     trailing: TrailingConfig = TrailingConfig()
@@ -417,6 +476,17 @@ class ScannerConfig(BaseModel):
     above_volume: int = 10_000
     refresh_seconds: int = 60
     max_candidates: int = 25
+    # Ross explicitly trades only the top 2-3 (occasionally top 5) most
+    # obvious gainers each morning -- until 2026-09-26, every one of the up
+    # to max_candidates onboarded symbols was equally eligible for every
+    # strategy regardless of rank; only RiskConfig.reserved_top_tier_slots
+    # was rank-aware at all, and only as a capacity tie-breaker, not an
+    # eligibility filter. A symbol ranked worse than this stops generating
+    # NEW signals (see WarriorBot._eligible_for_new_signals in main.py) but
+    # an already-open position on it keeps being managed normally -- no
+    # forced exit just because its rank slipped. None disables this
+    # (pre-existing behavior, every onboarded symbol eligible).
+    max_eligible_rank: int | None = Field(default=3, ge=1)
 
 
 class DataWatchdogConfig(BaseModel):
