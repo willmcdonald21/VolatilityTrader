@@ -4,7 +4,9 @@ from datetime import datetime
 
 from tests.unit.fixtures import make_bars
 from warrior_bot.config import VwapReversionConfig
+from warrior_bot.strategies import vwap_reversion as vwap_reversion_module
 from warrior_bot.strategies.base_strategy import SymbolContext
+from warrior_bot.strategies.pullback_validity import PullbackValidity
 from warrior_bot.strategies.vwap_reversion import VwapReversionStrategy
 from warrior_bot.utils.time_utils import EASTERN
 
@@ -36,6 +38,24 @@ def test_red_to_green_triggers_signal():
     assert signal.entry_price == 10.2
 
 
+def test_red_to_green_weak_candle_rejected():
+    # Added 2026-09-25 -- min_breakout_candle_strength was missing on this
+    # strategy entirely; a red/weak-bodied bar whose close still numerically
+    # clears prior_close (is_red_to_green only checks the close) used to
+    # trigger a signal anyway.
+    ctx = make_ctx(
+        bar_specs=[
+            (9.5, 9.6, 9.4, 9.5, 1000),
+            (9.5, 9.8, 9.4, 9.8, 1000),
+            (10.5, 10.6, 9.9, 10.05, 5000),  # opens above prior_close, sells off, closes barely at/above it -- red body
+        ],
+        prior_close=10.0,
+        avg_daily_volume=10_000,
+    )
+    strategy = VwapReversionStrategy(VwapReversionConfig())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
 def test_red_to_green_skipped_when_relative_volume_too_low():
     ctx = make_ctx(
         bar_specs=[
@@ -56,7 +76,7 @@ def test_vwap_bounce_triggers_signal():
             (10.0, 10.0, 10.0, 10.0, 1000),
             (10.0, 10.0, 10.0, 10.0, 1000),
             (10.0, 10.05, 9.9, 9.95, 1000),   # dips to touch VWAP
-            (9.95, 10.3, 9.95, 10.3, 1000),   # bounces back above prior high and VWAP
+            (9.95, 10.2, 9.95, 10.2, 1000),   # bounces back above prior high and VWAP -- ~1.6% past VWAP (10.0375), under the 2% extension cap
         ],
         prior_close=5.0,  # far below everything -> red_to_green never applies
         avg_daily_volume=5_000,  # low enough that cumulative volume clears the 5x relative-volume floor
@@ -65,7 +85,48 @@ def test_vwap_bounce_triggers_signal():
     signal = strategy.evaluate(ctx, NOW)
     assert signal is not None
     assert signal.context["setup"] == "vwap_bounce"
-    assert signal.entry_price == 10.3
+    assert signal.entry_price == 10.2
+
+
+def test_vwap_bounce_weak_candle_rejected():
+    # Same gap as red_to_green above -- a red/weak-bodied bounce bar that
+    # still numerically clears the prior bar's high and VWAP.
+    ctx = make_ctx(
+        bar_specs=[
+            (10.0, 10.0, 10.0, 10.0, 1000),
+            (10.0, 10.0, 10.0, 10.0, 1000),
+            (10.0, 10.05, 9.9, 9.95, 1000),
+            (10.25, 10.3, 9.95, 10.2, 1000),  # opens high, sells off, closes red but still above prior high/VWAP
+        ],
+        prior_close=5.0,
+        avg_daily_volume=5_000,
+    )
+    strategy = VwapReversionStrategy(VwapReversionConfig())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_vwap_bounce_rejected_by_pullback_quality(monkeypatch):
+    # Confirms the wiring, not validate_pullback's own internal rules
+    # (see test_pullback_validity.py for those) -- the VWAP bounce is
+    # structurally a pullback-to-a-level-then-reclaim pattern too, and
+    # this shared quality gate previously only ran for bull_flag/abcd.
+    monkeypatch.setattr(
+        vwap_reversion_module,
+        "validate_pullback",
+        lambda **kwargs: PullbackValidity(False, "topping tail in pullback"),
+    )
+    ctx = make_ctx(
+        bar_specs=[
+            (10.0, 10.0, 10.0, 10.0, 1000),
+            (10.0, 10.0, 10.0, 10.0, 1000),
+            (10.0, 10.05, 9.9, 9.95, 1000),
+            (9.95, 10.2, 9.95, 10.2, 1000),
+        ],
+        prior_close=5.0,
+        avg_daily_volume=5_000,
+    )
+    strategy = VwapReversionStrategy(VwapReversionConfig())
+    assert strategy.evaluate(ctx, NOW) is None
 
 
 def test_no_signal_when_pullback_too_far_from_vwap():

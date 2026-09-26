@@ -5,7 +5,12 @@ from datetime import datetime
 from warrior_bot.config import BullFlagConfig, PullbackQualityConfig
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
-from warrior_bot.strategies.indicators import candle_strength, crossed_round_number, is_bottoming_tail
+from warrior_bot.strategies.indicators import (
+    candle_strength,
+    crossed_round_number,
+    is_bottoming_tail,
+    is_entry_too_extended,
+)
 from warrior_bot.strategies.pullback_validity import validate_pullback
 from warrior_bot.utils.time_utils import session_elapsed_fraction
 
@@ -87,6 +92,11 @@ class BullFlagStrategy(BaseStrategy):
 
         if candle_strength(current_bar) < cfg.min_breakout_candle_strength:
             return self._reject(ctx, "weak_breakout_candle")
+
+        if is_entry_too_extended(
+            current_bar, flag_high, ctx.atr(), cfg.max_extension_atr_multiple, cfg.max_extension_pct
+        ):
+            return self._reject(ctx, "breakout_too_extended")
 
         entry_price = current_bar.close
         stop_price = pullback_low * (1 - cfg.stop_buffer_pct / 100.0)

@@ -130,6 +130,23 @@ def test_no_signal_when_relative_volume_too_low():
     assert strategy.evaluate(ctx, NOW) is None
 
 
+def test_no_signal_when_breakout_bar_too_extended():
+    # Added 2026-09-25 for entry-guard consistency with gap_and_go/
+    # vwap_reversion -- b_high is 12.0; this breakout bar closes ~8.3% past
+    # it, well over the default 3% cap.
+    bars = PASSING_BARS[:-1] + [(11.45, 13.0, 11.45, 13.0, 1000)]
+    ctx = make_ctx(bars)
+    strategy = AbcdStrategy(AbcdConfig())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_signal_when_extension_gate_loosened_enough():
+    bars = PASSING_BARS[:-1] + [(11.45, 13.0, 11.45, 13.0, 1000)]
+    ctx = make_ctx(bars)
+    strategy = AbcdStrategy(AbcdConfig(max_extension_atr_multiple=100.0, max_extension_pct=100.0))
+    assert strategy.evaluate(ctx, NOW) is not None
+
+
 def test_no_signal_when_pullback_volume_not_lighter_than_up_move():
     # same price structure as PASSING_BARS (still a valid pattern by the
     # pre-existing gates) but with pullback volume bumped above the

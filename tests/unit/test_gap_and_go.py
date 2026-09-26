@@ -90,6 +90,36 @@ def test_no_signal_when_gap_too_small():
     assert strategy.evaluate(ctx, NOW) is None
 
 
+def test_no_signal_when_gap_too_large():
+    ctx = make_ctx(
+        [
+            (6.5, 6.55, 6.45, 6.5, 1000),
+            (6.5, 6.55, 6.45, 6.5, 1000),
+            (6.5, 6.55, 6.45, 6.5, 1000),
+            (6.5, 6.55, 6.45, 6.5, 1000),
+            (6.5, 6.65, 6.5, 6.6, 1000),  # controlled ~0.76% breakout past the 6.55 opening-range high
+        ],
+        prior_close=5.0,  # gap from 5.0 to the 6.6 close is 32%, over the 20% ceiling
+    )
+    strategy = GapAndGoStrategy(default_config())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_signal_when_max_gap_pct_disabled():
+    ctx = make_ctx(
+        [
+            (6.5, 6.55, 6.45, 6.5, 1000),
+            (6.5, 6.55, 6.45, 6.5, 1000),
+            (6.5, 6.55, 6.45, 6.5, 1000),
+            (6.5, 6.55, 6.45, 6.5, 1000),
+            (6.5, 6.65, 6.5, 6.6, 1000),
+        ],
+        prior_close=5.0,
+    )
+    strategy = GapAndGoStrategy(default_config(max_gap_pct=None))
+    assert strategy.evaluate(ctx, NOW) is not None
+
+
 def test_no_signal_outside_price_band():
     ctx = make_ctx(
         [
@@ -146,6 +176,36 @@ def test_no_signal_when_relative_volume_too_low():
     )
     strategy = GapAndGoStrategy(default_config())
     assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_no_signal_when_relative_volume_too_high():
+    ctx = make_ctx(
+        [
+            (5.5, 5.7, 5.4, 5.6, 1000),
+            (5.6, 5.8, 5.5, 5.7, 1000),
+            (5.7, 5.9, 5.6, 5.75, 1000),
+            (5.75, 5.85, 5.7, 5.8, 1000),
+            (5.8, 6.0, 5.8, 5.95, 1000),
+        ],
+        avg_daily_volume=10,  # tiny average vs. actual bar volume -> relative volume far above the 200x ceiling
+    )
+    strategy = GapAndGoStrategy(default_config())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_signal_when_max_rel_volume_disabled():
+    ctx = make_ctx(
+        [
+            (5.5, 5.7, 5.4, 5.6, 1000),
+            (5.6, 5.8, 5.5, 5.7, 1000),
+            (5.7, 5.9, 5.6, 5.75, 1000),
+            (5.75, 5.85, 5.7, 5.8, 1000),
+            (5.8, 6.0, 5.8, 5.95, 1000),
+        ],
+        avg_daily_volume=10,
+    )
+    strategy = GapAndGoStrategy(default_config(max_rel_volume=None))
+    assert strategy.evaluate(ctx, NOW) is not None
 
 
 def test_does_not_retrigger_same_symbol_same_day():
@@ -295,7 +355,12 @@ def test_signal_when_extension_gate_loosened_enough():
             (5.5, 7.0, 5.5, 7.0, 1000),
         ]
     )
-    strategy = GapAndGoStrategy(default_config(max_extension_atr_multiple=100.0, max_extension_pct=100.0))
+    # max_gap_pct also loosened -- this fixture's 40% gap (prior_close=5.0 ->
+    # 7.0) would otherwise get rejected by the new gap-size ceiling before
+    # the extension gate this test isolates ever runs.
+    strategy = GapAndGoStrategy(
+        default_config(max_extension_atr_multiple=100.0, max_extension_pct=100.0, max_gap_pct=100.0)
+    )
     assert strategy.evaluate(ctx, NOW) is not None
 
 

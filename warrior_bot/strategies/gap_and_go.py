@@ -56,10 +56,14 @@ class GapAndGoStrategy(BaseStrategy):
         gap = ctx.gap_pct
         if gap is None or gap < cfg.min_gap_pct:
             return self._reject(ctx, "gap_pct")
+        if cfg.max_gap_pct is not None and gap > cfg.max_gap_pct:
+            return self._reject(ctx, "gap_too_large")
 
         rel_vol = ctx.relative_volume(session_elapsed_fraction(now))
         if rel_vol is None or rel_vol < cfg.min_rel_volume:
             return self._reject(ctx, "relative_volume")
+        if cfg.max_rel_volume is not None and rel_vol > cfg.max_rel_volume:
+            return self._reject(ctx, "relative_volume_too_high")
 
         # Breakout level is computed from bars *before* the current one, so
         # the current bar is judged against a level it couldn't itself set.

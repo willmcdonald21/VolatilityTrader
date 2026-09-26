@@ -166,9 +166,21 @@ class RiskConfig(BaseModel):
 class GapAndGoConfig(BaseModel):
     enabled: bool = True
     min_gap_pct: float = 10.0
+    # Upper bound on the gap floor above -- confirmed live via the full
+    # trade journal (2026-09-25 win-rate review): gaps under 20% return a
+    # profit factor of 5.46 (N=44); the 20-100% band collapses to 0.11-0.16
+    # (N=41). A monster gap isn't automatically a better setup -- past a
+    # point it reads more like an already-exhausted, hard-to-time move than
+    # a controlled breakout. None disables it (pre-existing behavior).
+    max_gap_pct: float | None = Field(default=20.0, gt=0)
     min_price: float = 1.0
     max_price: float = 20.0
     min_rel_volume: float = 5.0
+    # Upper bound on the rel-vol floor above -- same journal review: >=200x
+    # relative volume is a clean, consistent loser (PF 0.04, N=15), likely
+    # thin-liquidity/momentum-exhaustion chases rather than a controlled
+    # five-pillars setup. None disables it (pre-existing behavior).
+    max_rel_volume: float | None = Field(default=200.0, gt=0)
     breakout_lookback_bars: int = 30
     stop_buffer_pct: float = 1.0
     target_r_multiple: float = 2.0
@@ -188,10 +200,12 @@ class GapAndGoConfig(BaseModel):
     # ATR inflates right as it spikes, since the spike bars are themselves
     # in the lookback, which loosens the ATR multiple exactly when it
     # should tighten. A flat % of the breakout level has no such feedback
-    # loop. Calibrated directly off the journal: entries within 1-3% of the
-    # breakout level were the single most profitable bucket in the whole
-    # strategy (+$1,474.57 over 27 trades); entries 6%+ past it were 0-for-12.
-    max_extension_pct: float = Field(default=3.0, gt=0)
+    # loop. Originally calibrated at 3.0 off a coarse 1-3%/6%+ bucket split
+    # (+$1,474.57 over 27 trades vs. 0-for-12); a finer bucket breakdown of
+    # the same data (2026-09-25 win-rate review) shows the actual cliff is
+    # at 2%, not 3% -- 1-2% extended is PF 1.85 (N=19), 2-3% is already PF
+    # 0.07 (N=8). Tightened to 2.0 to stop admitting that losing band.
+    max_extension_pct: float = Field(default=2.0, gt=0)
 
 
 class PullbackQualityConfig(BaseModel):
@@ -236,6 +250,16 @@ class BullFlagConfig(BaseModel):
     target_r_multiple: float = 2.0
     min_rel_volume: float = 5.0  # Ross's stated hard floor -- "if it doesn't have at least 5x average volume, it's not worth touching"
     min_breakout_candle_strength: float = Field(default=0.0, ge=-1.0, le=1.0)
+    # Same guard as gap_and_go/vwap_reversion's field of the same name,
+    # applied to this strategy's own breakout level (flag_high). Added for
+    # entry-guard consistency across every breakout-style strategy, not
+    # because bull_flag's own historical losses were traced to chasing an
+    # extended bar (2026-09-25 win-rate review: 0 of bull_flag's 11 losers,
+    # small sample, were extended past 3%) -- this is defense-in-depth
+    # against the same shape of mistake, not a proven fix for bull_flag
+    # specifically. See is_entry_too_extended in strategies/indicators.py.
+    max_extension_atr_multiple: float = Field(default=2.5, gt=0)
+    max_extension_pct: float = Field(default=3.0, gt=0)
 
 
 class AbcdConfig(BaseModel):
@@ -247,6 +271,14 @@ class AbcdConfig(BaseModel):
     target_r_multiple: float = 2.0
     min_rel_volume: float = 5.0  # same hard floor as the other strategies -- a blanket five-pillars criterion, not gap_and_go-specific
     min_breakout_candle_strength: float = Field(default=0.0, ge=-1.0, le=1.0)
+    # Same guard/rationale as BullFlagConfig's field of the same name,
+    # applied to this strategy's own breakout level (b_high). abcd has 0
+    # accepted signals in the journal to date (crowded out by risk-slot
+    # competition, not a filter problem -- see docs), so there's no
+    # strategy-specific data to calibrate against yet; added for
+    # consistency with the other breakout-style strategies.
+    max_extension_atr_multiple: float = Field(default=2.5, gt=0)
+    max_extension_pct: float = Field(default=3.0, gt=0)
 
 
 class VwapReversionConfig(BaseModel):
@@ -263,8 +295,22 @@ class VwapReversionConfig(BaseModel):
     # within that single 1-minute bar. See is_entry_too_extended.
     max_extension_atr_multiple: float = Field(default=2.5, gt=0)
     # PRIMARY guard -- see gap_and_go's field of the same name for why the
-    # ATR check above has never once fired live.
-    max_extension_pct: float = Field(default=3.0, gt=0)
+    # ATR check above has never once fired live. Tightened to 2.0 alongside
+    # gap_and_go's own field (2026-09-25 win-rate review) for consistency --
+    # unlike gap_and_go, vwap_reversion's OWN extension buckets are small
+    # and noisy with no clean cliff (this strategy's setups are
+    # mean-reversion bounces off VWAP/prior-close, not a breakout chase, so
+    # "extension" measures something structurally different here), so this
+    # value was never independently calibrated from vwap_reversion's own
+    # data any more than the original 3.0 was -- it was always inherited
+    # from gap_and_go's number. Revisit once vwap_reversion accumulates
+    # enough extension-labeled trades of its own to calibrate independently.
+    max_extension_pct: float = Field(default=2.0, gt=0)
+    # Missing relative to the other four strategies until now: a weak-bodied
+    # (near-doji/wick-heavy) bounce/reclaim bar was never rejected here even
+    # though vwap_reversion has the extension guard the others (except
+    # gap_and_go) lack. See candle_strength in strategies/indicators.py.
+    min_breakout_candle_strength: float = Field(default=0.0, ge=-1.0, le=1.0)
 
 
 class InvertedHeadAndShouldersConfig(BaseModel):

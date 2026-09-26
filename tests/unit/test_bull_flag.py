@@ -16,7 +16,7 @@ PASSING_BARS = [
     (11.8, 11.75, 11.6, 11.65, 300),  # consolidation 1 -- light volume
     (11.65, 11.7, 11.55, 11.6, 300),  # consolidation 2
     (11.6, 11.65, 11.5, 11.55, 300),  # consolidation 3
-    (11.55, 12.2, 11.55, 12.2, 1000),  # breakout
+    (11.55, 12.05, 11.55, 12.05, 1000),  # breakout -- ~2.55% past the 11.75 flag_high, under the 3% extension cap
 ]
 
 
@@ -37,7 +37,7 @@ def test_flag_breakout_triggers_signal():
     signal = strategy.evaluate(ctx, NOW)
     assert signal is not None
     assert signal.strategy == "bull_flag"
-    assert signal.entry_price == 12.2
+    assert signal.entry_price == 12.05
     assert signal.stop_price < signal.entry_price
     assert signal.context["round_number_breakout"] is True  # crosses $12.0 on the breakout bar
 
@@ -98,7 +98,7 @@ SINGLE_BAR_PULLBACK = [
     (10.0, 10.0, 9.9, 10.0, 1000),     # baseline
     (10.0, 12.0, 10.0, 11.8, 3000),    # spike
     (11.8, 11.75, 11.5, 11.6, 300),    # single-bar pullback -- light volume
-    (11.6, 12.2, 11.6, 12.2, 1000),    # breakout
+    (11.6, 12.05, 11.6, 12.05, 1000),    # breakout -- ~2.55% past the 11.75 flag_high, under the 3% extension cap
 ]
 
 
@@ -160,3 +160,20 @@ def test_no_signal_when_relative_volume_too_low():
     ctx = make_ctx(PASSING_BARS, avg_daily_volume=10_000_000)
     strategy = BullFlagStrategy(BullFlagConfig())
     assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_no_signal_when_breakout_bar_too_extended():
+    # Added 2026-09-25 for entry-guard consistency with gap_and_go/
+    # vwap_reversion -- flag_high is 11.75; this breakout bar closes ~10.6%
+    # past it, well over the default 3% cap.
+    bars = PASSING_BARS[:-1] + [(11.55, 13.0, 11.55, 13.0, 1000)]
+    ctx = make_ctx(bars)
+    strategy = BullFlagStrategy(BullFlagConfig())
+    assert strategy.evaluate(ctx, NOW) is None
+
+
+def test_signal_when_extension_gate_loosened_enough():
+    bars = PASSING_BARS[:-1] + [(11.55, 13.0, 11.55, 13.0, 1000)]
+    ctx = make_ctx(bars)
+    strategy = BullFlagStrategy(BullFlagConfig(max_extension_atr_multiple=100.0, max_extension_pct=100.0))
+    assert strategy.evaluate(ctx, NOW) is not None

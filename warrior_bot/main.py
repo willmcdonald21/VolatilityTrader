@@ -103,7 +103,7 @@ class WarriorBot:
         if config.strategies.abcd.enabled:
             self.strategies.append(AbcdStrategy(config.strategies.abcd, config.pullback_quality))
         if config.strategies.vwap_reversion.enabled:
-            self.strategies.append(VwapReversionStrategy(config.strategies.vwap_reversion))
+            self.strategies.append(VwapReversionStrategy(config.strategies.vwap_reversion, config.pullback_quality))
         if config.strategies.inverted_head_and_shoulders.enabled:
             self.strategies.append(
                 InvertedHeadAndShouldersStrategy(config.strategies.inverted_head_and_shoulders)
