@@ -2,30 +2,43 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from warrior_bot.config import GapAndGoConfig
+from warrior_bot.config import GapAndGoConfig, PullbackQualityConfig
 from warrior_bot.scanner.float_provider import FloatProvider
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import BaseStrategy, SymbolContext
-from warrior_bot.strategies.indicators import (
-    candle_strength,
-    crossed_round_number,
-    is_entry_too_extended,
-    opening_range,
-)
+from warrior_bot.strategies.indicators import candle_strength, crossed_round_number, is_entry_too_extended
+from warrior_bot.strategies.pullback_validity import validate_pullback
 from warrior_bot.utils.time_utils import session_elapsed_fraction
 
 
 class GapAndGoStrategy(BaseStrategy):
     """Classic Warrior-Trading gap-and-go: a low-priced, high-relative-volume
-    gapper breaks above its pre-market/opening-range high on volume. Enter
-    long on the breakout, stop just below the breakout level."""
+    gapper spikes, pulls back (ideally holding VWAP and the 9 EMA), then
+    breaks the pullback's high on volume. Enter long on the breakout, stop
+    below the pullback low.
+
+    Reworked 2026-09-26 from a straight opening-range-breakout trigger (no
+    pullback of any kind) to this spike -> consolidation -> breakout
+    structure, mirroring bull_flag.py exactly -- Ross's own documented
+    beginner rule for gap-and-go is "buy the first pullback", not "buy the
+    initial breakout", and the old version had no pullback-detection logic
+    at all. The gap/price/float/relative-volume qualification checks below
+    are unchanged; only what counts as "the entry" has changed.
+    """
 
     name = "gap_and_go"
     config: GapAndGoConfig
+    LOOKBACK_BARS = 40
 
-    def __init__(self, config: GapAndGoConfig, float_provider: FloatProvider | None = None):
+    def __init__(
+        self,
+        config: GapAndGoConfig,
+        float_provider: FloatProvider | None = None,
+        pullback_quality_config: PullbackQualityConfig | None = None,
+    ):
         super().__init__(config)
         self.float_provider = float_provider
+        self.pullback_quality_config = pullback_quality_config or PullbackQualityConfig()
 
     def evaluate(self, ctx: SymbolContext, now: datetime) -> Signal | None:
         cfg = self.config
@@ -65,14 +78,47 @@ class GapAndGoStrategy(BaseStrategy):
         if cfg.max_rel_volume is not None and rel_vol > cfg.max_rel_volume:
             return self._reject(ctx, "relative_volume_too_high")
 
-        # Breakout level is computed from bars *before* the current one, so
-        # the current bar is judged against a level it couldn't itself set.
         prior_bars = ctx.bars[:-1]
-        range_ = opening_range(prior_bars, cfg.breakout_lookback_bars)
-        if range_ is None:
-            return self._reject(ctx, "no_opening_range")
-        breakout_high, _ = range_
+        # minimum viable window: 1 baseline bar + 1 spike bar + the shortest allowed consolidation
+        if len(prior_bars) < cfg.min_consolidation_bars + 2:
+            return None
 
+        window = prior_bars[-self.LOOKBACK_BARS :]
+        spike_idx = max(range(len(window)), key=lambda i: window[i].high)
+        spike_high = window[spike_idx].high
+
+        pre_spike = window[: spike_idx + 1]
+        baseline_low = min(b.low for b in pre_spike)
+        if baseline_low <= 0:
+            return self._reject(ctx, "invalid_baseline")
+        spike_pct = (spike_high - baseline_low) / baseline_low * 100.0
+        if spike_pct < cfg.min_spike_pct:
+            return self._reject(ctx, "spike_pct")
+
+        consolidation = window[spike_idx + 1 :]
+        if not (cfg.min_consolidation_bars <= len(consolidation) <= cfg.max_consolidation_bars):
+            return self._reject(ctx, "consolidation_bars")
+
+        pullback_low_bar = min(consolidation, key=lambda b: b.low)
+        pullback_low = pullback_low_bar.low
+        spike_range = spike_high - baseline_low
+        pullback_pct = (spike_high - pullback_low) / spike_range * 100.0 if spike_range > 0 else 100.0
+        if pullback_pct > cfg.max_pullback_pct:
+            return self._reject(ctx, "pullback_pct")
+
+        # Ross's beginner gap-and-go entry rule specifically requires the
+        # pullback to hold VWAP and the 9 EMA -- validate_pullback's base
+        # checks already enforce exactly that (plus the same volume-profile/
+        # topping-tail/MACD quality gates bull_flag/abcd already share), so
+        # this is what actually closes that fidelity gap, not a bespoke
+        # VWAP-distance check.
+        validity = validate_pullback(
+            pullback_bars=consolidation, up_move_bars=pre_spike, ctx=ctx, config=self.pullback_quality_config
+        )
+        if not validity.valid:
+            return self._reject(ctx, f"pullback_quality:{validity.reason}")
+
+        breakout_high = max(b.high for b in consolidation)
         current_bar = ctx.bars[-1]
         if current_bar.close <= breakout_high:
             return self._reject(ctx, "no_breakout")
@@ -86,7 +132,7 @@ class GapAndGoStrategy(BaseStrategy):
             return self._reject(ctx, "breakout_too_extended")
 
         entry_price = current_bar.close
-        stop_price = breakout_high * (1 - cfg.stop_buffer_pct / 100.0)
+        stop_price = pullback_low * (1 - cfg.stop_buffer_pct / 100.0)
         if stop_price >= entry_price:
             return self._reject(ctx, "invalid_stop")
 
@@ -101,7 +147,9 @@ class GapAndGoStrategy(BaseStrategy):
             context={
                 "gap_pct": gap,
                 "relative_volume": rel_vol,
+                "spike_high": spike_high,
                 "breakout_high": breakout_high,
+                "pullback_pct": pullback_pct,
                 "round_number_breakout": crossed_round_number(prior_bar.close, current_bar.close),
             },
         )
