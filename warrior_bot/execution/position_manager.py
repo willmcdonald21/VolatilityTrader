@@ -71,6 +71,12 @@ class ManagedPosition:
     # <= 0 without checking this orphaned 959 later-filled shares with no
     # listener left to protect them.
     parent_done: bool = False
+    # Count of "scale_out"-role target fills seen so far -- what
+    # _check_breakeven gates on for a lot with configured profit tiers (see
+    # its docstring), instead of racing an independent R-multiple trigger
+    # against the same tier fill. Irrelevant (never incremented, never read)
+    # for the single-fallback "target" role case.
+    tier_fill_count: int = 0
     breakeven_done: bool = False
     trailing_active: bool = False
     # When the bracket was submitted -- the clock cancel_stale_entries runs
@@ -205,8 +211,8 @@ class PositionManager:
 
         self._wire_entry_fill(pos, parent_trade)
 
-        for target_trade in target_trades:
-            self._wire_target_fill(pos, target_trade)
+        for target_trade, role in zip(target_trades, target_roles):
+            self._wire_target_fill(pos, target_trade, role)
         # journal_fill=False: this is the original bracket's stop_trade,
         # which OrderManager.submit_signal already ran through
         # _attach_tracking (journaling its fills there) before ever
@@ -263,8 +269,8 @@ class PositionManager:
         passes journal_fill=False to avoid double-recording it."""
         trade.fillEvent += lambda t, fill: self._on_stop_fill(pos, t, fill, journal_fill=journal_fill)
 
-    def _wire_target_fill(self, pos: ManagedPosition, trade: Trade) -> None:
-        trade.fillEvent += lambda t, fill: self._on_target_fill(pos, fill)
+    def _wire_target_fill(self, pos: ManagedPosition, trade: Trade, role: str = "target") -> None:
+        trade.fillEvent += lambda t, fill: self._on_target_fill(pos, fill, role)
 
     def resync_after_reconnect(self, ib: IB) -> set[int]:
         """Re-wires fill listeners for every tracked lot's stop/target/parent
@@ -334,10 +340,10 @@ class PositionManager:
                         pos.stop_order.orderId,
                     )
 
-                for target_order in pos.target_orders:
+                for target_order, role in zip(pos.target_orders, pos.target_roles):
                     fresh_target = open_by_id.get(target_order.orderId)
                     if fresh_target is not None:
-                        self._wire_target_fill(pos, fresh_target)
+                        self._wire_target_fill(pos, fresh_target, role)
                         claimed.add(target_order.orderId)
 
         if claimed:
@@ -435,7 +441,21 @@ class PositionManager:
         return (last_price - pos.signal.entry_price) / risk_per_share
 
     def _check_breakeven(self, pos: ManagedPosition, last_price: float) -> None:
-        if self._current_r(pos, last_price) < self.config.breakeven.trigger_r_multiple:
+        """Ross's rule sequences these two actions: sell (part of) the
+        position at the first profit target, THEN move the stop to
+        breakeven as a consequence of having banked that profit -- not two
+        independent triggers racing the same R-multiple (which is what an
+        R-multiple-only check does: it used to fire at 0.5R regardless of
+        whether the 1.0R tier had actually filled yet, the opposite order
+        from Ross's rule). For a lot with a "scale_out"-role tier configured,
+        this now waits for that tier's fill event specifically; only the
+        tiers-disabled fallback ("target"-role only) still uses the
+        independent trigger_r_multiple race, since there's no tier fill to
+        sequence after in that case."""
+        if "scale_out" in pos.target_roles:
+            if pos.tier_fill_count < 1:
+                return
+        elif self._current_r(pos, last_price) < self.config.breakeven.trigger_r_multiple:
             return
         entry = pos.signal.entry_price
         if entry > pos.current_stop_price:
@@ -672,9 +692,11 @@ class PositionManager:
         pos.current_stop_price = price
         self._wire_stop_fill(pos, new_trade)
 
-    def _on_target_fill(self, pos: ManagedPosition, fill) -> None:
+    def _on_target_fill(self, pos: ManagedPosition, fill, role: str = "target") -> None:
         filled_qty = fill.execution.shares
         pos.remaining_qty = max(0, pos.remaining_qty - filled_qty)
+        if role == "scale_out":
+            pos.tier_fill_count += 1
         if pos.remaining_qty <= 0:
             self._close_out(pos, cancel_stop=True, cancel_target=False)
             return

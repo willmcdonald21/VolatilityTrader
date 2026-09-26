@@ -308,6 +308,42 @@ def test_breakeven_is_idempotent_no_duplicate_modify_calls():
     assert pm._positions["TEST"][0].current_stop_price == 10.0
 
 
+def test_breakeven_waits_for_scale_out_tier_fill_even_after_r_multiple_reached():
+    # 2026-09-26 resequencing: for a lot with a configured "scale_out"
+    # profit tier, breakeven no longer races trigger_r_multiple
+    # independently -- it must wait for that tier's own fill event,
+    # matching Ross's rule (sell first, then de-risk to breakeven as a
+    # consequence of having banked that profit), not two triggers racing
+    # the same R-multiple.
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False, breakeven_r=0.5))
+    signal = make_signal(entry=10.0, stop=9.0)  # risk_per_share = 1.0
+    track_position(pm, signal, quantity=100, target_role="scale_out", target_qty=50)
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.0))  # +1.0R -- well past trigger_r_multiple, but no tier fill yet
+
+    pos = pm._positions["TEST"][0]
+    assert pos.current_stop_price == 9.0
+    assert pos.breakeven_done is False
+
+
+def test_breakeven_fires_right_after_scale_out_tier_fills_regardless_of_current_price():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False, breakeven_r=0.5))
+    signal = make_signal(entry=10.0, stop=9.0)
+    _, target_trade = track_position(pm, signal, quantity=100, target_role="scale_out", target_qty=50)
+    pos = pm._positions["TEST"][0]
+
+    target_trade.fillEvent.emit(target_trade, make_fill(50))  # the profit tier fills
+    flush_resize(pos)
+    assert pos.tier_fill_count == 1
+
+    pm.on_bar(FakeCtx("TEST", last_price=10.1))  # nowhere near +0.5R -- no longer gated on price at all
+
+    assert pos.breakeven_done is True
+    assert pos.current_stop_price == 10.0
+
+
 def test_trailing_only_moves_stop_up_never_down():
     ib = FakeIB()
     pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_method="ema"))
