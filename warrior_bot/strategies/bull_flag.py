@@ -10,6 +10,7 @@ from warrior_bot.strategies.indicators import (
     crossed_round_number,
     is_bottoming_tail,
     is_entry_too_extended,
+    is_flat_top,
 )
 from warrior_bot.strategies.pullback_validity import validate_pullback
 from warrior_bot.utils.time_utils import session_elapsed_fraction
@@ -98,8 +99,17 @@ class BullFlagStrategy(BaseStrategy):
         ):
             return self._reject(ctx, "breakout_too_extended")
 
+        # Ross's micro-pullback rule is a very tight, cents-below-the-low
+        # stop -- distinctly tighter than a multi-bar consolidation's stop.
+        # Only the literal micro-pullback case (exactly 1 bar) gets it;
+        # anything longer keeps the uniform stop_buffer_pct, same as before.
+        if len(consolidation) == 1 and cfg.micro_pullback_stop_buffer_pct is not None:
+            stop_buffer_pct = cfg.micro_pullback_stop_buffer_pct
+        else:
+            stop_buffer_pct = cfg.stop_buffer_pct
+
         entry_price = current_bar.close
-        stop_price = pullback_low * (1 - cfg.stop_buffer_pct / 100.0)
+        stop_price = pullback_low * (1 - stop_buffer_pct / 100.0)
         if stop_price >= entry_price:
             return self._reject(ctx, "invalid_stop")
 
@@ -117,5 +127,8 @@ class BullFlagStrategy(BaseStrategy):
                 "pullback_pct": pullback_pct,
                 "bottoming_tail_confirmation": is_bottoming_tail(pullback_low_bar),
                 "round_number_breakout": crossed_round_number(prior_bar.close, current_bar.close),
+                "flat_top_breakout": is_flat_top(
+                    [b.high for b in consolidation], cfg.flat_top_max_spread_pct
+                ),
             },
         )

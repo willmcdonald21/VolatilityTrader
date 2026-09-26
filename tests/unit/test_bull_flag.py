@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime
 
+import pytest
+
 from tests.unit.fixtures import make_bars
 from warrior_bot.config import BullFlagConfig
 from warrior_bot.strategies.base_strategy import SymbolContext
 from warrior_bot.strategies.bull_flag import BullFlagStrategy
+from warrior_bot.utils.rounding import round_to_tick
 from warrior_bot.utils.time_utils import EASTERN
 
 NOW = datetime(2026, 1, 5, 10, 0, tzinfo=EASTERN)
@@ -177,3 +180,73 @@ def test_signal_when_extension_gate_loosened_enough():
     ctx = make_ctx(bars)
     strategy = BullFlagStrategy(BullFlagConfig(max_extension_atr_multiple=100.0, max_extension_pct=100.0))
     assert strategy.evaluate(ctx, NOW) is not None
+
+
+def test_micro_pullback_uses_tighter_stop_buffer():
+    # SINGLE_BAR_PULLBACK's one consolidation bar has low=11.5 -- the
+    # default stop_buffer_pct (0.5%) would put the stop at 11.5*0.995=11.4425;
+    # the tighter micro_pullback_stop_buffer_pct default (0.15%) instead puts
+    # it at 11.5*0.9985=11.48275, matching Ross's "1-2 cents below the low"
+    # micro-pullback rule.
+    ctx = make_ctx(SINGLE_BAR_PULLBACK)
+    strategy = BullFlagStrategy(BullFlagConfig())
+    signal = strategy.evaluate(ctx, NOW)
+    assert signal is not None
+    assert signal.stop_price == round_to_tick(11.5 * (1 - 0.15 / 100.0))
+
+
+def test_multi_bar_pullback_keeps_uniform_stop_buffer():
+    # PASSING_BARS' 3-bar consolidation is not the micro-pullback case --
+    # stop stays at the uniform stop_buffer_pct regardless of
+    # micro_pullback_stop_buffer_pct being configured.
+    ctx = make_ctx(PASSING_BARS)
+    strategy = BullFlagStrategy(BullFlagConfig())
+    signal = strategy.evaluate(ctx, NOW)
+    assert signal is not None
+    assert signal.stop_price == round_to_tick(11.5 * (1 - 0.5 / 100.0))
+
+
+def test_micro_pullback_tight_stop_disabled_falls_back_to_uniform_buffer():
+    ctx = make_ctx(SINGLE_BAR_PULLBACK)
+    strategy = BullFlagStrategy(BullFlagConfig(micro_pullback_stop_buffer_pct=None))
+    signal = strategy.evaluate(ctx, NOW)
+    assert signal is not None
+    assert signal.stop_price == round_to_tick(11.5 * (1 - 0.5 / 100.0))
+
+
+def test_flat_top_breakout_true_when_pullback_highs_are_stacked():
+    # Consolidation highs 11.66/11.655/11.65 -- within the default 0.3%
+    # spread (top*0.3% = 0.035, actual spread = 0.01). Kept each bar's own
+    # wick shallow (unlike simply raising PASSING_BARS' own highs) so none
+    # of them accidentally reads as a topping tail and gets rejected by the
+    # existing pullback-quality gate instead.
+    bars = PASSING_BARS[:2] + [
+        (11.8, 11.66, 11.6, 11.65, 300),
+        (11.65, 11.655, 11.55, 11.6, 300),
+        (11.6, 11.65, 11.5, 11.55, 300),
+        (11.65, 11.85, 11.65, 11.85, 1000),
+    ]
+    ctx = make_ctx(bars)
+    strategy = BullFlagStrategy(BullFlagConfig())
+    signal = strategy.evaluate(ctx, NOW)
+    assert signal is not None
+    assert signal.context["flat_top_breakout"] is True
+
+
+def test_flat_top_breakout_false_when_pullback_highs_are_descending():
+    # PASSING_BARS' own consolidation highs (11.75, 11.7, 11.65) descend by
+    # well over the default 0.3% spread threshold.
+    ctx = make_ctx(PASSING_BARS)
+    strategy = BullFlagStrategy(BullFlagConfig())
+    signal = strategy.evaluate(ctx, NOW)
+    assert signal is not None
+    assert signal.context["flat_top_breakout"] is False
+
+
+def test_flat_top_breakout_false_for_single_bar_pullback():
+    # Nothing to compare -- not flat-top by definition (see is_flat_top).
+    ctx = make_ctx(SINGLE_BAR_PULLBACK)
+    strategy = BullFlagStrategy(BullFlagConfig())
+    signal = strategy.evaluate(ctx, NOW)
+    assert signal is not None
+    assert signal.context["flat_top_breakout"] is False

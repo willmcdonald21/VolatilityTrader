@@ -131,6 +131,24 @@ def crossed_round_number(prior_price: float, current_price: float) -> bool:
     return current_level > prior_level
 
 
+def is_flat_top(highs: list[float], max_spread_pct: float = 0.3) -> bool:
+    """True when a pullback's bar highs sit within `max_spread_pct` of each
+    other -- sellers stacked at (about) one price, rather than each
+    successive high sitting a little lower. Ross's "flat-top breakout": the
+    stacked resistance produces a more explosive break once cleared (short
+    stops and resting buy orders trigger together) than a normally-
+    declining pullback. Needs at least 2 highs to mean anything -- a
+    single-bar pullback has nothing to compare and is not flat-top by
+    definition."""
+    if len(highs) < 2:
+        return False
+    top = max(highs)
+    if top <= 0:
+        return False
+    spread = top - min(highs)
+    return spread <= top * (max_spread_pct / 100.0)
+
+
 def swing_points(bars: list[Bar], window: int = 2) -> list[tuple[int, str, float]]:
     """Simple local swing high/low detector.
 
