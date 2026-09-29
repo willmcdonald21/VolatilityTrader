@@ -98,15 +98,23 @@ def test_on_connected_resyncs_order_and_position_tracking(tmp_path, monkeypatch)
     assert calls[1] == ("order_manager", {"force": True, "skip_order_ids": frozenset({5, 6})})
 
 
-def test_on_connected_skips_resync_on_first_connect(tmp_path):
+def test_on_connected_always_resyncs_even_with_no_tracked_symbols(tmp_path):
+    # Changed 2026-09-28. The early return for an empty `contexts` used to
+    # skip BOTH the subscription teardown and the two resyncs -- but the
+    # resyncs recover fill listeners for OPEN POSITIONS, which can exist
+    # while contexts is empty (right after reset_daily_state, after a mass
+    # eviction, or before the first scan tick completes). Skipping them
+    # there left those positions permanently unmanaged. On a genuine first
+    # connect they are harmless no-ops.
     bot = WarriorBot(make_config(tmp_path))
     calls = []
     bot.position_manager.resync_after_reconnect = lambda ib: calls.append("position_manager") or set()
     bot.order_manager.resync_open_orders = lambda **kwargs: calls.append("order_manager")
 
-    bot._on_connected()  # nothing tracked yet -- first connect, not a reconnect
+    bot._on_connected()
 
-    assert calls == []
+    assert calls == ["position_manager", "order_manager"]
+    assert bot._resubscribe_after_reconnect == set()  # nothing held, nothing to re-onboard
 
 
 def make_signal(entry=10.0, stop=9.0) -> Signal:
@@ -1211,3 +1219,123 @@ def test_new_trading_day_persists_fresh_state_under_todays_date_not_yesterdays(t
         "start_of_day_equity": 40_000.0,
         "loss_limit_halted": True,
     }
+
+
+# -- 2026-09-28 execution-layer audit: reconciliation and reconnect fixes --
+
+
+def test_reconciliation_keeps_a_symbol_whose_entry_is_still_working(tmp_path, monkeypatch):
+    # track() registers a lot the instant the bracket is submitted, with
+    # remaining_qty=0, and entry_fill_timeout_seconds is 300s -- so IBKR
+    # correctly reports no position for a working limit entry. Dropping it
+    # left the lot with a stop but no breakeven/trailing/reversal (on_bar
+    # can't see it), outside the position caps, and invisible to
+    # cancel_stale_entries.
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.position_manager._positions["SLOW"] = [
+        SimpleNamespace(resize_task=None, parent_done=False)  # entry still working
+    ]
+    bot.ib.positions = lambda: []
+    bot.ib.openTrades = lambda: []
+
+    bot._check_position_reconciliation()
+
+    assert "SLOW" in bot.position_manager.tracked_symbols()
+
+
+def test_reconciliation_still_drops_a_symbol_whose_entry_is_done(tmp_path, monkeypatch):
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.position_manager._positions["DONE"] = [SimpleNamespace(resize_task=None, parent_done=True)]
+    bot.ib.positions = lambda: []
+    bot.ib.openTrades = lambda: []
+
+    bot._check_position_reconciliation()
+
+    assert "DONE" not in bot.position_manager.tracked_symbols()
+
+
+def _stranded_stop_trade(symbol="GAPR", trigger=10.0, qty=100.0):
+    trade = _FakeTrade(symbol, "SELL", "STP LMT", qty)
+    trade.order.auxPrice = trigger
+    trade.orderStatus.filled = 0.0
+    return trade
+
+
+def test_triggered_but_unfilled_stop_limit_no_longer_counts_as_protection(tmp_path, monkeypatch):
+    # Every stop is a STP LMT with the limit only 0.5% under the trigger.
+    # In a gap-down the stop triggers and the limit is left behind; the
+    # order keeps reporting full `remaining`, so the watchdog scored the
+    # position 100% covered while it was actually naked.
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.contexts["GAPR"] = SimpleNamespace(symbol="GAPR", last_price=8.0)  # gapped well under the 10.0 trigger
+    bot.ib.positions = lambda: [_FakePosition("GAPR", 100.0)]
+    bot.ib.openTrades = lambda: [_stranded_stop_trade()]
+    placed = []
+    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    bot._check_position_reconciliation()
+
+    assert len(placed) == 1  # flattened, not treated as covered
+    assert placed[0][1].action == "SELL"
+
+
+def test_stop_limit_sitting_near_its_trigger_still_counts_as_protection(tmp_path, monkeypatch):
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.contexts["CALM"] = SimpleNamespace(symbol="CALM", last_price=10.05)  # trading above its trigger
+    bot.ib.positions = lambda: [_FakePosition("CALM", 100.0)]
+    bot.ib.openTrades = lambda: [_stranded_stop_trade(symbol="CALM")]
+    placed = []
+    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    bot._check_position_reconciliation()
+
+    assert placed == []
+
+
+def test_stranded_check_is_skipped_without_a_price_reference(tmp_path, monkeypatch):
+    # No bar feed for the symbol -- fall back to the old behaviour rather
+    # than flattening on a guess.
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.positions = lambda: [_FakePosition("NOCTX", 100.0)]
+    bot.ib.openTrades = lambda: [_stranded_stop_trade(symbol="NOCTX")]
+    placed = []
+    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    bot._check_position_reconciliation()
+
+    assert placed == []
+
+
+def test_reconnect_queues_held_symbols_for_re_onboarding(tmp_path, monkeypatch):
+    # _scan_loop only onboards names in the current top-N, so a held
+    # position that dropped out of the scan never got bars again -- no
+    # breakeven, no trailing, no reversal exit for the rest of the day.
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.contexts["AAA"] = object()
+    bot.position_manager._positions["HELD"] = [SimpleNamespace(resize_task=None, parent_done=True)]
+    bot.position_manager.resync_after_reconnect = lambda ib: {7}
+    bot.order_manager.resync_open_orders = lambda **kwargs: None
+
+    bot._on_connected()
+
+    assert bot._resubscribe_after_reconnect == {"HELD"}
+
+
+def test_reconnect_alerts_when_nothing_resynced_but_positions_are_held(tmp_path, monkeypatch):
+    alerts = []
+    monkeypatch.setattr("warrior_bot.main.alert", lambda message, channel=None: alerts.append((message, channel)))
+    bot = WarriorBot(make_config(tmp_path))
+    bot.contexts["AAA"] = object()
+    bot.position_manager._positions["HELD"] = [SimpleNamespace(resize_task=None, parent_done=True)]
+    bot.position_manager.resync_after_reconnect = lambda ib: set()  # nothing found at the broker
+    bot.order_manager.resync_open_orders = lambda **kwargs: None
+
+    bot._on_connected()
+
+    assert any("resynced 0 orders" in message for message, _ in alerts)

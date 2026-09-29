@@ -62,6 +62,11 @@ class WarriorBot:
         # candidate it returns) -- protects currently-relevant symbols from
         # eviction and picks the least-relevant one when capacity is needed.
         self._last_scan_seen_at: dict[str, datetime] = {}
+        # Symbols holding an open position when a reconnect dropped every
+        # bar subscription. _scan_loop re-onboards these on its next tick
+        # regardless of whether they still rank, so an open position never
+        # loses its bar feed (and with it breakeven/trailing/reversal).
+        self._resubscribe_after_reconnect: set[str] = set()
         self.ib.connectedEvent += self._on_connected
 
         conn = get_connection(config.resolve_path(config.journal.db_path))
@@ -198,23 +203,47 @@ class WarriorBot:
         before the reconnect -- see resync_open_orders' docstring) doesn't
         also re-attach its own journaling listener to those and
         double-journal the next fill."""
-        if not self.contexts:
-            return
-        orphaned = list(self.contexts.keys())
-        self.logger.warning(
-            "Reconnected -- dropping bar subscriptions for %d already-tracked symbol(s) "
-            "(disconnect clears all session state); will re-onboard on next scan: %s",
-            len(orphaned),
-            orphaned,
-        )
-        self.contexts.clear()
-        self.contracts.clear()
-        self._subscriptions.clear()
-        self._last_bar_at.clear()
-        self._last_scan_seen_at.clear()
+        # Only the subscription teardown is conditional on having tracked
+        # symbols. The two resyncs below must run unconditionally: they
+        # recover fill listeners for OPEN POSITIONS, which can exist while
+        # `contexts` is empty (right after reset_daily_state, after a mass
+        # eviction, or before the first scan tick completes). Returning
+        # early here skipped both and left those positions permanently
+        # unmanaged.
+        if self.contexts:
+            orphaned = list(self.contexts.keys())
+            self.logger.warning(
+                "Reconnected -- dropping bar subscriptions for %d already-tracked symbol(s) "
+                "(disconnect clears all session state); will re-onboard on next scan: %s",
+                len(orphaned),
+                orphaned,
+            )
+            self.contexts.clear()
+            self.contracts.clear()
+            self._subscriptions.clear()
+            self._last_bar_at.clear()
+            self._last_scan_seen_at.clear()
 
+        tracked = self.position_manager.tracked_symbols()
         claimed = self.position_manager.resync_after_reconnect(self.ib)
         self.order_manager.resync_open_orders(force=True, skip_order_ids=frozenset(claimed))
+
+        if tracked and not claimed:
+            alert(
+                f"Reconnected but resynced 0 orders while still tracking {len(tracked)} position(s) "
+                f"({', '.join(sorted(tracked))}) -- fill tracking may be dead; check IBKR",
+                channel="kill_switch",
+            )
+
+        # Held symbols must be re-subscribed regardless of the scanner.
+        # _scan_loop only onboards names in the current top-N, so a position
+        # that had dropped out of the scan (very likely after a multi-hour
+        # outage) never got bars again -- meaning no breakeven, no trailing
+        # and no reversal exit for it for the rest of the day, leaving only
+        # its resting stop. On 2026-09-28 the scanner itself was dead after
+        # the reconnect, so nothing would have been re-onboarded at all.
+        if tracked:
+            self._resubscribe_after_reconnect = set(tracked)
 
     async def _scan_loop(self) -> None:
         while True:
@@ -224,6 +253,19 @@ class WarriorBot:
             try:
                 symbols = await asyncio.wait_for(scan_candidates(self.ib, self.config), timeout=30)
                 now = datetime.now(timezone.utc)
+                # Symbols holding an open position across a reconnect are
+                # onboarded first and unconditionally -- see _on_connected.
+                # They are prepended rather than merged so their rank still
+                # reflects the real scan when they are genuinely in it.
+                for held in sorted(self._resubscribe_after_reconnect - set(symbols)):
+                    if held not in self.contexts:
+                        self.logger.warning(
+                            "Re-onboarding %s after reconnect: it holds an open position but is no "
+                            "longer in the scanner's results",
+                            held,
+                        )
+                        await self._onboard_symbol(held, scanner_rank=None)
+                self._resubscribe_after_reconnect.clear()
                 for symbol in symbols:
                     # Stamped for every symbol still in the current top-N,
                     # already-tracked ones included -- this is what protects
@@ -468,7 +510,21 @@ class WarriorBot:
         # Stale local tracking: PositionManager thinks a symbol is still
         # open but IBKR shows it flat (e.g. a resync that couldn't resolve
         # a stop that filled/cancelled entirely while disconnected).
+        #
+        # A lot whose ENTRY is still working is not stale -- IBKR correctly
+        # reports no position for it yet. track() registers a lot the
+        # instant the bracket is submitted with remaining_qty=0, and
+        # entry_fill_timeout_seconds is 300s (RLGT filled 3h56m late on
+        # 2026-09-15), so before this guard any entry slower than one 30s
+        # watchdog cycle was silently untracked. It then kept its stop but
+        # lost breakeven, trailing and reversal-exit permanently (on_bar
+        # can no longer see it), stopped counting toward
+        # max_concurrent_positions / the 2-lot cap / the cross-strategy
+        # gate, and became invisible to cancel_stale_entries -- the very
+        # mechanism meant to cancel it.
         for symbol in self.position_manager.tracked_symbols() - set(live_positions.keys()):
+            if self.position_manager.has_unfilled_entry(symbol):
+                continue
             self.logger.warning(
                 "Reconciliation: %s tracked locally but flat at IBKR -- dropping stale local state", symbol
             )
@@ -482,6 +538,8 @@ class WarriorBot:
         stop_qty_by_symbol: dict[str, float] = {}
         for trade in self.ib.openTrades():
             if trade.order.action != "SELL" or trade.order.orderType not in ("STP", "STP LMT"):
+                continue
+            if self._stop_is_stranded(trade):
                 continue
             remaining = trade.orderStatus.remaining or trade.order.totalQuantity
             symbol = trade.contract.symbol
@@ -502,6 +560,39 @@ class WarriorBot:
                 self._emergency_flatten_symbol(
                     symbol, position, reason="unprotected_position_detected", covered_qty=covered
                 )
+
+    # How far below its own trigger price a stop-limit has to be left before
+    # it counts as stranded rather than protective. Every stop this bot
+    # places is a STP LMT with the limit only stop_limit_offset_pct (0.5%)
+    # below the trigger; in a gap-down on a low-float name the stop triggers
+    # and the limit is left behind unfilled. The order keeps reporting its
+    # full `remaining`, so the watchdog scored the position 100% covered
+    # while it was in fact naked. Sized comfortably beyond the limit offset
+    # so ordinary trading around the trigger doesn't read as stranded.
+    _STRANDED_STOP_PCT = 2.0
+
+    def _stop_is_stranded(self, trade) -> bool:
+        """True when a stop has triggered but its limit was left behind, so
+        it is no longer providing the protection its `remaining` implies."""
+        trigger = getattr(trade.order, "auxPrice", None)
+        if not trigger or trigger <= 0 or trigger > 1e15:  # 1e15: IBKR's UNSET_DOUBLE sentinel
+            return False
+        if (trade.orderStatus.filled or 0) > 0:
+            return False  # partially filling -- it is working, not stranded
+        ctx = self.contexts.get(trade.contract.symbol)
+        last_price = ctx.last_price if ctx is not None else None
+        if last_price is None or last_price <= 0:
+            return False  # no trustworthy reference; leave the old behaviour
+        stranded = last_price < trigger * (1 - self._STRANDED_STOP_PCT / 100.0)
+        if stranded:
+            self.logger.warning(
+                "Reconciliation: %s stop triggered at %.4f but price is %.4f with no fills -- "
+                "treating it as stranded, not protection",
+                trade.contract.symbol,
+                trigger,
+                last_price,
+            )
+        return stranded
 
     def _emergency_flatten_symbol(self, symbol: str, position, reason: str, covered_qty: float) -> None:
         placed = flatten_position(
@@ -658,7 +749,7 @@ class WarriorBot:
         ctx = SymbolContext(symbol=symbol, scanner_rank=scanner_rank)
 
         try:
-            ctx.prior_close = await fetch_prior_close(self.ib, contract)
+            ctx.prior_close = await asyncio.wait_for(fetch_prior_close(self.ib, contract), timeout=30)
         except Exception:
             self.logger.exception("Failed to fetch prior close for %s", symbol)
 
@@ -682,7 +773,9 @@ class WarriorBot:
             self.logger.exception("Failed to fetch avg daily volume for %s", symbol)
 
         try:
-            warmup_bars = await fetch_warmup_bars(self.ib, contract, self.config)
+            warmup_bars = await asyncio.wait_for(
+                fetch_warmup_bars(self.ib, contract, self.config), timeout=30
+            )
             for b in warmup_bars:
                 ctx.add_bar(_bar_from_ib(b))
         except Exception:
@@ -690,8 +783,11 @@ class WarriorBot:
 
         if self.config.news.enabled and self._news_provider_codes:
             try:
-                headlines = await fetch_recent_headlines(
-                    self.ib, contract, self._news_provider_codes, self.config.news.lookback_hours
+                headlines = await asyncio.wait_for(
+                    fetch_recent_headlines(
+                        self.ib, contract, self._news_provider_codes, self.config.news.lookback_hours
+                    ),
+                    timeout=30,
                 )
                 catalyst = classify_headlines(headlines)
                 ctx.catalyst_category = catalyst.category
