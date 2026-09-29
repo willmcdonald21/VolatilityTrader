@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import threading
+import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
@@ -25,30 +28,47 @@ _CHANNEL_ENV_VARS = {
 }
 
 
-def _post_payload(payload: dict, channel: str) -> None:
-    """Fire-and-forget POST of a Discord webhook payload to one of the
-    named channels (see _CHANNEL_ENV_VARS), whose URL is read from an
-    environment variable -- deliberately never from config.yaml, which is
-    tracked in git. No-ops silently if that channel's variable isn't set,
-    so notifications are opt-in with zero setup cost otherwise.
+# Channels whose messages matter enough to block briefly for. A lost
+# kill-switch or daily-limit alert is the difference between knowing the
+# bot halted and finding out hours later; 748 `limits` messages and one
+# `kill_switch` message were dropped without trace before this.
+_CRITICAL_CHANNELS = frozenset({"kill_switch", "limits"})
 
-    Runs the actual HTTP call on a background thread rather than making
-    the caller `await` it: this needs to be safely callable from both the
-    async main bot loop and synchronous contexts (scripts/kill_switch.py
-    has no running event loop), and a slow/failed webhook call must never
-    block or fail trading logic.
-    """
+_MAX_ATTEMPTS = 3
+_RETRY_BASE_SECONDS = 0.5
+_REQUEST_TIMEOUT_SECONDS = 5.0
+# Bounded so a webhook outage can't grow the queue without limit; the
+# oldest non-critical message is dropped (with a log line) when full.
+_QUEUE_MAX = 500
+
+_queue: "queue.Queue[tuple[dict, str, int]]" = queue.Queue(maxsize=_QUEUE_MAX)
+_worker: threading.Thread | None = None
+_worker_lock = threading.Lock()
+
+
+def _webhook_url(channel: str) -> str | None:
     env_var = _CHANNEL_ENV_VARS.get(channel)
     if env_var is None:
         raise ValueError(f"Unknown notification channel {channel!r}, expected one of {list(_CHANNEL_ENV_VARS)}")
+    return os.environ.get(env_var)
 
-    webhook_url = os.environ.get(env_var)
+
+def _deliver(payload: dict, channel: str, attempts: int = _MAX_ATTEMPTS) -> bool:
+    """POSTs once per attempt with backoff. Returns True on success.
+
+    Honours Discord's 429 Retry-After: the old code treated a rate-limit
+    identically to a network error and dropped the message. With
+    notify_on_fill posting one message per partial fill, bursts blow
+    straight through Discord's ~5-requests-per-2-seconds webhook limit --
+    which is the most likely explanation for the 627 failures recorded
+    during the 2026-09-21 storm."""
+    webhook_url = _webhook_url(channel)
     if not webhook_url:
-        return
+        return True  # channel not configured -- nothing to deliver, not a failure
 
-    def _post() -> None:
+    data = json.dumps(payload).encode("utf-8")
+    for attempt in range(1, attempts + 1):
         try:
-            data = json.dumps(payload).encode("utf-8")
             request = urllib.request.Request(
                 webhook_url,
                 data=data,
@@ -58,11 +78,114 @@ def _post_payload(payload: dict, channel: str) -> None:
                 headers={"Content-Type": "application/json", "User-Agent": "warrior-bot (discord-notify, 1.0)"},
                 method="POST",
             )
-            urllib.request.urlopen(request, timeout=5.0).read()
+            urllib.request.urlopen(request, timeout=_REQUEST_TIMEOUT_SECONDS).read()
+            return True
+        except urllib.error.HTTPError as exc:
+            retry_after = None
+            if exc.code == 429:
+                try:
+                    retry_after = float(exc.headers.get("Retry-After", "1"))
+                except (TypeError, ValueError):
+                    retry_after = 1.0
+            if attempt == attempts:
+                logger.error(
+                    "Discord notification to %r failed permanently after %d attempts (HTTP %s)",
+                    channel,
+                    attempts,
+                    exc.code,
+                )
+                return False
+            time.sleep(retry_after if retry_after is not None else _RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
         except Exception:
-            logger.exception("Failed to send Discord notification to channel %r", channel)
+            if attempt == attempts:
+                logger.exception(
+                    "Discord notification to %r failed permanently after %d attempts", channel, attempts
+                )
+                return False
+            time.sleep(_RETRY_BASE_SECONDS * (2 ** (attempt - 1)))
+    return False
 
-    threading.Thread(target=_post, daemon=True).start()
+
+def _worker_loop() -> None:
+    while True:
+        payload, channel, attempts = _queue.get()
+        try:
+            _deliver(payload, channel, attempts)
+        except Exception:  # pragma: no cover - the worker must never die
+            logger.exception("Unexpected failure in the Discord worker")
+        finally:
+            _queue.task_done()
+
+
+def _ensure_worker() -> None:
+    global _worker
+    with _worker_lock:
+        if _worker is None or not _worker.is_alive():
+            # No name= kwarg: ib_async substitutes its own Thread class
+            # (SyncThread) which doesn't accept one.
+            _worker = threading.Thread(target=_worker_loop, daemon=True)
+            _worker.start()
+
+
+def _post_payload(payload: dict, channel: str) -> None:
+    """Queues a Discord webhook payload for one of the named channels (see
+    _CHANNEL_ENV_VARS), whose URL is read from an environment variable --
+    deliberately never from config.yaml, which is tracked in git. No-ops
+    silently if that channel's variable isn't set, so notifications are
+    opt-in with zero setup cost otherwise.
+
+    Delivery happens off the caller's thread so a slow webhook never blocks
+    or fails trading logic, and this stays safely callable from both the
+    async bot loop and synchronous contexts (scripts/kill_switch.py has no
+    running event loop).
+
+    Two deliberate changes from the original fire-and-forget design, after
+    2,489 notifications were confirmed lost -- including 748 on `limits`
+    and one on `kill_switch`:
+
+    - One queue and one worker thread, instead of a new OS thread per
+      message. During the 2026-09-21 storm the old design spawned thousands
+      of threads competing with the trading event loop.
+    - Critical channels (kill_switch, limits) are delivered SYNCHRONOUSLY
+      with retry. A few seconds of blocking is an acceptable price for
+      actually knowing the bot halted -- and it also means such a message
+      can't be killed in flight by a daemon thread dying at interpreter
+      exit, which is precisely when a shutdown alert matters most.
+    """
+    if _webhook_url(channel) is None:
+        return
+
+    if channel in _CRITICAL_CHANNELS:
+        _deliver(payload, channel)
+        return
+
+    _ensure_worker()
+    try:
+        _queue.put_nowait((payload, channel, _MAX_ATTEMPTS))
+    except queue.Full:
+        logger.error("Discord queue full (%d) -- dropping a %r notification", _QUEUE_MAX, channel)
+
+
+def flush(timeout: float = 5.0) -> bool:
+    """Blocks until every queued notification has been attempted.
+
+    Called on shutdown so pending messages aren't lost with the daemon
+    worker at interpreter exit, and used by tests to observe delivery
+    deterministically. Returns False if the queue didn't drain in time."""
+    deadline = time.monotonic() + timeout
+    while not _queue.empty() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    return _queue.empty()
+
+
+def validate_configured_channels(enabled_channels: list[str]) -> list[str]:
+    """Returns the enabled channels with no webhook URL set.
+
+    A missing env var was previously an silent `return` -- a typo'd or
+    unset DISCORD_WEBHOOK_KILL_SWITCH produced no error anywhere and was
+    indistinguishable from working. Called at startup so the operator finds
+    out immediately rather than during an incident."""
+    return [channel for channel in enabled_channels if not _webhook_url(channel)]
 
 
 def send_discord_message(content: str, channel: str) -> None:

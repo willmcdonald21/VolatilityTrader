@@ -14,7 +14,11 @@ from warrior_bot.config import AppConfig, load_config
 from warrior_bot.execution.order_manager import OrderManager
 from warrior_bot.execution.position_manager import PositionManager
 from warrior_bot.logging_setup import alert, setup_logging
-from warrior_bot.notify.discord import send_discord_message
+from warrior_bot.notify.discord import (
+    flush as discord_flush,
+    send_discord_message,
+    validate_configured_channels,
+)
 from warrior_bot.persistence.db import get_connection
 from warrior_bot.persistence.journal import Journal
 from warrior_bot.risk.account_state import AccountState
@@ -167,6 +171,7 @@ class WarriorBot:
                 self._news_provider_codes = await discover_provider_codes(self.ib)
             except Exception:
                 self.logger.exception("Failed to discover news providers")
+        self._validate_notification_channels()
         self.ib_client.start_heartbeat()
         self._scan_task = asyncio.ensure_future(self._scan_loop())
         self._risk_task = asyncio.ensure_future(self._risk_loop())
@@ -187,6 +192,10 @@ class WarriorBot:
             self._watchdog_task.cancel()
         if self._reconciliation_task:
             self._reconciliation_task.cancel()
+        # Drain queued notifications before the daemon worker dies with
+        # the interpreter -- a shutdown alert is exactly the one you
+        # cannot afford to lose.
+        discord_flush(timeout=5.0)
         self.ib_client.disconnect()
 
     def _on_connected(self) -> None:
@@ -269,6 +278,40 @@ class WarriorBot:
     # escalated from a log line to an alert. Below it, brief blips stay
     # quiet.
     DISCONNECT_ALERT_SECONDS = 120.0
+
+    def _validate_notification_channels(self) -> None:
+        """Warns at startup about enabled Discord channels with no webhook
+        URL configured. A missing env var used to be a silent no-op --
+        indistinguishable from working until the moment an alert didn't
+        arrive."""
+        cfg = self.config.notifications
+        if not cfg.enabled:
+            return
+        enabled = []
+        if cfg.notify_on_kill_switch:
+            enabled.append("kill_switch")
+        if cfg.notify_on_limits:
+            enabled.append("limits")
+        if cfg.notify_on_signal or cfg.notify_on_fill:
+            enabled.append("trade_activity")
+        if cfg.notify_on_entry_summary:
+            enabled.append("trade_activity_summary")
+        if cfg.notify_on_pnl:
+            enabled.append("pnl")
+
+        missing = validate_configured_channels(enabled)
+        if missing:
+            self.logger.error(
+                "Notifications are enabled for %s but no webhook URL is configured for them -- "
+                "those alerts will go nowhere",
+                ", ".join(missing),
+            )
+            if "kill_switch" not in missing:
+                alert(
+                    f"Discord channels enabled with no webhook configured: {', '.join(missing)} -- "
+                    "those notifications are being silently discarded",
+                    channel="kill_switch",
+                )
 
     async def _await_connection(self, loop_name: str) -> bool:
         """Returns True when connected. When not, records and reports the

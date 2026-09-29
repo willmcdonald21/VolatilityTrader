@@ -7,24 +7,21 @@ import pytest
 from warrior_bot.notify import discord as discord_module
 
 
-class SyncThread:
-    """Runs the target synchronously instead of on a real thread, so tests
-    don't need to sleep/join to observe the effect."""
+def _drain(monkeypatch):
+    """Non-critical channels are queued to a single background worker
+    (2026-09-28: the old thread-per-message design lost 2,489
+    notifications and spawned thousands of threads during a storm).
+    Tests queue, then drain, instead of stubbing out threading.
 
-    def __init__(self, target, daemon=None):
-        self._target = target
-
-    def start(self) -> None:
-        self._target()
+    Retry backoff is shortened so a test exercising a failure path doesn't
+    actually sleep for seconds."""
+    monkeypatch.setattr(discord_module, "_RETRY_BASE_SECONDS", 0.001)
+    return lambda: discord_module.flush(timeout=5.0)
 
 
 class FakeResponse:
     def read(self):
         return b""
-
-
-def _use_sync_thread(monkeypatch):
-    monkeypatch.setattr(discord_module, "threading", type("FakeThreadingModule", (), {"Thread": SyncThread}))
 
 
 def test_unknown_channel_raises():
@@ -53,7 +50,7 @@ def test_no_op_when_that_channels_webhook_url_not_set(monkeypatch, channel, env_
 def test_posts_content_to_the_correct_channels_webhook(monkeypatch):
     monkeypatch.setenv("DISCORD_WEBHOOK_KILL_SWITCH", "https://discord.example/kill-switch")
     monkeypatch.setenv("DISCORD_WEBHOOK_LIMITS", "https://discord.example/limits")
-    _use_sync_thread(monkeypatch)
+    drain = _drain(monkeypatch)
     captured = {}
 
     def fake_urlopen(request, timeout=None):
@@ -65,6 +62,7 @@ def test_posts_content_to_the_correct_channels_webhook(monkeypatch):
     monkeypatch.setattr(discord_module.urllib.request, "urlopen", fake_urlopen)
 
     discord_module.send_discord_message("hello world", channel="kill_switch")
+    drain()
 
     assert captured["url"] == "https://discord.example/kill-switch"
     assert captured["data"]["content"] == "hello world"
@@ -73,7 +71,7 @@ def test_posts_content_to_the_correct_channels_webhook(monkeypatch):
 
 def test_truncates_content_to_discord_message_limit(monkeypatch):
     monkeypatch.setenv("DISCORD_WEBHOOK_TRADE_ACTIVITY", "https://discord.example/trade-activity")
-    _use_sync_thread(monkeypatch)
+    drain = _drain(monkeypatch)
     captured = {}
 
     def fake_urlopen(request, timeout=None):
@@ -83,13 +81,14 @@ def test_truncates_content_to_discord_message_limit(monkeypatch):
     monkeypatch.setattr(discord_module.urllib.request, "urlopen", fake_urlopen)
 
     discord_module.send_discord_message("x" * 3000, channel="trade_activity")
+    assert drain()
 
     assert len(captured["data"]["content"]) == 2000
 
 
 def test_swallows_exceptions_from_failed_request(monkeypatch):
     monkeypatch.setenv("DISCORD_WEBHOOK_LIMITS", "https://discord.example/limits")
-    _use_sync_thread(monkeypatch)
+    drain = _drain(monkeypatch)
 
     def failing_urlopen(*args, **kwargs):
         raise OSError("network down")
@@ -97,6 +96,7 @@ def test_swallows_exceptions_from_failed_request(monkeypatch):
     monkeypatch.setattr(discord_module.urllib.request, "urlopen", failing_urlopen)
 
     discord_module.send_discord_message("hello", channel="limits")  # must not raise
+    drain()
 
 
 def test_no_op_when_pnl_webhook_url_not_set(monkeypatch):
@@ -139,7 +139,7 @@ def test_build_pnl_message_zero_is_treated_as_green():
 
 def test_send_discord_embed_posts_embeds_payload(monkeypatch):
     monkeypatch.setenv("DISCORD_WEBHOOK_TRADE_ACTIVITY_SUMMARY", "https://discord.example/trade-activity-summary")
-    _use_sync_thread(monkeypatch)
+    drain = _drain(monkeypatch)
     captured = {}
 
     def fake_urlopen(request, timeout=None):
@@ -150,6 +150,7 @@ def test_send_discord_embed_posts_embeds_payload(monkeypatch):
     monkeypatch.setattr(discord_module.urllib.request, "urlopen", fake_urlopen)
 
     discord_module.send_discord_embed({"title": "hi"}, channel="trade_activity_summary")
+    assert drain()
 
     assert captured["url"] == "https://discord.example/trade-activity-summary"
     assert captured["data"] == {"embeds": [{"title": "hi"}]}
@@ -241,3 +242,88 @@ def test_build_entry_summary_embed_new_position_uses_green_addon_uses_amber():
     )
 
     assert new_embed["color"] != addon_embed["color"]
+
+
+# -- 2026-09-28 audit: 2,489 notifications were lost, including on
+# kill_switch and limits. No retry, no queue, no 429 handling. --
+
+
+def test_critical_channels_deliver_synchronously(monkeypatch):
+    # kill_switch/limits must not depend on a daemon worker that dies at
+    # interpreter exit -- a shutdown alert is precisely the one that matters.
+    monkeypatch.setenv("DISCORD_WEBHOOK_KILL_SWITCH", "https://discord.example/kill-switch")
+    monkeypatch.setattr(discord_module, "_RETRY_BASE_SECONDS", 0.001)
+    calls = []
+    monkeypatch.setattr(
+        discord_module.urllib.request, "urlopen", lambda r, timeout=None: calls.append(1) or FakeResponse()
+    )
+
+    discord_module.send_discord_message("halted", channel="kill_switch")
+
+    assert calls == [1]  # already delivered, no drain needed
+
+
+def test_transient_failure_is_retried_then_succeeds(monkeypatch):
+    monkeypatch.setenv("DISCORD_WEBHOOK_KILL_SWITCH", "https://discord.example/kill-switch")
+    monkeypatch.setattr(discord_module, "_RETRY_BASE_SECONDS", 0.001)
+    attempts = []
+
+    def flaky(request, timeout=None):
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise OSError("network down")
+        return FakeResponse()
+
+    monkeypatch.setattr(discord_module.urllib.request, "urlopen", flaky)
+
+    discord_module.send_discord_message("halted", channel="kill_switch")
+
+    assert len(attempts) == 3  # retried rather than dropped on first failure
+
+
+def test_rate_limit_honours_retry_after(monkeypatch):
+    # notify_on_fill posts one message per partial fill, which blows
+    # straight through Discord's ~5-per-2s webhook limit. A 429 used to be
+    # treated identically to a network error and dropped.
+    monkeypatch.setenv("DISCORD_WEBHOOK_KILL_SWITCH", "https://discord.example/kill-switch")
+    slept = []
+    monkeypatch.setattr(discord_module.time, "sleep", lambda s: slept.append(s))
+    attempts = []
+
+    def rate_limited(request, timeout=None):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise discord_module.urllib.error.HTTPError(
+                "url", 429, "Too Many Requests", {"Retry-After": "0.25"}, None
+            )
+        return FakeResponse()
+
+    monkeypatch.setattr(discord_module.urllib.request, "urlopen", rate_limited)
+
+    discord_module.send_discord_message("burst", channel="kill_switch")
+
+    assert slept == [0.25]  # waited exactly as instructed, then succeeded
+    assert len(attempts) == 2
+
+
+def test_permanent_failure_is_logged_not_raised(monkeypatch):
+    monkeypatch.setenv("DISCORD_WEBHOOK_KILL_SWITCH", "https://discord.example/kill-switch")
+    monkeypatch.setattr(discord_module, "_RETRY_BASE_SECONDS", 0.001)
+    monkeypatch.setattr(
+        discord_module.urllib.request,
+        "urlopen",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("down")),
+    )
+
+    discord_module.send_discord_message("halted", channel="kill_switch")  # must not raise
+
+
+def test_validate_configured_channels_reports_missing_webhooks(monkeypatch):
+    # A missing env var used to be a silent `return` -- a typo'd
+    # DISCORD_WEBHOOK_KILL_SWITCH was indistinguishable from working.
+    monkeypatch.setenv("DISCORD_WEBHOOK_KILL_SWITCH", "https://discord.example/kill-switch")
+    monkeypatch.delenv("DISCORD_WEBHOOK_LIMITS", raising=False)
+
+    missing = discord_module.validate_configured_channels(["kill_switch", "limits"])
+
+    assert missing == ["limits"]
