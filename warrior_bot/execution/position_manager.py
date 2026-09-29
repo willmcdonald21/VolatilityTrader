@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from ib_async import IB, Contract, Order, StopLimitOrder, StopOrder, Trade
 
 from warrior_bot.config import ExitsConfig, NotificationsConfig
+from warrior_bot.logging_setup import alert
 from warrior_bot.notify.discord import build_pnl_message, send_discord_message
 from warrior_bot.persistence.journal import Journal
 from warrior_bot.risk.account_state import AccountState
@@ -86,6 +87,17 @@ class ManagedPosition:
     # and rescheduled on every fill so a burst only replaces the stop once,
     # after fills stop arriving for _STOP_RESIZE_DEBOUNCE_SECONDS.
     resize_task: asyncio.Task | None = None
+    # True from the moment a replacement stop is placed until IBKR
+    # acknowledges it (status leaves PendingSubmit). While set, a second
+    # cancel-and-replace must NOT be issued: ib_async's cancelOrder only
+    # sends the cancel and locally marks it PendingCancel, and IBKR
+    # routinely refuses to cancel an order it has not yet acknowledged --
+    # so replacing again here is how one position ends up with two live
+    # full-size stops, the mechanism behind the 2026-09-16 NRXS naked
+    # short. A request arriving while this is set is parked in
+    # pending_stop_request and applied once the in-flight one settles.
+    stop_replace_pending: bool = False
+    pending_stop_request: tuple[float | None, int | None] | None = None
 
 
 class PositionManager:
@@ -175,7 +187,24 @@ class PositionManager:
         tracked lots for it (stale local state -- e.g. a resync that
         couldn't resolve a filled-while-disconnected stop, see
         resync_after_reconnect). No IBKR side effects, matching clear()."""
+        for pos in self._positions.get(symbol, []):
+            self._cancel_resize_task(pos)
         self._positions.pop(symbol, None)
+
+    def has_unfilled_entry(self, symbol: str) -> bool:
+        """True while any lot for `symbol` still has a working entry order.
+
+        The reconciliation watchdog drops symbols IBKR reports no position
+        in -- correct for genuinely stale local state, catastrophic for a
+        bracket whose limit entry simply hasn't filled yet. track() registers
+        a lot the instant the bracket is submitted with remaining_qty=0, and
+        entry_fill_timeout_seconds is 300s by default (RLGT filled 3h56m late
+        on 2026-09-15), so any entry slower than one 30s watchdog cycle used
+        to be silently untracked. That lot then keeps its stop but loses
+        breakeven, trailing and reversal-exit permanently -- on_bar can no
+        longer see it -- and stops counting toward max_concurrent_positions,
+        the 2-lot cap and the cross-strategy gate."""
+        return any(not pos.parent_done for pos in self._positions.get(symbol, []))
 
     def track(
         self,
@@ -255,7 +284,9 @@ class PositionManager:
 
         trade.fillEvent += on_entry_fill
 
-    def _wire_stop_fill(self, pos: ManagedPosition, trade: Trade, journal_fill: bool = True) -> None:
+    def _wire_stop_fill(
+        self, pos: ManagedPosition, trade: Trade, journal_fill: bool = True, row_id: int | None = None
+    ) -> None:
         """Separated from track() so a replacement stop order (see
         _replace_stop_order) can re-wire the same fill handling onto its
         own fresh Trade object. A replacement stop's Trade never passes
@@ -266,8 +297,24 @@ class PositionManager:
         data/journal.sqlite3 even though a real execution happened. The
         original bracket's stop_trade (see track() above) is the one
         exception -- OrderManager already journals that one, so track()
-        passes journal_fill=False to avoid double-recording it."""
-        trade.fillEvent += lambda t, fill: self._on_stop_fill(pos, t, fill, journal_fill=journal_fill)
+        passes journal_fill=False to avoid double-recording it.
+
+        `row_id` binds this listener to the journal row for THIS order,
+        captured at wire time. Previously every listener read
+        `pos.stop_row_id` at fire time, so a fill landing on a superseded
+        stop (a cancel IBKR refused, or one that filled in the
+        cancel-in-flight window) was journaled against the REPLACEMENT's
+        row. Deliberately not detached on replacement: if the cancel didn't
+        actually land and the old stop really fills, those shares really
+        did sell, and dropping the event would leave remaining_qty
+        overstating the position with nothing to notice it until the
+        reconciliation watchdog's next pass."""
+        bound_row_id = row_id if row_id is not None else pos.stop_row_id
+
+        def on_stop_fill(t: Trade, fill) -> None:
+            self._on_stop_fill(pos, t, fill, journal_fill=journal_fill, row_id=bound_row_id)
+
+        trade.fillEvent += on_stop_fill
 
     def _wire_target_fill(self, pos: ManagedPosition, trade: Trade, role: str = "target") -> None:
         trade.fillEvent += lambda t, fill: self._on_target_fill(pos, fill, role)
@@ -315,7 +362,16 @@ class PositionManager:
 
         for symbol, lots in list(self._positions.items()):
             for pos in list(lots):
-                if not pos.entry_filled:
+                # Gate on parent_done, NOT entry_filled. A lot that filled
+                # 300 of 2,000 shares before the disconnect has
+                # entry_filled=True but parent_done=False -- its parent is
+                # still working, and without a re-wired listener the
+                # remaining 1,700 shares fill with no remaining_qty
+                # increment and no stop resize, leaving the resting stop
+                # sized for 300 while 2,000 are held. parent_done also
+                # never flips, so the lot is never untracked and
+                # cancel_stale_entries skips it forever.
+                if not pos.parent_done:
                     fresh_parent = open_by_id.get(pos.parent_order.orderId)
                     if fresh_parent is not None:
                         self._wire_entry_fill(pos, fresh_parent)
@@ -344,7 +400,21 @@ class PositionManager:
                     fresh_target = open_by_id.get(target_order.orderId)
                     if fresh_target is not None:
                         self._wire_target_fill(pos, fresh_target, role)
-                        claimed.add(target_order.orderId)
+                        # Deliberately NOT claimed. Claiming told
+                        # OrderManager.resync_open_orders to skip re-attaching
+                        # its own listener, but _on_target_fill journals
+                        # nothing and notifies nothing -- so every trim fill
+                        # after a reconnect vanished from the journal and
+                        # from Discord. OrderManager owns journaling target
+                        # fills; this class only tracks quantity off them.
+                    else:
+                        logger.warning(
+                            "Resync: target order for %s (orderId=%d, role=%s) not found after reconnect -- "
+                            "it may have filled while disconnected; remaining_qty may overstate the position",
+                            symbol,
+                            target_order.orderId,
+                            role,
+                        )
 
         if claimed:
             logger.info("Resync: re-wired fill tracking for %d order(s) after reconnect", len(claimed))
@@ -371,14 +441,26 @@ class PositionManager:
                 # _reversal_exit building a zero-quantity market order.
                 continue
 
-            if self.config.reversal_exit.enabled and self._check_reversal_exit(pos, ctx):
-                continue  # this lot is now flat -- evaluate any remaining lot for this symbol
+            # Per-lot isolation: a failure managing one lot (a disconnect
+            # mid-replacement, an IBKR rejection) must not abort the whole
+            # bar. Unhandled, it propagated out of on_bar and skipped every
+            # remaining lot AND every strategy evaluation for that bar,
+            # since _on_new_bar calls this before the strategy loop.
+            try:
+                if self.config.reversal_exit.enabled and self._check_reversal_exit(pos, ctx):
+                    continue  # this lot is now flat -- evaluate any remaining lot for this symbol
 
-            if not pos.breakeven_done and self.config.breakeven.enabled:
-                self._check_breakeven(pos, last_price)
+                if not pos.breakeven_done and self.config.breakeven.enabled:
+                    self._check_breakeven(pos, last_price)
 
-            if pos.breakeven_done and self.config.trailing.enabled:
-                self._check_trailing(pos, ctx, last_price)
+                if pos.breakeven_done and self.config.trailing.enabled:
+                    self._check_trailing(pos, ctx, last_price)
+            except Exception:
+                logger.exception("Position management failed for %s -- continuing with other lots", pos.symbol)
+                alert(
+                    f"Position management FAILED for {pos.symbol} -- stop may not have moved, check IBKR",
+                    channel="kill_switch",
+                )
 
     def cancel_stale_entries(self, timeout_seconds: float) -> None:
         """Cancels entry orders still working `timeout_seconds` after they
@@ -422,9 +504,26 @@ class PositionManager:
         """Drops all tracked positions with no IBKR side effects — used
         after a kill-switch/auto-flatten pass that already cancelled and
         flattened everything directly."""
+        for lots in self._positions.values():
+            for pos in lots:
+                self._cancel_resize_task(pos)
         self._positions.clear()
 
+    def _cancel_resize_task(self, pos: ManagedPosition) -> None:
+        """Kills any armed stop-resize before a lot stops being tracked.
+
+        Without this a resize armed moments before a flatten fires ~1.5s
+        LATER and places a brand-new full-size protective stop on a
+        position that no longer exists -- after panic_stop's global cancel
+        has already swept -- where it rests for the day and can fill into
+        an unintended short. _reversal_exit and _close_out always cancelled
+        it; clear() and drop_symbol(), i.e. both flatten paths, did not."""
+        if pos.resize_task is not None:
+            pos.resize_task.cancel()
+            pos.resize_task = None
+
     def _untrack(self, pos: ManagedPosition) -> None:
+        self._cancel_resize_task(pos)
         lots = self._positions.get(pos.symbol)
         if lots is None:
             return
@@ -480,6 +579,20 @@ class PositionManager:
             return
 
         just_activated = not pos.trailing_active
+
+        # Move the stop FIRST, and only cancel the static target / latch
+        # trailing_active once that succeeded. The old order did the
+        # opposite: it cancelled the target and set trailing_active before
+        # calling _replace_stop_order, so if that raised (a disconnect makes
+        # getReqId() raise ConnectionError, and placeOrder can fail outright)
+        # the position was left with neither a target nor a moved stop, and
+        # just_activated could never become True again to retry.
+        try:
+            self._replace_stop_order(pos, new_stop)
+        except Exception:
+            logger.exception("Trailing stop replacement failed for %s -- leaving target in place", pos.symbol)
+            return
+
         pos.trailing_active = True
         # Only the single-full-quantity fallback ("target", no configured
         # profit tiers) gets cancelled on trailing activation. Configured
@@ -492,7 +605,6 @@ class PositionManager:
             pos.target_orders = []
             logger.info("Trailing activated for %s: cancelled static target", pos.symbol)
 
-        self._replace_stop_order(pos, new_stop)
         logger.info("Trailing: moved stop for %s to %.4f", pos.symbol, new_stop)
 
     def _check_reversal_exit(self, pos: ManagedPosition, ctx: SymbolContext) -> bool:
@@ -545,9 +657,7 @@ class PositionManager:
         return True
 
     def _reversal_exit(self, pos: ManagedPosition, reasons: list[str]) -> None:
-        if pos.resize_task is not None:
-            pos.resize_task.cancel()
-            pos.resize_task = None
+        self._cancel_resize_task(pos)
         self.ib.cancelOrder(pos.stop_order)
         for target_order in pos.target_orders:
             self.ib.cancelOrder(target_order)
@@ -593,7 +703,20 @@ class PositionManager:
             except asyncio.CancelledError:
                 return
             pos.resize_task = None
-            self._replace_stop_order(pos, new_qty=pos.remaining_qty)
+            # Anything other than CancelledError used to escape into an
+            # un-awaited task and surface only as an unretrieved-exception
+            # message at GC time -- i.e. the stop silently never got
+            # resized. A failed resize is a protection failure, not a
+            # logging event.
+            try:
+                self._replace_stop_order(pos, new_qty=pos.remaining_qty)
+            except Exception:
+                logger.exception("Debounced stop resize failed for %s", pos.symbol)
+                alert(
+                    f"Stop resize FAILED for {pos.symbol} ({pos.remaining_qty} shares) -- "
+                    "position may be under-protected, check IBKR",
+                    channel="kill_switch",
+                )
 
         pos.resize_task = asyncio.ensure_future(_debounced())
 
@@ -617,7 +740,26 @@ class PositionManager:
         now -- just cancel the old order and leave the position without a
         resting stop rather than submitting an invalid zero-quantity
         order; the next real fill (see on_entry_fill) calls back in here
-        to establish a fresh one."""
+        to establish a fresh one.
+
+        Serialized via pos.stop_replace_pending: a replacement requested
+        while a previous one is still unacknowledged is parked and applied
+        when that one settles, rather than issuing a second
+        cancel-and-replace. See ManagedPosition.stop_replace_pending for
+        why doing otherwise can leave two live stops on one position."""
+        if pos.stop_replace_pending:
+            # Merge with anything already parked -- last writer wins per
+            # field, so a price move and a size change both survive.
+            parked_price, parked_qty = pos.pending_stop_request or (None, None)
+            pos.pending_stop_request = (
+                new_price if new_price is not None else parked_price,
+                new_qty if new_qty is not None else parked_qty,
+            )
+            logger.info(
+                "Stop replacement for %s deferred -- previous replacement not acknowledged yet", pos.symbol
+            )
+            return
+
         old_order = pos.stop_order
         price = round_to_tick(new_price) if new_price is not None else pos.current_stop_price
         qty = pos.remaining_qty if new_qty is None else new_qty
@@ -690,11 +832,65 @@ class PositionManager:
         pos.stop_order = new_order
         pos.stop_row_id = new_row_id
         pos.current_stop_price = price
-        self._wire_stop_fill(pos, new_trade)
+        self._wire_stop_fill(pos, new_trade, row_id=new_row_id)
+        self._wire_stop_status(pos, new_trade, new_row_id)
+
+    # IBKR has not acknowledged an order in these states, so a cancel for it
+    # may well be refused -- see ManagedPosition.stop_replace_pending.
+    _UNACKNOWLEDGED_STATES = frozenset({"PendingSubmit", "ApiPending"})
+
+    def _wire_stop_status(self, pos: ManagedPosition, trade: Trade, row_id: int) -> None:
+        """Tracks a replacement stop's status. PositionManager previously
+        wired no statusEvent at all (only OrderManager._attach_tracking
+        does, and it never sees a replacement stop), which left every
+        replacement's journal row frozen at PendingSubmit forever -- 227 of
+        them across the journal -- and left this class with no way to know
+        whether a cancel-and-replace had actually been acknowledged."""
+        pos.stop_replace_pending = trade.orderStatus.status in self._UNACKNOWLEDGED_STATES
+
+        def on_status(t: Trade) -> None:
+            status = t.orderStatus.status
+            self.journal.update_order_status(row_id, status)
+            if status in self._UNACKNOWLEDGED_STATES or pos.stop_order is not t.order:
+                return
+            pos.stop_replace_pending = False
+            parked = pos.pending_stop_request
+            if parked is not None:
+                pos.pending_stop_request = None
+                price, qty = parked
+                logger.info("Applying deferred stop replacement for %s", pos.symbol)
+                self._replace_stop_order(pos, new_price=price, new_qty=qty)
+
+        trade.statusEvent += on_status
+
+    def _apply_exit_fill(self, pos: ManagedPosition, filled_qty: float) -> None:
+        """Decrements remaining_qty, and treats an oversell as the incident
+        it is rather than clamping it away.
+
+        Profit tiers are deliberately not OCA-linked to the stop
+        (bracket_builder), so both legs stay independently live and can fill
+        nearly simultaneously. `max(0, ...)` used to silently erase the
+        evidence, leaving a real short at IBKR that only the reconciliation
+        watchdog would notice, up to 30s later."""
+        remaining = pos.remaining_qty - int(round(filled_qty))
+        if remaining < 0:
+            logger.error(
+                "OVERSELL on %s: exits exceeded the position by %d shares -- flattening immediately",
+                pos.symbol,
+                -remaining,
+            )
+            alert(
+                f"OVERSELL on {pos.symbol}: sold {-remaining} shares more than held "
+                "(tier and stop likely filled together) -- flattening now",
+                channel="kill_switch",
+            )
+            flatten_position(
+                self.ib, SimpleNamespace(contract=pos.contract, position=remaining), channel="kill_switch"
+            )
+        pos.remaining_qty = max(0, remaining)
 
     def _on_target_fill(self, pos: ManagedPosition, fill, role: str = "target") -> None:
-        filled_qty = fill.execution.shares
-        pos.remaining_qty = max(0, pos.remaining_qty - filled_qty)
+        self._apply_exit_fill(pos, fill.execution.shares)
         if role == "scale_out":
             pos.tier_fill_count += 1
         if pos.remaining_qty <= 0:
@@ -703,10 +899,22 @@ class PositionManager:
         # Resize the stop down after ANY partial target fill (not just a
         # scale_out tier) -- shares that already left via a target fill
         # must not stay covered by a stop still sized for the full lot.
-        self._schedule_stop_resize(pos)
-        logger.info("Target fill for %s: stop resize scheduled for %d shares", pos.symbol, pos.remaining_qty)
+        #
+        # Synchronous, NOT debounced. The debounce exists to coalesce entry
+        # fill bursts, where the error direction is harmless (a stop briefly
+        # sized for fewer shares than held). Downsizing is the dangerous
+        # direction: for the whole debounce window the resting stop still
+        # covers shares that have already been sold, so a flush through it
+        # sells them twice and opens a real short.
+        self._replace_stop_order(pos, new_qty=pos.remaining_qty)
+        logger.info("Target fill for %s: stop resized to %d shares", pos.symbol, pos.remaining_qty)
 
-    def _on_stop_fill(self, pos: ManagedPosition, trade: Trade, fill, journal_fill: bool = True) -> None:
+    def _on_stop_fill(
+        self, pos: ManagedPosition, trade: Trade, fill, journal_fill: bool = True, row_id: int | None = None
+    ) -> None:
+        # Bound at wire time -- see _wire_stop_fill. Falls back to the
+        # current row only for callers that predate the binding.
+        target_row_id = row_id if row_id is not None else pos.stop_row_id
         if journal_fill:
             commission = None
             realized_pnl = None
@@ -717,7 +925,7 @@ class PositionManager:
                 if pnl is not None and abs(pnl) < 1e15:
                     realized_pnl = pnl
             self.journal.record_fill(
-                order_row_id=pos.stop_row_id,
+                order_row_id=target_row_id,
                 ib_order_id=trade.order.orderId,
                 fill_qty=fill.execution.shares,
                 fill_price=fill.execution.price,
@@ -736,8 +944,7 @@ class PositionManager:
             # journaled but never notified.
             self._notify_stop_fill(pos, fill, commission)
 
-        filled_qty = fill.execution.shares
-        pos.remaining_qty = max(0, pos.remaining_qty - filled_qty)
+        self._apply_exit_fill(pos, fill.execution.shares)
         if pos.remaining_qty <= 0:
             self._close_out(pos, cancel_stop=False, cancel_target=True)
 
@@ -787,9 +994,6 @@ class PositionManager:
             for target_order in pos.target_orders:
                 self.ib.cancelOrder(target_order)
         if pos.parent_done:
-            if pos.resize_task is not None:
-                pos.resize_task.cancel()
-                pos.resize_task = None
             self._untrack(pos)
         else:
             logger.info(

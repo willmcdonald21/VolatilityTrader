@@ -724,13 +724,17 @@ def _fake_lot(bot, symbol, strategy="gap_and_go", remaining_qty=100.0):
         ts=datetime.now(timezone.utc),
     )
     signal_id = bot.journal.record_signal(signal)
-    return SimpleNamespace(signal_id=signal_id, remaining_qty=remaining_qty)
+    # resize_task mirrors the real ManagedPosition field -- drop_symbol()/
+    # clear() now cancel any armed stop-resize before untracking a lot (so a
+    # resize can't fire after a flatten and resurrect a stop), and they read
+    # it off every lot they drop.
+    return SimpleNamespace(signal_id=signal_id, remaining_qty=remaining_qty, resize_task=None)
 
 
 def test_reconciliation_drops_stale_local_tracking_when_broker_flat(tmp_path, monkeypatch):
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
-    bot.position_manager._positions["GHOST"] = [object()]
+    bot.position_manager._positions["GHOST"] = [SimpleNamespace(resize_task=None, parent_done=True)]
     bot.ib.positions = lambda: []
     bot.ib.openTrades = lambda: []
 

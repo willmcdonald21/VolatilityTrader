@@ -42,14 +42,21 @@ def flush_resize(pos) -> None:
 
 class FakeEvent:
     """Minimal stand-in for eventkit.Event -- `+=` appends a listener,
-    `.emit(*args)` invokes every listener, matching how ib_async's
-    Trade.fillEvent is used elsewhere in this codebase."""
+    `-=` removes one, `.emit(*args)` invokes every listener, matching how
+    ib_async's Trade.fillEvent/statusEvent are used elsewhere in this
+    codebase. `-=` matters: _replace_stop_order detaches the outgoing
+    stop's fill listener before cancelling it, and without it here that
+    path would be silently untested."""
 
     def __init__(self):
         self._listeners = []
 
     def __iadd__(self, listener):
         self._listeners.append(listener)
+        return self
+
+    def __isub__(self, listener):
+        self._listeners.remove(listener)
         return self
 
     def emit(self, *args) -> None:
@@ -1157,7 +1164,11 @@ def test_resync_rewires_target_fill_onto_fresh_trade():
     ib.open_trades = [fresh_stop_trade, fresh_target_trade]
 
     claimed = pm.resync_after_reconnect(ib)
-    assert target_trade.order.orderId in claimed
+    # Deliberately NOT claimed (changed 2026-09-28): claiming told
+    # OrderManager.resync_open_orders to skip re-attaching its own listener,
+    # but _on_target_fill journals and notifies nothing -- so every trim fill
+    # after a reconnect silently vanished from the journal and from Discord.
+    assert target_trade.order.orderId not in claimed
 
     fresh_target_trade.fillEvent.emit(fresh_target_trade, make_fill(40))
 
@@ -1498,3 +1509,225 @@ def test_replaced_stop_fill_pnl_message_respects_notify_on_pnl_toggle(monkeypatc
     _replaced_stop_fill(ib, pm, signal)
 
     assert sent == []
+
+
+# -- 2026-09-28 execution-layer audit: safety fixes --
+
+
+def capture_alerts(monkeypatch):
+    """Records alert() calls raised from PositionManager."""
+    alerts = []
+    monkeypatch.setattr(
+        position_manager_module, "alert", lambda message, channel=None: alerts.append((message, channel))
+    )
+    return alerts
+
+
+class PendingFakeIB(FakeIB):
+    """placeOrder returns a Trade still in PendingSubmit, matching what
+    IBKR actually reports for an order it has not yet acknowledged."""
+
+    def placeOrder(self, contract, order):
+        trade = super().placeOrder(contract, order)
+        trade.orderStatus.status = "PendingSubmit"
+        return trade
+
+
+def test_stop_replacement_deferred_while_previous_is_unacknowledged():
+    # IBKR routinely refuses to cancel an order it hasn't acknowledged, so
+    # issuing a second cancel-and-replace against an unacknowledged stop is
+    # how one position ends up with two live full-size stops -- the
+    # 2026-09-16 NRXS naked-short mechanism.
+    ib = PendingFakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal)
+    pos = pm._positions["TEST"][0]
+    assert pos.stop_replace_pending is True  # the entry-fill resize is still unacknowledged
+    placed_before = len(ib.placed)
+
+    pm._replace_stop_order(pos, new_price=10.0)
+
+    assert len(ib.placed) == placed_before  # no second replacement went out
+    assert pos.pending_stop_request == (10.0, None)
+
+
+def test_deferred_stop_replacement_is_applied_once_ibkr_acknowledges():
+    ib = PendingFakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal)
+    pos = pm._positions["TEST"][0]
+    pm._replace_stop_order(pos, new_price=10.0)
+    in_flight = find_trade(ib, pos.stop_order)
+    placed_before = len(ib.placed)
+
+    in_flight.orderStatus.status = "Submitted"
+    in_flight.statusEvent.emit(in_flight)
+
+    assert len(ib.placed) == placed_before + 1  # the parked request went out
+    assert pos.current_stop_price == 10.0
+    assert pos.pending_stop_request is None
+
+
+def test_replacement_stop_status_is_journaled_instead_of_freezing_at_pending():
+    # 227 stop rows journal-wide were stuck at PendingSubmit because
+    # PositionManager wired no statusEvent at all.
+    ib = FakeIB()
+    journal = FakeJournal()
+    pm = PositionManager(ib, journal, make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal)
+    pos = pm._positions["TEST"][0]
+    trade = find_trade(ib, pos.stop_order)
+
+    trade.orderStatus.status = "Filled"
+    trade.statusEvent.emit(trade)
+
+    assert (pos.stop_row_id, "Filled") in journal.order_statuses
+
+
+def test_clear_cancels_a_pending_resize_so_a_flatten_stays_flat():
+    # A resize armed just before a panic flatten used to fire ~1.5s later
+    # and place a brand-new full-size stop on a position that no longer
+    # exists -- after the global cancel had already swept.
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal)
+    pos = pm._positions["TEST"][0]
+    pm._schedule_stop_resize(pos)
+    assert pos.resize_task is not None
+
+    pm.clear()
+
+    assert pos.resize_task is None
+
+
+def test_drop_symbol_cancels_a_pending_resize():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal)
+    pos = pm._positions["TEST"][0]
+    pm._schedule_stop_resize(pos)
+
+    pm.drop_symbol("TEST")
+
+    assert pos.resize_task is None
+
+
+def test_oversell_alerts_and_flattens_instead_of_clamping(monkeypatch):
+    # Tiers are not OCA-linked to the stop, so both legs stay live and can
+    # fill nearly simultaneously. max(0, ...) used to erase the evidence.
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    flatten_calls = capture_flatten_calls(monkeypatch)
+    alerts = capture_alerts(monkeypatch)
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, quantity=100)
+    pos = pm._positions["TEST"][0]
+
+    pm._apply_exit_fill(pos, 150)  # sold 150 against a 100-share position
+
+    assert pos.remaining_qty == 0
+    assert len(flatten_calls) == 1
+    assert flatten_calls[0].position.position == -50  # cover the 50-share short
+    assert any("OVERSELL" in message for message, _ in alerts)
+
+
+def test_target_fill_resizes_the_stop_synchronously_not_debounced():
+    # Downsizing must not be debounced: for the whole window the resting
+    # stop still covers shares that have already been sold.
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    _, target_trade = track_position(pm, signal, quantity=100, target_role="scale_out", target_qty=40)
+    pos = pm._positions["TEST"][0]
+
+    target_trade.fillEvent.emit(target_trade, make_fill(40))
+
+    assert pos.remaining_qty == 60
+    assert pos.stop_order.totalQuantity == 60  # already resized, no flush_resize needed
+    assert pos.resize_task is None
+
+
+def test_trailing_keeps_the_target_when_the_stop_replacement_fails(monkeypatch):
+    # Cancelling the target first left the position with neither a target
+    # nor a moved stop, and just_activated could never recur to retry.
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_method="ema"))
+    signal = make_signal(entry=10.0, stop=9.0)
+    _, target_trade = track_position(pm, signal)
+    pos = pm._positions["TEST"][0]
+
+    def boom(*args, **kwargs):
+        raise ConnectionError("Not connected")
+
+    monkeypatch.setattr(pm, "_replace_stop_order", boom)
+
+    # Called directly rather than via on_bar: breakeven runs first there and
+    # would hit the same stub, so this isolates the trailing path.
+    pm._check_trailing(pos, FakeCtx("TEST", last_price=11.0, ema_9=10.5), 11.0)
+
+    assert target_trade.order not in ib.cancelled  # target preserved
+    assert pos.trailing_active is False  # not latched, so a later bar can retry
+
+
+def test_on_bar_isolates_a_failing_lot_from_the_rest(monkeypatch):
+    # An unhandled failure managing one lot used to propagate out of
+    # on_bar, skipping every remaining lot and (since _on_new_bar calls
+    # this before the strategy loop) every strategy evaluation that bar.
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    alerts = capture_alerts(monkeypatch)
+    track_position(pm, make_signal(entry=10.0, stop=9.0))
+    pos = pm._positions["TEST"][0]
+
+    def boom(*args, **kwargs):
+        raise ConnectionError("Not connected")
+
+    monkeypatch.setattr(pm, "_check_breakeven", boom)
+
+    pm.on_bar(FakeCtx("TEST", last_price=11.0))  # must not raise
+
+    assert any("Position management FAILED" in message for message, _ in alerts)
+    assert pos in pm._positions["TEST"]  # still tracked, not lost
+
+
+def test_late_fill_on_a_superseded_stop_journals_against_its_own_row():
+    # Every listener used to read pos.stop_row_id at FIRE time, so a fill
+    # landing on a stop that had since been replaced was journaled against
+    # the replacement's row. The shares really did sell, so the event must
+    # still be honoured -- just attributed correctly.
+    ib = FakeIB()
+    journal = FakeJournal()
+    pm = PositionManager(ib, journal, make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, quantity=100)
+    pos = pm._positions["TEST"][0]
+    first_replacement_row = pos.stop_row_id
+    first_replacement_trade = find_trade(ib, pos.stop_order)
+
+    pm._replace_stop_order(pos, new_price=9.5)  # supersede it
+    assert pos.stop_row_id != first_replacement_row
+
+    first_replacement_trade.fillEvent.emit(first_replacement_trade, make_fill(100))
+
+    rows = [f["order_row_id"] for f in journal.fills_recorded]
+    assert first_replacement_row in rows
+    assert pos.stop_row_id not in rows  # not mis-attributed to the live stop
+
+
+def test_has_unfilled_entry_tracks_the_working_parent():
+    ib = FakeIB()
+    pm = PositionManager(ib, FakeJournal(), make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, entry_filled=False)
+
+    assert pm.has_unfilled_entry("TEST") is True
+    assert pm.has_unfilled_entry("OTHER") is False
+
+    pos = pm._positions["TEST"][0]
+    pos.parent_done = True
+    assert pm.has_unfilled_entry("TEST") is False
