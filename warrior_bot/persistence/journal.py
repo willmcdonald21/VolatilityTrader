@@ -145,6 +145,37 @@ class Journal:
         )
         self.conn.commit()
 
+    def record_heartbeat(
+        self,
+        connected: bool,
+        symbols_subscribed: int,
+        bars_received_last_min: int,
+        signals_today: int,
+        open_positions: int,
+        breadth: int | None = None,
+        scanner_refusals: int = 0,
+        seconds_since_scan: float | None = None,
+    ) -> None:
+        """One row per minute of liveness -- see bot_heartbeat in db.py."""
+        self.conn.execute(
+            """INSERT INTO bot_heartbeat
+               (ts, connected, symbols_subscribed, bars_received_last_min, signals_today,
+                open_positions, breadth, scanner_refusals, seconds_since_scan)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                _now(),
+                1 if connected else 0,
+                symbols_subscribed,
+                bars_received_last_min,
+                signals_today,
+                open_positions,
+                breadth,
+                scanner_refusals,
+                seconds_since_scan,
+            ),
+        )
+        self.conn.commit()
+
     def find_order_by_ib_order_id(self, ib_order_id: int) -> dict | None:
         """Looks up the journal row (+ role, entry price) for a previously
         recorded order, keyed by IBKR's own order id -- used to re-attach

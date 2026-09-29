@@ -73,6 +73,26 @@ CREATE TABLE IF NOT EXISTS account_snapshots (
     open_positions_count INTEGER
 );
 
+-- One row per minute while the bot is up, so "was it actually working at
+-- 10:15?" becomes a query instead of log archaeology. The watchdogs cover
+-- CONNECTION health; nothing covered PRODUCTIVITY, and a bot that is
+-- connected, subscribed and silently producing nothing looks exactly like
+-- a quiet market. On 2026-09-28 it was disconnected for 5h20m and then ran
+-- ~6 hours on a dead scanner, and the only reason anyone noticed was a
+-- direct question.
+CREATE TABLE IF NOT EXISTS bot_heartbeat (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    connected INTEGER NOT NULL,
+    symbols_subscribed INTEGER NOT NULL,
+    bars_received_last_min INTEGER NOT NULL,
+    signals_today INTEGER NOT NULL,
+    open_positions INTEGER NOT NULL,
+    breadth INTEGER,
+    scanner_refusals INTEGER NOT NULL DEFAULT 0,
+    seconds_since_scan REAL
+);
+
 CREATE TABLE IF NOT EXISTS kill_switch_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT NOT NULL,

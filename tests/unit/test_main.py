@@ -1445,3 +1445,105 @@ def test_long_disconnect_alerts_during_an_active_session(tmp_path, monkeypatch):
     alerts.clear()
     asyncio.run(bot._await_connection("scan_loop"))
     assert alerts == []
+
+
+# -- 2026-09-28 audit: "alive but idle" detection --
+
+
+def _heartbeat_rows(bot):
+    cols = ["ts", "connected", "symbols_subscribed", "bars_received_last_min", "signals_today",
+            "open_positions", "breadth", "scanner_refusals", "seconds_since_scan"]
+    rows = bot.journal.conn.execute(
+        "SELECT ts, connected, symbols_subscribed, bars_received_last_min, signals_today, "
+        "open_positions, breadth, scanner_refusals, seconds_since_scan FROM bot_heartbeat ORDER BY id"
+    ).fetchall()
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def test_heartbeat_records_liveness(tmp_path, monkeypatch):
+    # "Was the bot actually working at 10:15?" was previously answerable
+    # only by log archaeology, and only while the tail still reached back.
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    monkeypatch.setattr("warrior_bot.main.is_active_session", lambda: True)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.isConnected = lambda: True
+    _seed_symbol(bot, "AAA")
+    bot._signals_today = 3
+
+    bot._record_heartbeat()
+
+    rows = _heartbeat_rows(bot)
+    assert len(rows) == 1
+    assert rows[0]["connected"] == 1
+    assert rows[0]["symbols_subscribed"] == 1
+    assert rows[0]["bars_received_last_min"] == 1
+    assert rows[0]["signals_today"] == 3
+
+
+def test_idle_alert_fires_when_connected_but_receiving_no_bars(tmp_path, monkeypatch):
+    # The exact 2026-09-28 shape: connected, subscribed, and silently
+    # producing nothing because the scanner was dead.
+    alerts = []
+    monkeypatch.setattr("warrior_bot.main.alert", lambda message, channel=None: alerts.append(message))
+    monkeypatch.setattr("warrior_bot.main.is_active_session", lambda: True)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.isConnected = lambda: True
+    _seed_symbol(bot, "AAA")
+    bot._last_bar_at["AAA"] = datetime.now(timezone.utc) - timedelta(hours=2)  # stale
+    bot._last_productive_at = datetime.now(timezone.utc) - timedelta(seconds=1200)
+
+    bot._record_heartbeat()
+
+    assert any("up but blind" in message for message in alerts)
+    # One-shot until productivity resumes.
+    alerts.clear()
+    bot._record_heartbeat()
+    assert alerts == []
+
+
+def test_idle_alert_clears_once_bars_resume(tmp_path, monkeypatch):
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    monkeypatch.setattr("warrior_bot.main.is_active_session", lambda: True)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.isConnected = lambda: True
+    _seed_symbol(bot, "AAA")
+    bot._last_bar_at["AAA"] = datetime.now(timezone.utc) - timedelta(hours=2)
+    bot._last_productive_at = datetime.now(timezone.utc) - timedelta(seconds=1200)
+    bot._record_heartbeat()
+    assert bot._idle_alert_sent is True
+
+    bot._last_bar_at["AAA"] = datetime.now(timezone.utc)  # data is flowing again
+    bot._record_heartbeat()
+
+    assert bot._idle_alert_sent is False
+
+
+def test_no_idle_alert_outside_an_active_session(tmp_path, monkeypatch):
+    alerts = []
+    monkeypatch.setattr("warrior_bot.main.alert", lambda message, channel=None: alerts.append(message))
+    monkeypatch.setattr("warrior_bot.main.is_active_session", lambda: False)  # overnight
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.isConnected = lambda: True
+    _seed_symbol(bot, "AAA")
+    bot._last_bar_at["AAA"] = datetime.now(timezone.utc) - timedelta(hours=8)
+    bot._last_productive_at = datetime.now(timezone.utc) - timedelta(hours=8)
+
+    bot._record_heartbeat()
+
+    assert alerts == []
+
+
+def test_no_idle_alert_while_disconnected(tmp_path, monkeypatch):
+    # A disconnect has its own alert path; this one must not double up.
+    alerts = []
+    monkeypatch.setattr("warrior_bot.main.alert", lambda message, channel=None: alerts.append(message))
+    monkeypatch.setattr("warrior_bot.main.is_active_session", lambda: True)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.isConnected = lambda: False
+    _seed_symbol(bot, "AAA")
+    bot._last_productive_at = datetime.now(timezone.utc) - timedelta(hours=1)
+
+    bot._record_heartbeat()
+
+    assert alerts == []
+    assert _heartbeat_rows(bot)[0]["connected"] == 0  # still recorded

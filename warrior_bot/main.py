@@ -82,6 +82,11 @@ class WarriorBot:
         self._disconnected_since: datetime | None = None
         self._disconnect_alert_sent = False
         self._disconnect_logged_at: datetime | None = None
+        # Productivity tracking for the heartbeat loop: last time any
+        # bar arrived, and signals produced today.
+        self._last_productive_at: datetime | None = None
+        self._idle_alert_sent = False
+        self._signals_today = 0
         self.ib.connectedEvent += self._on_connected
 
         conn = get_connection(config.resolve_path(config.journal.db_path))
@@ -140,6 +145,7 @@ class WarriorBot:
         self._risk_task: asyncio.Task | None = None
         self._watchdog_task: asyncio.Task | None = None
         self._reconciliation_task: asyncio.Task | None = None
+        self._heartbeat_task: asyncio.Task | None = None
         # Tracked separately, not as one shared flag: a daily-loss-limit
         # flatten firing earlier in the day must never suppress the 15:55
         # EOD sweep later that same day. A single _flattened_today flag did
@@ -179,6 +185,7 @@ class WarriorBot:
         self._risk_task = asyncio.ensure_future(self._risk_loop())
         self._watchdog_task = asyncio.ensure_future(self._data_watchdog_loop())
         self._reconciliation_task = asyncio.ensure_future(self._position_reconciliation_loop())
+        self._heartbeat_task = asyncio.ensure_future(self._heartbeat_loop())
         self.logger.info(
             "WarriorBot started: mode=%s strategies=%s",
             self.config.trading.mode,
@@ -194,6 +201,8 @@ class WarriorBot:
             self._watchdog_task.cancel()
         if self._reconciliation_task:
             self._reconciliation_task.cancel()
+        if self._heartbeat_task:
+            self._heartbeat_task.cancel()
         # Drain queued notifications before the daemon worker dies with
         # the interpreter -- a shutdown alert is exactly the one you
         # cannot afford to lose.
@@ -280,6 +289,78 @@ class WarriorBot:
     # escalated from a log line to an alert. Below it, brief blips stay
     # quiet.
     DISCONNECT_ALERT_SECONDS = 120.0
+
+    # No bars at all for this long during an active session means the bot
+    # is up but blind -- a dead scanner, a wedged feed, or an empty
+    # watchlist. Generous enough that a genuinely thin pre-market tape on a
+    # handful of symbols doesn't cry wolf.
+    IDLE_ALERT_SECONDS = 600.0
+    HEARTBEAT_INTERVAL_SECONDS = 60.0
+
+    async def _heartbeat_loop(self) -> None:
+        """Records liveness once a minute and alerts when the bot is up but
+        doing nothing.
+
+        Every existing watchdog covers CONNECTION health. None covered
+        PRODUCTIVITY -- a bot that is connected, subscribed and silently
+        producing nothing is indistinguishable from a quiet market. On
+        2026-09-28 it sat disconnected for 5h20m, came back onto a dead
+        scanner for another six hours, and the only thing that surfaced it
+        was someone asking."""
+        while True:
+            await asyncio.sleep(self.HEARTBEAT_INTERVAL_SECONDS)
+            try:
+                self._record_heartbeat()
+            except Exception:
+                self.logger.exception("Heartbeat iteration failed")
+
+    def _record_heartbeat(self) -> None:
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(seconds=self.HEARTBEAT_INTERVAL_SECONDS)
+        bars_recently = sum(1 for seen_at in self._last_bar_at.values() if seen_at >= cutoff)
+        connected = self.ib.isConnected()
+        seconds_since_scan = (
+            (now - self._last_successful_scan_at).total_seconds() if self._last_successful_scan_at else None
+        )
+
+        self.journal.record_heartbeat(
+            connected=connected,
+            symbols_subscribed=len(self._subscriptions),
+            bars_received_last_min=bars_recently,
+            signals_today=self._signals_today,
+            open_positions=len(self.position_manager.tracked_symbols()),
+            breadth=self._last_logged_breadth,
+            scanner_refusals=self._consecutive_scanner_refusals,
+            seconds_since_scan=seconds_since_scan,
+        )
+
+        if not connected or not is_active_session():
+            self._last_productive_at = self._last_productive_at or now
+            return
+
+        if bars_recently > 0:
+            self._last_productive_at = now
+            self._idle_alert_sent = False
+            return
+
+        if self._last_productive_at is None:
+            self._last_productive_at = now
+            return
+
+        idle_for = (now - self._last_productive_at).total_seconds()
+        if idle_for >= self.IDLE_ALERT_SECONDS and not self._idle_alert_sent:
+            self._idle_alert_sent = True
+            self.logger.error(
+                "No bars received from any of %d subscribed symbol(s) in %.0f minutes during an active session",
+                len(self._subscriptions),
+                idle_for / 60,
+            )
+            alert(
+                f"Bot is CONNECTED but has received no market data for {idle_for / 60:.0f} minutes "
+                f"({len(self._subscriptions)} symbols subscribed, "
+                f"{self._consecutive_scanner_refusals} scanner refusals) -- it is up but blind",
+                channel="kill_switch",
+            )
 
     def _validate_float_filter(self) -> None:
         """Says so out loud when the float filter is enabled but has no
@@ -1109,6 +1190,7 @@ class WarriorBot:
                 self.logger.exception("Strategy %s failed evaluating %s", strategy.name, ctx.symbol)
                 continue
             if signal is not None:
+                self._signals_today += 1
                 self._handle_signal(contract, signal, strategy, now)
 
     def _handle_signal(
@@ -1188,6 +1270,9 @@ class WarriorBot:
         self._eod_flatten_fired = False
         self._loss_limit_flatten_fired = False
         self._last_logged_breadth = None
+        self._signals_today = 0
+        self._idle_alert_sent = False
+        self._last_productive_at = None
         self.logger.info("Daily state reset. Start-of-day equity=%s", snapshot.net_liquidation)
 
 
