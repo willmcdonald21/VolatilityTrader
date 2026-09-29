@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import logging
+import time as time_module
 from datetime import datetime, time, timezone
 from typing import Callable
 
@@ -25,12 +26,41 @@ OnOrderPlaced = Callable[[str, Trade, Order], None]
 logger = logging.getLogger("warrior_bot.utils.panic")
 
 
+# How long panic_stop waits for reqGlobalCancel to actually take effect
+# before flattening anyway. reqGlobalCancel is asynchronous at IBKR -- it
+# returns immediately and the cancels land over the following moments -- so
+# firing flatten sells straight after it can put a sell on the tape while a
+# protective stop is still live, double-exiting the position.
+_GLOBAL_CANCEL_TIMEOUT_SECONDS = 3.0
+_GLOBAL_CANCEL_POLL_SECONDS = 0.1
+
+
 def cancel_all_orders(ib: IB, channel: str = "kill_switch") -> None:
     """Cancel every active order on the account, including ones this
     process didn't place itself (reqGlobalCancel is account-wide, not
     per-client)."""
     ib.reqGlobalCancel()
     alert("reqGlobalCancel issued — all active orders cancelled", channel=channel)
+
+
+def _await_global_cancel(ib: IB, timeout: float | None = None) -> bool:
+    """Blocks until IBKR reports no open trades, or `timeout` elapses.
+
+    Returns True if everything cleared. Uses ib.sleep (ib_async's
+    event-loop-aware sleep) so order status callbacks keep arriving while
+    we wait -- time.sleep here would block the very loop that delivers
+    them. The timeout is resolved from the module global at call time so
+    it stays patchable."""
+    timeout = _GLOBAL_CANCEL_TIMEOUT_SECONDS if timeout is None else timeout
+    deadline = time_module.monotonic() + timeout
+    while time_module.monotonic() < deadline:
+        if not ib.openTrades():
+            return True
+        try:
+            ib.sleep(_GLOBAL_CANCEL_POLL_SECONDS)
+        except Exception:  # pragma: no cover - no running loop (tests/scripts)
+            return not ib.openTrades()
+    return not ib.openTrades()
 
 
 FLATTEN_ORDER_REF = "warrior_flatten"
@@ -43,15 +73,69 @@ def _in_regular_hours(now: datetime | None = None) -> bool:
     return now_et.weekday() < 5 and RTH_OPEN <= now_et.time() < RTH_CLOSE
 
 
-def _pending_flatten_qty(ib: IB, symbol: str) -> float:
-    """Shares already covered by a still-working flatten order for `symbol`.
-    Only orders this module placed count (tagged via orderRef) -- a resting
-    take-profit or stop is not a flatten."""
+# A flatten order still working after this long is treated as stale: it is
+# cancelled and re-issued rather than counted as covering the position.
+# Outside RTH a flatten is a marketable limit priced off ib.portfolio()'s
+# marketPrice, which on a thin pre-market name can be minutes old or from a
+# wholly different price level -- if the result isn't actually marketable it
+# rests unfilled forever. Every subsequent watchdog pass then saw it as
+# "already covered" and returned BEFORE main.py's error log and alert, so an
+# unprotected position could sit behind a dead order all session with
+# nothing said about it.
+STALE_FLATTEN_SECONDS = 45.0
+
+
+def _trade_age_seconds(trade, now: datetime) -> float | None:
+    """Seconds since IBKR first logged this trade, or None if unknown."""
+    log = getattr(trade, "log", None)
+    if not log:
+        return None
+    first = getattr(log[0], "time", None)
+    if first is None:
+        return None
+    if first.tzinfo is None:
+        first = first.replace(tzinfo=timezone.utc)
+    return (now - first).total_seconds()
+
+
+def _pending_flatten_trades(ib: IB, symbol: str) -> list:
+    """Still-working flatten orders this module placed for `symbol`. Only
+    orders tagged via orderRef count -- a resting take-profit or stop is not
+    a flatten."""
+    return [
+        trade
+        for trade in ib.openTrades()
+        if trade.contract.symbol == symbol and trade.order.orderRef == FLATTEN_ORDER_REF
+    ]
+
+
+def _pending_flatten_qty(ib: IB, symbol: str, now: datetime | None = None) -> float:
+    """Shares covered by a still-working, still-credible flatten order.
+
+    A flatten older than STALE_FLATTEN_SECONDS with nothing filled is not
+    counted and is cancelled, so the caller re-issues it at a fresh price
+    instead of trusting an order that is evidently not going to fill."""
+    now = now or datetime.now(timezone.utc)
     pending = 0.0
-    for trade in ib.openTrades():
-        if trade.contract.symbol != symbol or trade.order.orderRef != FLATTEN_ORDER_REF:
+    for trade in _pending_flatten_trades(ib, symbol):
+        remaining = trade.orderStatus.remaining or trade.order.totalQuantity
+        age = _trade_age_seconds(trade, now)
+        if age is not None and age > STALE_FLATTEN_SECONDS and not (trade.orderStatus.filled or 0):
+            logger.warning(
+                "Flatten for %s has been working %.0fs with no fills -- cancelling and re-issuing",
+                symbol,
+                age,
+            )
+            alert(
+                f"Flatten order for {symbol} stalled unfilled for {age:.0f}s -- re-issuing at a fresh price",
+                channel="kill_switch",
+            )
+            try:
+                ib.cancelOrder(trade.order)
+            except Exception:  # pragma: no cover - best effort; we re-issue regardless
+                logger.exception("Could not cancel stale flatten order for %s", symbol)
             continue
-        pending += trade.orderStatus.remaining or trade.order.totalQuantity
+        pending += remaining
     return pending
 
 
@@ -99,7 +183,7 @@ def flatten_position(
     symbol = position.contract.symbol
     action = "SELL" if position.position > 0 else "BUY"
     qty = abs(position.position)
-    if skip_if_pending and _pending_flatten_qty(ib, symbol) >= qty:
+    if skip_if_pending and _pending_flatten_qty(ib, symbol, now=now or datetime.now(timezone.utc)) >= qty:
         logger.info("Flatten for %s already working (%s shares) -- not re-sending", symbol, qty)
         return False
 
@@ -167,4 +251,20 @@ def panic_stop(
 ) -> None:
     cancel_all_orders(ib, channel=channel)
     if flatten:
+        # Wait for the cancels to actually land before selling. Without
+        # this, a stop still live when the flatten sell hits the tape
+        # exits the position twice -- and since flatten_all_positions runs
+        # with skip_if_pending=False, nothing else would catch it.
+        if not _await_global_cancel(ib):
+            still_open = len(ib.openTrades())
+            logger.warning(
+                "reqGlobalCancel did not clear %d order(s) within %.0fs -- flattening anyway",
+                still_open,
+                _GLOBAL_CANCEL_TIMEOUT_SECONDS,
+            )
+            alert(
+                f"Global cancel still shows {still_open} open order(s) after "
+                f"{_GLOBAL_CANCEL_TIMEOUT_SECONDS:.0f}s -- flattening anyway, watch for a double exit",
+                channel=channel,
+            )
         flatten_all_positions(ib, channel=channel, limit_offset_pct=limit_offset_pct, on_order_placed=on_order_placed)

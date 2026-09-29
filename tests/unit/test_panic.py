@@ -279,3 +279,116 @@ def test_panic_stop_threads_hook_through_to_flatten(monkeypatch):
     panic.panic_stop(ib, flatten=True, on_order_placed=lambda symbol, trade, order: calls.append(symbol))
 
     assert calls == ["AAA"]
+
+
+# -- 2026-09-28 audit: stale flattens and the async global-cancel race --
+
+
+def _flatten_trade(symbol="STUCK", qty=100.0, age_seconds=None, filled=0.0, cancelled=None):
+    """A resting flatten order this module placed, optionally aged."""
+    from datetime import datetime, timedelta, timezone
+
+    log = []
+    if age_seconds is not None:
+        log = [SimpleNamespace(time=datetime.now(timezone.utc) - timedelta(seconds=age_seconds))]
+    order = SimpleNamespace(
+        orderRef=panic.FLATTEN_ORDER_REF, totalQuantity=qty, action="SELL", orderId=99, lmtPrice=1.0
+    )
+    return SimpleNamespace(
+        contract=FakeContract(symbol),
+        order=order,
+        orderStatus=SimpleNamespace(remaining=qty, filled=filled, status="Submitted"),
+        log=log,
+    )
+
+
+class CancellingFakeIB(FakeIB):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.cancelled = []
+
+    def cancelOrder(self, order):
+        self.cancelled.append(order)
+
+
+def test_fresh_pending_flatten_still_suppresses_a_duplicate(monkeypatch):
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    ib = CancellingFakeIB([make_position("STUCK", 100.0)], open_trades=[_flatten_trade(age_seconds=5)])
+
+    placed = panic.flatten_position(ib, make_position("STUCK", 100.0))
+
+    assert placed is False  # idempotency preserved
+    assert ib.cancelled == []
+
+
+def test_stale_unfilled_flatten_is_cancelled_and_reissued(monkeypatch):
+    # A marketable limit priced off a stale portfolio marketPrice can rest
+    # unfilled forever. Every later watchdog pass then saw the position as
+    # "already covered" and returned before main.py's error log and alert,
+    # so an unprotected position could sit behind a dead order all session.
+    alerts = []
+    monkeypatch.setattr(panic, "alert", lambda message, channel=None: alerts.append(message))
+    stale = _flatten_trade(age_seconds=120)
+    ib = CancellingFakeIB([make_position("STUCK", 100.0)], open_trades=[stale])
+
+    placed = panic.flatten_position(ib, make_position("STUCK", 100.0))
+
+    assert placed is True  # re-issued rather than silently trusted
+    assert ib.cancelled == [stale.order]
+    assert any("stalled unfilled" in message for message in alerts)
+
+
+def test_stale_flatten_that_is_partially_filling_is_left_alone(monkeypatch):
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    working = _flatten_trade(age_seconds=120, filled=40.0)
+    ib = CancellingFakeIB([make_position("STUCK", 100.0)], open_trades=[working])
+
+    placed = panic.flatten_position(ib, make_position("STUCK", 100.0))
+
+    assert placed is False  # it IS filling, just slowly
+    assert ib.cancelled == []
+
+
+class SlowCancelIB(FakeIB):
+    """openTrades() stays non-empty for the first `clears_after` polls,
+    mimicking reqGlobalCancel's asynchronous behaviour at IBKR.
+    `clears_after=None` never clears."""
+
+    def __init__(self, positions, clears_after=2, **kwargs):
+        super().__init__(positions, **kwargs)
+        self._polls = 0
+        self._clears_after = clears_after
+        self.slept = 0
+
+    def openTrades(self):
+        if self._clears_after is None:
+            return [_flatten_trade()]
+        return [] if self._polls >= self._clears_after else [_flatten_trade()]
+
+    def sleep(self, seconds):
+        self._polls += 1
+        self.slept += 1
+
+
+def test_panic_stop_waits_for_the_global_cancel_before_flattening(monkeypatch):
+    # reqGlobalCancel is asynchronous; flattening straight after it can put
+    # a sell on the tape while a protective stop is still live.
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    ib = SlowCancelIB([make_position("AAA", 100.0)], clears_after=2)
+
+    panic.panic_stop(ib)
+
+    assert ib.slept >= 2  # actually waited
+    assert len(ib.placed) == 1  # and still flattened afterwards
+
+
+def test_panic_stop_flattens_anyway_and_alerts_if_the_cancel_never_clears(monkeypatch):
+    alerts = []
+    monkeypatch.setattr(panic, "alert", lambda message, channel=None: alerts.append(message))
+    monkeypatch.setattr(panic, "_GLOBAL_CANCEL_TIMEOUT_SECONDS", 0.2)
+    ib = SlowCancelIB([make_position("AAA", 100.0)], clears_after=None)  # never clears
+
+    panic.panic_stop(ib)
+
+    assert any("flattening anyway" in message for message in alerts)
+    assert len(ib.placed) == 1  # getting flat still wins
