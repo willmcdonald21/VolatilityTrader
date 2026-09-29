@@ -767,3 +767,54 @@ def test_mark_start_of_day_always_clears_the_halt(tmp_path):
 
     assert rm.loss_limit_halted_today is False
     assert rm.evaluate(make_signal()).accepted
+
+
+# -- 2026-09-28 audit: a missing account value must never read as zero --
+
+
+def test_missing_net_liquidation_rejects_instead_of_zeroing_the_baseline(tmp_path):
+    # ib_async clears accountValues on every disconnect, so an empty table
+    # is a routine post-reconnect state. Treating it as 0.0 set
+    # start_of_day_equity to zero, which made the daily loss limit zero,
+    # which latched the halt on the first cent of red P&L -- persisted, and
+    # deliberately not cleared by a restart. A whole trading day, lost to a
+    # routine blip.
+    snapshot = default_snapshot(net_liquidation=None, available_funds=None, buying_power=None)
+    rm = make_risk_manager(tmp_path, snapshot)
+
+    decision = rm.evaluate(make_signal())
+
+    assert decision.accepted is False
+    assert "account values unavailable" in decision.reason
+    assert rm.start_of_day_equity is None  # baseline NOT poisoned
+    assert rm.loss_limit_halted_today is False  # and the day is not halted
+
+
+def test_zero_net_liquidation_is_also_refused(tmp_path):
+    snapshot = default_snapshot(net_liquidation=0.0)
+    rm = make_risk_manager(tmp_path, snapshot)
+
+    decision = rm.evaluate(make_signal())
+
+    assert decision.accepted is False
+    assert rm.start_of_day_equity is None
+
+
+def test_baseline_is_established_normally_once_values_return(tmp_path):
+    rm = make_risk_manager(tmp_path, default_snapshot(net_liquidation=None))
+    assert rm.evaluate(make_signal()).accepted is False
+
+    rm.account_state = FakeAccountState(default_snapshot(net_liquidation=50_000, available_funds=50_000))
+    decision = rm.evaluate(make_signal())
+
+    assert decision.accepted is True
+    assert rm.start_of_day_equity == 50_000
+
+
+def test_mark_start_of_day_refuses_a_missing_equity_reading(tmp_path):
+    rm = make_risk_manager(tmp_path, default_snapshot())
+    rm.mark_start_of_day(None)
+    assert rm.start_of_day_equity is None
+
+    rm.mark_start_of_day(45_000.0)
+    assert rm.start_of_day_equity == 45_000.0

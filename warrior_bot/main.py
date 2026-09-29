@@ -1004,7 +1004,7 @@ class WarriorBot:
         self._eod_flatten_fired = False
         self._loss_limit_flatten_fired = False
         self._last_logged_breadth = None
-        self.logger.info("Daily state reset. Start-of-day equity=%.2f", snapshot.net_liquidation)
+        self.logger.info("Daily state reset. Start-of-day equity=%s", snapshot.net_liquidation)
 
 
 async def run() -> None:

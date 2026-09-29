@@ -85,11 +85,23 @@ class RiskManager:
     def _kill_switch_active(self) -> bool:
         return self._manual_kill_switch or self.kill_switch_path.exists()
 
-    def mark_start_of_day(self, equity: float) -> None:
+    def mark_start_of_day(self, equity: float | None) -> None:
         """Establishes a FRESH baseline for a genuinely new trading day --
         always clears the halt. Never call this to resume a process
         mid-day; use load_state for that (see its docstring for why the
-        distinction matters)."""
+        distinction matters).
+
+        A missing or zero equity reading is refused rather than stored: it
+        would make the daily loss limit zero and latch the halt on the
+        first cent of red P&L. evaluate() re-attempts the baseline on the
+        next signal once IBKR reports real values."""
+        if not equity:
+            logger.warning(
+                "Refusing to set start-of-day equity from an unavailable/zero account value -- "
+                "will retry once IBKR reports it"
+            )
+            self._loss_limit_halted_today = False
+            return
         self._start_of_day_equity = equity
         self._loss_limit_halted_today = False
 
@@ -142,6 +154,18 @@ class RiskManager:
 
     def evaluate(self, signal: Signal, now: datetime | None = None) -> RiskDecision:
         snapshot = self.account_state.snapshot()
+
+        # A missing account figure is NOT zero. ib_async clears
+        # accountValues on every disconnect, so an empty table is a routine
+        # post-reconnect state -- and seeding the day's baseline from it
+        # used to set start_of_day_equity to 0.0, which made the daily loss
+        # limit 0.0, which made the first cent of red P&L latch the halt for
+        # the rest of the day (persisted, and deliberately not cleared by a
+        # restart). Refuse to trade until IBKR reports real numbers.
+        if not snapshot.net_liquidation or snapshot.available_funds is None or snapshot.buying_power is None:
+            reason = "account values unavailable from IBKR (likely a fresh reconnect) -- not sizing anything yet"
+            alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}", channel="kill_switch")
+            return RiskDecision(False, 0, reason, snapshot)
 
         if self._start_of_day_equity is None:
             self._start_of_day_equity = snapshot.net_liquidation
@@ -337,6 +361,8 @@ class RiskManager:
         if risk_per_share <= 0:
             return None
         equity = self._start_of_day_equity or snapshot.net_liquidation
+        if not equity:
+            return None  # no trustworthy equity figure -- fall back to the notional caps
         return math.floor((equity * risk_pct) / risk_per_share)
 
     def _cushion_met(self, snapshot: AccountSnapshot) -> bool:

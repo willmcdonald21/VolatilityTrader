@@ -11,9 +11,13 @@ from warrior_bot.utils.time_utils import session_date_start
 
 @dataclass
 class AccountSnapshot:
-    net_liquidation: float
-    available_funds: float
-    buying_power: float
+    # None means IBKR has not reported the figure (typically a fresh
+    # reconnect before account updates have resynced) -- callers must
+    # distinguish that from a genuine zero. See AccountState._account_value
+    # for the live incident this guards against.
+    net_liquidation: float | None
+    available_funds: float | None
+    buying_power: float | None
     open_positions_count: int
     daily_realized_pnl: float
     # Symbols IBKR reports a nonzero position in, and the summed unrealized
@@ -59,14 +63,37 @@ class AccountState:
     def reset_session(self) -> None:
         self._session_start = _today_start_utc()
 
-    def _account_value(self, tag: str) -> float:
+    def _account_value(self, tag: str) -> float | None:
+        """None when IBKR has not reported this tag, which is NOT the same
+        as zero.
+
+        ib_async's wrapper.reset() clears accountValues on every disconnect,
+        and connectAsync's account-updates sync can time out silently, so an
+        empty table is a routine post-reconnect state. Returning 0.0 for it
+        was a live landmine: RiskManager.evaluate seeds start_of_day_equity
+        from net_liquidation when it is None, so a 0.0 reading set the
+        day's baseline to zero, which made the daily loss limit
+        (equity * pct) zero, which made the first cent of red P&L trip
+        `<= -0.0`. That latches _loss_limit_halted_today, persists it to
+        daily_risk_state, and load_state deliberately refuses to clear a
+        halt on restart -- so a routine disconnect could silently end
+        trading for the whole day.
+
+        Also filters on currency: with account="" (the default),
+        ib.accountValues("") returns every account and every currency, and
+        IBKR publishes NetLiquidation in both USD and BASE. Taking
+        whichever arrived first is benign on a USD-only paper account and
+        wrong the moment that stops being true."""
         for av in self.ib.accountValues(self.account):
-            if av.tag == tag and (not self.account or av.account == self.account):
-                try:
-                    return float(av.value)
-                except ValueError:
-                    return 0.0
-        return 0.0
+            if av.tag != tag or (self.account and av.account != self.account):
+                continue
+            if getattr(av, "currency", "") not in ("", "USD", "BASE"):
+                continue
+            try:
+                return float(av.value)
+            except (TypeError, ValueError):
+                return None
+        return None
 
     def _todays_fills(self) -> list:
         """This session's fills, oldest first — average-cost accounting
