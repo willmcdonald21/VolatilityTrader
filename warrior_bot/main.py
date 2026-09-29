@@ -8,7 +8,7 @@ from ib_async import Contract, Order, Trade
 
 from warrior_bot.broker.historical import fetch_prior_close, fetch_warmup_bars
 from warrior_bot.broker.ib_client import IBClient
-from warrior_bot.broker.market_data import scan_candidates
+from warrior_bot.broker.market_data import ScannerRefused, scan_candidates
 from warrior_bot.broker.news import discover_provider_codes, fetch_recent_headlines
 from warrior_bot.config import AppConfig, load_config
 from warrior_bot.execution.order_manager import OrderManager
@@ -67,6 +67,17 @@ class WarriorBot:
         # regardless of whether they still rank, so an open position never
         # loses its bar feed (and with it breakeven/trailing/reversal).
         self._resubscribe_after_reconnect: set[str] = set()
+        # Scanner health. A refused scan is not an empty market (see
+        # market_data.ScannerRefused) -- these drive alerting and the
+        # forced reconnect that releases IBKR's leaked scanner slots.
+        self._consecutive_scanner_refusals = 0
+        self._last_successful_scan_at: datetime | None = None
+        # Wall-clock time the connection state last changed, so a
+        # disconnect can be reported with its duration instead of the loops
+        # silently spinning (2026-09-28: 5h20m of near-total log silence).
+        self._disconnected_since: datetime | None = None
+        self._disconnect_alert_sent = False
+        self._disconnect_logged_at: datetime | None = None
         self.ib.connectedEvent += self._on_connected
 
         conn = get_connection(config.resolve_path(config.journal.db_path))
@@ -156,6 +167,7 @@ class WarriorBot:
                 self._news_provider_codes = await discover_provider_codes(self.ib)
             except Exception:
                 self.logger.exception("Failed to discover news providers")
+        self.ib_client.start_heartbeat()
         self._scan_task = asyncio.ensure_future(self._scan_loop())
         self._risk_task = asyncio.ensure_future(self._risk_loop())
         self._watchdog_task = asyncio.ensure_future(self._data_watchdog_loop())
@@ -245,13 +257,75 @@ class WarriorBot:
         if tracked:
             self._resubscribe_after_reconnect = set(tracked)
 
+    # Consecutive refused scans before forcing a reconnect. The leaked
+    # scanner slots that caused the 2026-09-28 blackout are held per API
+    # connection, so dropping and re-establishing the connection is what
+    # actually releases them -- confirmed by the manual restart that
+    # recovered it. Kept high enough that a transient refusal doesn't churn
+    # the connection: at refresh_seconds=5 this is ~1 minute of failure.
+    SCANNER_REFUSAL_RECONNECT_THRESHOLD = 12
+
+    # A disconnect lasting longer than this during an active session is
+    # escalated from a log line to an alert. Below it, brief blips stay
+    # quiet.
+    DISCONNECT_ALERT_SECONDS = 120.0
+
+    async def _await_connection(self, loop_name: str) -> bool:
+        """Returns True when connected. When not, records and reports the
+        outage instead of silently sleeping.
+
+        Every loop used to do a bare `if not isConnected(): sleep(5);
+        continue`, so an outage produced no scanning, no evaluations and
+        essentially no log evidence -- 2026-09-28 lost 5h20m that way, with
+        3-15 log lines an hour and no alert. All four loops share this
+        state, so the reporting is throttled once globally rather than per
+        loop."""
+        now = datetime.now(timezone.utc)
+
+        if self.ib.isConnected():
+            if self._disconnected_since is not None:
+                outage = (now - self._disconnected_since).total_seconds()
+                self._disconnected_since = None
+                self._disconnect_alert_sent = False
+                self._disconnect_logged_at = None
+                self.logger.warning("IBKR connection restored after %.0fs offline", outage)
+                if outage >= self.DISCONNECT_ALERT_SECONDS:
+                    alert(f"IBKR connection restored after {outage / 60:.1f} minutes offline", channel="kill_switch")
+            return True
+
+        if self._disconnected_since is None:
+            self._disconnected_since = now
+            self._disconnect_logged_at = now
+            self.logger.warning("%s: IBKR not connected -- loops idle until it returns", loop_name)
+            return False
+
+        outage = (now - self._disconnected_since).total_seconds()
+        since_logged = (now - self._disconnect_logged_at).total_seconds() if self._disconnect_logged_at else None
+        if since_logged is None or since_logged >= 60:
+            self._disconnect_logged_at = now
+            self.logger.warning("Still disconnected from IBKR after %.0fs (noticed by %s)", outage, loop_name)
+        if outage >= self.DISCONNECT_ALERT_SECONDS and not self._disconnect_alert_sent and is_active_session():
+            self._disconnect_alert_sent = True
+            alert(
+                f"IBKR has been disconnected for {outage / 60:.1f} minutes during an active session -- "
+                "the bot is not scanning, evaluating or managing positions",
+                channel="kill_switch",
+            )
+        return False
+
     async def _scan_loop(self) -> None:
         while True:
-            if not self.ib.isConnected():
+            if not await self._await_connection("scan_loop"):
                 await asyncio.sleep(5)
                 continue
             try:
-                symbols = await asyncio.wait_for(scan_candidates(self.ib, self.config), timeout=30)
+                try:
+                    symbols = await asyncio.wait_for(scan_candidates(self.ib, self.config), timeout=30)
+                except ScannerRefused as exc:
+                    await self._handle_scanner_refusal(exc)
+                    await asyncio.sleep(self.config.scanner.refresh_seconds)
+                    continue
+                self._note_scan_succeeded()
                 now = datetime.now(timezone.utc)
                 # Symbols holding an open position across a reconnect are
                 # onboarded first and unconditionally -- see _on_connected.
@@ -300,6 +374,49 @@ class WarriorBot:
                 self.logger.exception("Scan loop iteration failed")
             await asyncio.sleep(self.config.scanner.refresh_seconds)
 
+    def _note_scan_succeeded(self) -> None:
+        if self._consecutive_scanner_refusals:
+            self.logger.info(
+                "Scanner recovered after %d refused scan(s)", self._consecutive_scanner_refusals
+            )
+            alert(
+                f"Scanner recovered after {self._consecutive_scanner_refusals} refused scan(s)",
+                channel="kill_switch",
+            )
+        self._consecutive_scanner_refusals = 0
+        self._last_successful_scan_at = datetime.now(timezone.utc)
+
+    async def _handle_scanner_refusal(self, exc: Exception) -> None:
+        """IBKR refused the scan. Crucially this does NOT demote any
+        symbol's rank: an empty result used to clear every rank, and since
+        the 2026-09-26 eligibility gate a cleared rank makes a symbol
+        ineligible for every strategy -- so a scanner failure silently took
+        the whole strategy layer offline rather than just pausing
+        discovery. Existing ranks are left exactly as they were until a
+        real scan supersedes them."""
+        self._consecutive_scanner_refusals += 1
+        count = self._consecutive_scanner_refusals
+        self.logger.error("Scanner refused (%d consecutive): %s", count, exc)
+
+        # Alert once when it starts, then at a slow cadence -- at
+        # refresh_seconds=5 this is roughly once a minute.
+        if count == 1 or count % self.SCANNER_REFUSAL_RECONNECT_THRESHOLD == 0:
+            alert(
+                f"Scanner is being REFUSED by IBKR ({count} consecutive): {exc}. "
+                "No new candidates are being discovered and no strategy can fire.",
+                channel="kill_switch",
+            )
+
+        if count and count % self.SCANNER_REFUSAL_RECONNECT_THRESHOLD == 0:
+            # Scanner subscription slots leak per API connection, so a
+            # reconnect is what actually frees them.
+            self.logger.warning("Forcing an IBKR reconnect to release leaked scanner subscriptions")
+            alert("Forcing an IBKR reconnect to clear the scanner refusal", channel="kill_switch")
+            try:
+                self.ib.disconnect()  # disconnectedEvent drives the normal reconnect path
+            except Exception:
+                self.logger.exception("Failed to force a disconnect for scanner recovery")
+
     def _demote_symbols_absent_from_scan(self, current: set[str]) -> None:
         """A tracked symbol that has dropped out of the scanner's top-N is
         no longer a top-tier candidate, so it must not keep claiming a rank
@@ -312,7 +429,7 @@ class WarriorBot:
 
     async def _risk_loop(self) -> None:
         while True:
-            if not self.ib.isConnected():
+            if not await self._await_connection("risk_loop"):
                 await asyncio.sleep(5)
                 continue
             try:
@@ -484,7 +601,7 @@ class WarriorBot:
         if not cfg.enabled:
             return
         while True:
-            if not self.ib.isConnected():
+            if not await self._await_connection("data_watchdog"):
                 await asyncio.sleep(5)
                 continue
             try:
@@ -889,7 +1006,7 @@ class WarriorBot:
         if not cfg.enabled:
             return
         while True:
-            if not self.ib.isConnected():
+            if not await self._await_connection("position_reconciliation"):
                 await asyncio.sleep(5)
                 continue
             try:

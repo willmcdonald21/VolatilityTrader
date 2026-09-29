@@ -1339,3 +1339,109 @@ def test_reconnect_alerts_when_nothing_resynced_but_positions_are_held(tmp_path,
     bot._on_connected()
 
     assert any("resynced 0 orders" in message for message, _ in alerts)
+
+
+# -- 2026-09-28 audit: scanner-refusal detection and disconnect visibility --
+
+
+def test_scanner_refusal_does_not_demote_ranks(tmp_path, monkeypatch):
+    # THE key interaction. An empty scan clears every symbol's rank, and
+    # since the 2026-09-26 eligibility gate a cleared rank makes a symbol
+    # ineligible for every strategy -- so a refused scan silently took the
+    # entire strategy layer offline rather than just pausing discovery.
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.contexts = {"AAA": _RankCtx(1), "BBB": _RankCtx(2)}
+
+    asyncio.run(bot._handle_scanner_refusal(RuntimeError("code 322")))
+
+    assert bot.contexts["AAA"].scanner_rank == 1  # untouched
+    assert bot.contexts["BBB"].scanner_rank == 2
+    assert bot._consecutive_scanner_refusals == 1
+
+
+def test_scanner_refusal_alerts_on_the_first_failure(tmp_path, monkeypatch):
+    alerts = []
+    monkeypatch.setattr("warrior_bot.main.alert", lambda message, channel=None: alerts.append(message))
+    bot = WarriorBot(make_config(tmp_path))
+
+    asyncio.run(bot._handle_scanner_refusal(RuntimeError("code 322")))
+
+    assert any("REFUSED" in message for message in alerts)
+
+
+def test_repeated_scanner_refusals_force_a_reconnect(tmp_path, monkeypatch):
+    # Scanner subscription slots leak per API connection, so only a
+    # reconnect actually releases them -- confirmed by the manual restart
+    # that recovered the 2026-09-28 outage.
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    disconnects = []
+    bot.ib.disconnect = lambda: disconnects.append(True)
+
+    for _ in range(bot.SCANNER_REFUSAL_RECONNECT_THRESHOLD):
+        asyncio.run(bot._handle_scanner_refusal(RuntimeError("code 322")))
+
+    assert len(disconnects) == 1
+
+
+def test_scanner_recovery_resets_the_counter_and_alerts(tmp_path, monkeypatch):
+    alerts = []
+    monkeypatch.setattr("warrior_bot.main.alert", lambda message, channel=None: alerts.append(message))
+    bot = WarriorBot(make_config(tmp_path))
+    asyncio.run(bot._handle_scanner_refusal(RuntimeError("code 322")))
+
+    bot._note_scan_succeeded()
+
+    assert bot._consecutive_scanner_refusals == 0
+    assert bot._last_successful_scan_at is not None
+    assert any("recovered" in message for message in alerts)
+
+
+def test_disconnect_is_logged_once_then_throttled(tmp_path, monkeypatch, caplog):
+    # The loops used to `sleep(5); continue` in silence -- 5h20m of outage
+    # produced 3-15 log lines an hour and no alert at all.
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.isConnected = lambda: False
+
+    with caplog.at_level("WARNING"):
+        assert asyncio.run(bot._await_connection("scan_loop")) is False
+        assert asyncio.run(bot._await_connection("risk_loop")) is False  # same outage, throttled
+
+    messages = [r.message for r in caplog.records]
+    assert sum("not connected" in m for m in messages) == 1
+    assert bot._disconnected_since is not None
+
+
+def test_reconnection_is_reported_with_its_duration(tmp_path, monkeypatch, caplog):
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.isConnected = lambda: False
+    asyncio.run(bot._await_connection("scan_loop"))
+
+    bot.ib.isConnected = lambda: True
+    with caplog.at_level("WARNING"):
+        assert asyncio.run(bot._await_connection("scan_loop")) is True
+
+    assert any("connection restored" in r.message for r in caplog.records)
+    assert bot._disconnected_since is None
+
+
+def test_long_disconnect_alerts_during_an_active_session(tmp_path, monkeypatch):
+    alerts = []
+    monkeypatch.setattr("warrior_bot.main.alert", lambda message, channel=None: alerts.append(message))
+    monkeypatch.setattr("warrior_bot.main.is_active_session", lambda: True)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.isConnected = lambda: False
+    asyncio.run(bot._await_connection("scan_loop"))
+    # Backdate the outage past the alert threshold.
+    bot._disconnected_since = datetime.now(timezone.utc) - timedelta(seconds=300)
+
+    asyncio.run(bot._await_connection("scan_loop"))
+
+    assert any("disconnected for" in message for message in alerts)
+    # One-shot: a second pass must not re-alert.
+    alerts.clear()
+    asyncio.run(bot._await_connection("scan_loop"))
+    assert alerts == []

@@ -9,12 +9,17 @@ from ib_async.util import UNSET_DOUBLE
 from warrior_bot.risk.account_state import AccountState
 
 
-def make_fill(symbol, side, shares, price, commission=0.0, minutes_ago=0, realized_pnl=0.0):
+def make_fill(symbol, side, shares, price, commission=0.0, minutes_ago=0, realized_pnl=0.0, at=None):
     """`realized_pnl` defaults to 0.0 to mirror what IBKR's paper simulator
     actually reports on closing fills -- the whole reason daily_realized_pnl
-    can't be built out of that field."""
+    can't be built out of that field.
+
+    `at` pins the fill to an absolute time. Prefer it over `minutes_ago`
+    for anything that must land inside today's ET session: a fixed offset
+    from now crosses into yesterday's ET day when the suite runs shortly
+    after midnight ET."""
     return SimpleNamespace(
-        time=datetime.now(timezone.utc) - timedelta(minutes=minutes_ago),
+        time=at if at is not None else datetime.now(timezone.utc) - timedelta(minutes=minutes_ago),
         contract=SimpleNamespace(symbol=symbol),
         execution=SimpleNamespace(side=side, shares=shares, price=price),
         commissionReport=SimpleNamespace(commission=commission, realizedPNL=realized_pnl),
@@ -179,9 +184,13 @@ def test_fresh_account_state_anchors_session_start_to_today_not_now():
 
     # Anchored to midnight ET today, not "now" -- must be exactly today's
     # ET day-start (allowing no drift at all, since both sides compute it
-    # the same way), and nowhere near datetime.now(timezone.utc).
+    # the same way), and strictly in the past rather than stamped at "now".
+    #
+    # The elapsed-time assertion is deliberately not "> 1 hour": run
+    # between 00:00 and 01:00 ET that is false for a perfectly correct
+    # anchor, and this test would fail every night for an hour.
     assert state._session_start == before_construction
-    assert (datetime.now(timezone.utc) - state._session_start) > timedelta(hours=1)
+    assert state._session_start <= datetime.now(timezone.utc)
 
 
 def test_reset_session_also_anchors_to_today_not_now():
@@ -196,11 +205,22 @@ def test_reset_session_also_anchors_to_today_not_now():
 
 
 def test_fresh_account_state_still_sees_a_fill_from_earlier_today():
-    # The actual restart scenario: a real loss happened hours before the
-    # process (re)started -- a brand-new AccountState, with no manual
-    # _session_start override, must still count it.
-    old_fill = make_fill("AAPL", "SLD", 100, 9.0, minutes_ago=180, realized_pnl=0.0)  # 3 hours ago
-    entry_fill = make_fill("AAPL", "BOT", 100, 10.0, minutes_ago=185, realized_pnl=None)
+    # The actual restart scenario: a real loss happened earlier in the ET
+    # trading day, before the process (re)started -- a brand-new
+    # AccountState, with no manual _session_start override, must still
+    # count it.
+    #
+    # Anchored just after ET midnight rather than "N minutes ago": a fixed
+    # offset from now falls into YESTERDAY's ET day whenever the suite runs
+    # shortly after midnight ET, which correctly excludes the fill and made
+    # this test fail every night between 00:00 and ~03:05 ET.
+    from warrior_bot.utils.time_utils import session_date_start
+
+    et_midnight = session_date_start().astimezone(timezone.utc)
+    entry_at = et_midnight + timedelta(minutes=1)
+    exit_at = et_midnight + timedelta(minutes=6)
+    entry_fill = make_fill("AAPL", "BOT", 100, 10.0, at=entry_at, realized_pnl=None)
+    old_fill = make_fill("AAPL", "SLD", 100, 9.0, at=exit_at, realized_pnl=0.0)
     state = AccountState(FakeIB([entry_fill, old_fill]))
 
     assert state.daily_realized_pnl() == pytest.approx(-100.0)  # (9.0 - 10.0) * 100
