@@ -569,6 +569,15 @@ class KillSwitchConfig(BaseModel):
 class LoggingConfig(BaseModel):
     level: str = "INFO"
     file: str = "data/warrior_bot.log"
+    # The log rotates at midnight; this many days are kept. At DEBUG the
+    # bot writes ~31-35 MB per active trading day, so 30 days is ~1 GB
+    # worst case -- bounded, where the previous plain FileHandler was not
+    # (418 MB and growing by 2026-09-28, in the same directory as
+    # journal.sqlite3).
+    backup_count: int = Field(default=30, ge=1)
+    # Lets the file stay at DEBUG for forensics while the console shows
+    # only what a human watching it needs. None = same as `level`.
+    console_level: str | None = None
 
 
 class NotificationsConfig(BaseModel):

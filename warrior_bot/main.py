@@ -114,6 +114,7 @@ class WarriorBot:
         )
 
         float_provider = FloatProvider(config.resolve_path("config/float_list.csv"))
+        self.float_provider = float_provider
 
         self.strategies: list[BaseStrategy] = []
         if config.strategies.gap_and_go.enabled:
@@ -172,6 +173,7 @@ class WarriorBot:
             except Exception:
                 self.logger.exception("Failed to discover news providers")
         self._validate_notification_channels()
+        self._validate_float_filter()
         self.ib_client.start_heartbeat()
         self._scan_task = asyncio.ensure_future(self._scan_loop())
         self._risk_task = asyncio.ensure_future(self._risk_loop())
@@ -278,6 +280,28 @@ class WarriorBot:
     # escalated from a log line to an alert. Below it, brief blips stay
     # quiet.
     DISCONNECT_ALERT_SECONDS = 120.0
+
+    def _validate_float_filter(self) -> None:
+        """Says so out loud when the float filter is enabled but has no
+        data to work with.
+
+        config.yaml sets enable_float_filter: true and annotates it
+        "matches Ross Cameron's 5 Pillars filter", but FloatProvider
+        degrades to "allow everything" when config/float_list.csv is
+        missing -- which it is. The result: a filter the operator believes
+        is screening out large-float names has never rejected a single
+        symbol (0 of 2,311 signals carry any float data), and the only
+        notice was one logger.info buried in millions of lines."""
+        if not self.config.strategies.gap_and_go.enable_float_filter:
+            return
+        if self.float_provider.is_available():
+            return
+        alert(
+            "Float filter is ENABLED but no usable float data exists "
+            f"({self.config.resolve_path('config/float_list.csv')}) -- "
+            "every symbol is passing the low-float check unfiltered",
+            channel="kill_switch",
+        )
 
     def _validate_notification_channels(self) -> None:
         """Warns at startup about enabled Discord channels with no webhook

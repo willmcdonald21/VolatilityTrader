@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 
 from warrior_bot.config import AppConfig, NotificationsConfig
@@ -23,11 +24,25 @@ def setup_logging(config: AppConfig) -> logging.Logger:
 
     fmt = logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s")
 
-    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    # Rotating, not a plain FileHandler. At DEBUG this bot writes ~31-35 MB
+    # per active trading day (305,500 lines on 2026-09-21); by 2026-09-28
+    # the single log file had reached 418 MB / 3.6M lines with no bound at
+    # all, on track for ~8.6 GB/year -- and it lives in the same directory
+    # as journal.sqlite3, so filling the disk would take down trading and
+    # record-keeping together. Rotating daily (rather than by size) also
+    # makes per-day forensics a matter of opening one file.
+    file_handler = TimedRotatingFileHandler(
+        log_path,
+        when="midnight",
+        backupCount=config.logging.backup_count,
+        encoding="utf-8",
+        utc=False,
+    )
     file_handler.setFormatter(fmt)
     logger.addHandler(file_handler)
 
     console_handler = logging.StreamHandler()
+    console_handler.setLevel(config.logging.console_level or config.logging.level)
     console_handler.setFormatter(fmt)
     logger.addHandler(console_handler)
 
