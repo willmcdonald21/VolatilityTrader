@@ -29,7 +29,14 @@ def test_red_to_green_triggers_signal():
             (9.8, 10.2, 9.8, 10.2, 5000),  # current bar: crosses to green
         ],
         prior_close=10.0,
-        avg_daily_volume=10_000,  # low enough that cumulative volume clears the 5x relative-volume floor
+        # Lowered from 10_000 on 2026-09-30. session_elapsed_fraction now
+        # models the pre-market session instead of returning a flat 0.01, so
+        # at 10:00 ET the expected-volume denominator is 0.169 * ADV rather
+        # than 0.077 * ADV. The same 7,000 shares that used to grade as 9.1x
+        # relative volume now grade as 4.1x and miss the 5.0 floor. The gate
+        # got stricter, not broken -- the fixture has to describe a stock
+        # genuinely trading at 5x pace under the corrected clock.
+        avg_daily_volume=5_000,
     )
     strategy = VwapReversionStrategy(VwapReversionConfig())
     signal = strategy.evaluate(ctx, NOW)
@@ -79,7 +86,10 @@ def test_vwap_bounce_triggers_signal():
             (9.95, 10.2, 9.95, 10.2, 1000),   # bounces back above prior high and VWAP -- ~1.6% past VWAP (10.0375), under the 2% extension cap
         ],
         prior_close=5.0,  # far below everything -> red_to_green never applies
-        avg_daily_volume=5_000,  # low enough that cumulative volume clears the 5x relative-volume floor
+        # Lowered from 5_000 on 2026-09-30, same reason as the red_to_green
+        # case above: the corrected elapsed-volume curve more than doubled
+        # the denominator at 10:00 ET.
+        avg_daily_volume=4_000,
     )
     strategy = VwapReversionStrategy(VwapReversionConfig())
     signal = strategy.evaluate(ctx, NOW)
@@ -263,7 +273,9 @@ def test_does_not_retrigger_same_symbol_same_day():
         (9.5, 9.8, 9.4, 9.8, 1000),
         (9.8, 10.2, 9.8, 10.2, 5000),
     ]
-    ctx = make_ctx(bar_specs, prior_close=10.0, avg_daily_volume=10_000)
+    # 5_000 (not 10_000) to clear the relative-volume floor under the
+    # corrected session_elapsed_fraction -- see test_red_to_green_triggers_signal.
+    ctx = make_ctx(bar_specs, prior_close=10.0, avg_daily_volume=5_000)
     strategy = VwapReversionStrategy(VwapReversionConfig())
     assert strategy.evaluate(ctx, NOW) is not None
     assert strategy.evaluate(ctx, NOW) is None

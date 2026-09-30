@@ -31,7 +31,12 @@ PASSING_BARS = [
 ]
 
 
-def make_ctx(bar_specs, prior_close=10.5, avg_daily_volume=10_000, symbol="GOGO"):
+# avg_daily_volume default lowered from 10_000 on 2026-09-30. The corrected
+# session_elapsed_fraction grades 09:35 ET as 0.111 of a day's volume rather
+# than 0.013, so these fixtures' volumes had to describe a stock genuinely
+# trading at >5x pace rather than one that only looked like it under the old
+# flat pre-market epsilon.
+def make_ctx(bar_specs, prior_close=10.5, avg_daily_volume=5_000, symbol="GOGO"):
     # prior_close=10.5 pairs with PASSING_BARS' 11.95 breakout close for a
     # ~13.8% gap -- comfortably inside the default 10-20% gap band.
     ctx = SymbolContext(symbol=symbol)

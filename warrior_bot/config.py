@@ -453,6 +453,25 @@ class ExitsConfig(BaseModel):
         return self
 
 
+class SessionConfig(BaseModel):
+    """How the trading session itself is modelled."""
+
+    # Fraction of a typical day's volume that trades pre-market (04:00-09:30
+    # ET). Relative volume compares actual volume against
+    # avg_daily_volume * elapsed_fraction, and until 2026-09-30 the
+    # elapsed fraction was a flat 0.01 for EVERY minute before 09:33 -- so
+    # 04:05 and 09:29 were graded identically, and min_rel_volume: 5.0 meant
+    # ">=5% of ADV" at 08:00 but ">=192%" at noon. The same number encoded
+    # two different rules depending on the clock, which is the most likely
+    # reason the bot traded almost exclusively pre-market.
+    #
+    # Raising this LOOSENS the pre-market gate (more volume is considered
+    # normal by then, so a given cumulative volume looks like a lower
+    # multiple); lowering it tightens. Approximate by nature -- tune it
+    # against gate-rejection data rather than treating it as exact.
+    premarket_volume_share: float = Field(default=0.10, gt=0, lt=1)
+
+
 class NewsConfig(BaseModel):
     enabled: bool = False
     lookback_hours: int = Field(default=48, gt=0)
@@ -605,6 +624,7 @@ class AppConfig(BaseModel):
     risk: RiskConfig
     strategies: StrategiesConfig
     pullback_quality: PullbackQualityConfig = PullbackQualityConfig()
+    session: SessionConfig = SessionConfig()
     exits: ExitsConfig = ExitsConfig()
     news: NewsConfig = NewsConfig()
     notifications: NotificationsConfig = NotificationsConfig()

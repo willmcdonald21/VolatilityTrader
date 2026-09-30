@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 EASTERN = ZoneInfo("America/New_York")
@@ -23,29 +23,84 @@ def to_eastern(dt: datetime) -> datetime:
     return dt.astimezone(EASTERN)
 
 
-def session_elapsed_fraction(now: datetime | None = None) -> float:
-    """Fraction of the regular trading session (9:30-16:00 ET) elapsed.
+def session_anchor(now: datetime | None = None) -> datetime:
+    """Start of the current trading session in ET: today's 04:00 pre-market
+    open (or yesterday's, if called before 04:00).
 
-    Clamped to [small epsilon, 1.0]. Used to scale a 20-day average daily
-    volume down to an expected-volume-by-now baseline for relative-volume
-    calculations. Pre-market minutes count as "0 elapsed" of RTH volume,
-    since Warrior-Trading-style relative volume is conventionally measured
-    against RTH averages even when the signal itself fires pre-market.
-
-    Accepts `now` in any timezone (or naive, treated as Eastern) and
-    normalizes to Eastern before comparing against session boundaries —
-    callers elsewhere in the bot pass UTC-aware datetimes.
+    This is the reference point VWAP and session volume are measured from.
+    Before this existed, both were measured from whenever the scanner
+    happened to discover a symbol -- a fixed 60-minute warmup window -- so
+    two identical stocks got different VWAPs based on discovery time, the
+    value never re-anchored at the open, and it silently re-anchored again
+    on every reconnect. 04:00 rather than 09:30 because this bot trades
+    pre-market from 06:30, and a VWAP that ignores the pre-market session
+    it is trading in would be meaningless there.
     """
     now = to_eastern(now) if now is not None else now_eastern()
-    session_start = now.replace(hour=RTH_OPEN.hour, minute=RTH_OPEN.minute, second=0, microsecond=0)
-    session_end = now.replace(hour=RTH_CLOSE.hour, minute=RTH_CLOSE.minute, second=0, microsecond=0)
-    if now <= session_start:
-        return 0.01
-    if now >= session_end:
+    anchor = now.replace(hour=PRE_MARKET_OPEN.hour, minute=PRE_MARKET_OPEN.minute, second=0, microsecond=0)
+    if now < anchor:
+        anchor -= timedelta(days=1)
+    return anchor
+
+
+# Share of a typical symbol's daily volume that trades in the 04:00-09:30
+# pre-market window. Gives pre-market a real elapsed curve instead of a flat
+# epsilon. Deliberately approximate -- the point is that 04:05 and 09:29 stop
+# being graded identically, not that this is precisely calibrated. Settable
+# from config (session.premarket_volume_share) via set_premarket_volume_share,
+# since config.yaml's own rule is that nothing thresholded is hard-coded.
+PREMARKET_VOLUME_SHARE = 0.10
+
+
+def set_premarket_volume_share(share: float) -> None:
+    """Overrides the pre-market volume share from config, once at startup."""
+    global PREMARKET_VOLUME_SHARE
+    PREMARKET_VOLUME_SHARE = share
+
+
+def session_elapsed_fraction(now: datetime | None = None) -> float:
+    """Fraction of a day's expected volume that should have traded by `now`.
+
+    Used to scale a 20-day average daily volume down to an
+    expected-volume-by-now baseline for relative volume.
+
+    Pre-market is modelled explicitly rather than clamped. The old version
+    returned a flat 0.01 for every minute from midnight through 09:33 ET,
+    which had two consequences: 04:05 and 09:29 were graded identically
+    (five and a half hours of accumulating volume treated as the same
+    elapsed time), and the resulting relative-volume number could not be
+    compared across times of day at all. With min_rel_volume: 5.0, that
+    meant "at least 5% of average daily volume" at 08:00 but "at least 192%"
+    at noon -- the same config number encoding two completely different
+    rules, and the most likely reason this bot traded almost exclusively
+    pre-market.
+
+    Accepts `now` in any timezone (or naive, treated as Eastern) and
+    normalizes to Eastern before comparing against session boundaries.
+    """
+    now = to_eastern(now) if now is not None else now_eastern()
+    premarket_start = now.replace(
+        hour=PRE_MARKET_OPEN.hour, minute=PRE_MARKET_OPEN.minute, second=0, microsecond=0
+    )
+    rth_start = now.replace(hour=RTH_OPEN.hour, minute=RTH_OPEN.minute, second=0, microsecond=0)
+    rth_end = now.replace(hour=RTH_CLOSE.hour, minute=RTH_CLOSE.minute, second=0, microsecond=0)
+
+    if now <= premarket_start:
+        return _MIN_ELAPSED_FRACTION
+    if now < rth_start:
+        # Pre-market: ramp linearly through PREMARKET_VOLUME_SHARE.
+        through = (now - premarket_start).total_seconds() / (rth_start - premarket_start).total_seconds()
+        return max(_MIN_ELAPSED_FRACTION, through * PREMARKET_VOLUME_SHARE)
+    if now >= rth_end:
         return 1.0
-    elapsed = (now - session_start).total_seconds()
-    total = (session_end - session_start).total_seconds()
-    return max(0.01, elapsed / total)
+    # Regular hours: the remaining share, spread across the RTH session.
+    through_rth = (now - rth_start).total_seconds() / (rth_end - rth_start).total_seconds()
+    return PREMARKET_VOLUME_SHARE + through_rth * (1.0 - PREMARKET_VOLUME_SHARE)
+
+
+# Floor, so relative volume can never divide by zero in the first seconds
+# after the pre-market open.
+_MIN_ELAPSED_FRACTION = 0.001
 
 
 def is_pre_market(now: datetime | None = None) -> bool:
@@ -69,5 +124,13 @@ def is_active_session(now: datetime | None = None) -> bool:
 
 
 def session_date_start(now: datetime | None = None) -> datetime:
-    now = now or now_eastern()
+    """Midnight ET on the current ET date.
+
+    The lone function here that did not normalise its argument to Eastern:
+    given a UTC datetime it returned midnight UTC, which after 19:00/20:00
+    ET is the WRONG DAY. Latent only because its sole caller passes no
+    argument -- but it feeds account_state's daily_realized_pnl, which arms
+    the daily-loss halt, so a future caller passing UTC would have moved
+    that boundary by 4-5 hours silently."""
+    now = to_eastern(now) if now is not None else now_eastern()
     return now.replace(hour=0, minute=0, second=0, microsecond=0)

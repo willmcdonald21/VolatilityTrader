@@ -133,6 +133,15 @@ strategies:
     target_r_multiple: 2.0
     min_breakout_candle_strength: 0.0
 
+session:
+  # Fraction of a typical day's volume that trades pre-market (04:00-09:30 ET).
+  # Relative volume is cumulative-volume / (avg_daily_volume * elapsed_fraction);
+  # before 2026-09-30 that elapsed fraction was a flat 0.01 for every minute
+  # before 09:33, so min_rel_volume: 5.0 meant ">=5% of ADV" at 08:00 but
+  # ">=192% of ADV" at noon -- one number, two different rules by the clock.
+  # Raise to loosen the pre-market gate, lower to tighten.
+  premarket_volume_share: 0.10
+
 news:
   enabled: true
   lookback_hours: 48          # how far back to check for a catalyst headline when a symbol is onboarded
