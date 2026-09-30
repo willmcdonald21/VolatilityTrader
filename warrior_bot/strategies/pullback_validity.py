@@ -20,6 +20,56 @@ class PullbackValidity:
     reason: str | None = None
 
 
+def _slice_start_index(ctx: SymbolContext, bars: list[Bar]) -> int | None:
+    """Where `bars` begins within `ctx.bars`.
+
+    Both callers pass slices of `ctx.bars`, so the Bar objects are identical
+    by identity. Scanned from the end because a pullback is by definition
+    recent. None means the caller synthesised its own bars (only tests do),
+    in which case the point-in-time lookups fall back to current values.
+    """
+    if not bars:
+        return None
+    first = bars[0]
+    for i in range(len(ctx.bars) - 1, -1, -1):
+        if ctx.bars[i] is first:
+            return i
+    return None
+
+
+def _trim_to_advance(up_move_bars: list[Bar]) -> list[Bar]:
+    """The actual advance, not the whole lookback window.
+
+    Callers hand over everything from the start of a 40-bar window up to the
+    peak, so on a symbol that chopped sideways for half an hour before a
+    three-bar rip, `up_move_bars` was ~37 bars of chop plus the advance. Two
+    consequences: has_rising_volume_on_advance was asked whether volume rose
+    across the chop (it hadn't, so a genuine advance got rejected), and the
+    "pullback volume lighter than the up-move" comparison was measured
+    against 40 bars of accumulated volume, which a 3-bar pullback can
+    essentially never exceed -- so that gate passed almost unconditionally.
+
+    The advance is the trailing run of strictly higher highs ending at the
+    peak. Not "everything after the window's lowest low": chop routinely
+    dips below the level the advance later starts from, which puts the
+    lowest low back in the chop and trims nothing. Not tolerant of a single
+    non-higher high either -- allowing one lets a flat stretch of equal
+    highs back in, and the failure mode of being strict is a SHORTER
+    advance, i.e. the volume trend is read off the freshest bars, which is
+    where the signal is anyway.
+    """
+    if len(up_move_bars) < 2:
+        return up_move_bars
+    start = len(up_move_bars) - 1
+    while start > 0 and up_move_bars[start - 1].high < up_move_bars[start].high:
+        start -= 1
+    advance = up_move_bars[start:]
+    # A one-bar "advance" carries no volume trend; keep the last two so the
+    # rising-volume check has something to compare and the aggregate volume
+    # comparison is not trivially small.
+    return advance if len(advance) >= 2 else up_move_bars[-2:]
+
+
 def validate_pullback(
     pullback_bars: list[Bar],
     up_move_bars: list[Bar],
@@ -56,6 +106,9 @@ def validate_pullback(
     if not pullback_bars or not up_move_bars:
         return PullbackValidity(True)
 
+    up_move_bars = _trim_to_advance(up_move_bars)
+    pullback_start = _slice_start_index(ctx, pullback_bars)
+
     pullback_volume = sum(b.volume for b in pullback_bars)
     up_move_volume = sum(b.volume for b in up_move_bars)
     if up_move_volume > 0 and pullback_volume >= up_move_volume:
@@ -77,20 +130,34 @@ def validate_pullback(
     if config.require_rising_volume_on_advance and not has_rising_volume_on_advance(up_move_bars):
         return PullbackValidity(False, "volume declining on the preceding advance")
 
-    pullback_low = min(b.low for b in pullback_bars)
+    # Both level checks below are evaluated AT EACH PULLBACK BAR's own
+    # moment, not against the current value. On a rising stock -- which
+    # every candidate here is -- VWAP and the 9 EMA are still climbing
+    # through the pullback, so comparing a bar that closed four minutes ago
+    # against the value as of now is systematically too strict: it rejected
+    # pullbacks that genuinely did hold the level when they printed. Where
+    # the point-in-time value is unavailable (too few bars for the EMA, or a
+    # caller that synthesised its own bars) the current value is used, which
+    # is the previous behaviour.
+    for offset, bar in enumerate(pullback_bars):
+        index = None if pullback_start is None else pullback_start + offset
 
-    vwap = ctx.vwap
-    if vwap is not None and pullback_low < vwap:
-        return PullbackValidity(False, "pullback broke below VWAP")
+        bar_vwap = ctx.vwap_at(index) if index is not None else None
+        if bar_vwap is None:
+            bar_vwap = ctx.vwap
+        if bar_vwap is not None and bar.low < bar_vwap:
+            return PullbackValidity(False, "pullback broke below VWAP")
 
-    ema_9 = ctx.ema_9
-    if ema_9 is not None and any(b.close < ema_9 for b in pullback_bars):
+        bar_ema_9 = ctx.ema_9_at(index) if index is not None else None
+        if bar_ema_9 is None:
+            bar_ema_9 = ctx.ema_9
         # Close-based, not low-based (unlike the VWAP check above): the
         # source material explicitly tolerates "a brief single-candle wick
         # below the 9 EMA that immediately reclaims it" as noise, not a
         # disqualifying break -- only a bar that actually *closes* below
         # the EMA counts as a real break.
-        return PullbackValidity(False, "pullback broke below 9 EMA")
+        if bar_ema_9 is not None and bar.close < bar_ema_9:
+            return PullbackValidity(False, "pullback broke below 9 EMA")
 
     # (9, 20) matches Ross Cameron's actual chart MACD setup (computed from
     # his 9/20 EMA pair), not the textbook (12, 26) default -- confirmed by
@@ -122,8 +189,10 @@ def validate_pullback(
                 macd_line, signal_line = five_min_macd
                 if macd_line <= signal_line:
                     return PullbackValidity(False, "5-minute MACD not bullish (multi-timeframe veto)")
-        if config.reject_5m_topping_tail and five_min_bars:
-            if is_topping_tail(five_min_bars[-1], wick_ratio=config.topping_tail_wick_ratio):
+        if config.reject_5m_topping_tail:
+            # The last COMPLETE bucket -- see resample_bars' drop_partial.
+            complete = resample_bars(ctx.bars, bucket_minutes=5, drop_partial=True)
+            if complete and is_topping_tail(complete[-1], wick_ratio=config.topping_tail_wick_ratio):
                 return PullbackValidity(False, "5-minute topping tail (multi-timeframe veto)")
 
     return PullbackValidity(True)
