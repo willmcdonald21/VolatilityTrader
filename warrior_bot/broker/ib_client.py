@@ -37,10 +37,17 @@ class IBClient:
     # reached Discord before -- combined with replacement stops having had
     # no status listener, a rejected protective stop was invisible on every
     # channel until the reconciliation watchdog happened to notice.
+    #
+    # 202 ("Order Cancelled") is deliberately NOT here. It was, briefly, and
+    # that was a mistake: this bot cancels orders constantly by design --
+    # every breakeven move, every stop resize, every flatten -- so it fired
+    # 13 kill_switch alerts for entirely routine cancels in two days of
+    # light trading, and would scale with activity. An unexpected
+    # cancellation still surfaces via the reconciliation watchdog, which
+    # checks actual protection rather than intent.
     _ORDER_REJECTION_CODES = {
         110,  # price does not conform to the minimum price variation
         201,  # order rejected (margin, compliance, etc.)
-        202,  # order cancelled
         203,  # security not available/allowed
         321,  # server error validating the request
         404,  # shares not available (locate)

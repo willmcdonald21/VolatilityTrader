@@ -20,7 +20,7 @@ from warrior_bot.notify.discord import (
     validate_configured_channels,
 )
 from warrior_bot.persistence.db import get_connection
-from warrior_bot.persistence.journal import Journal
+from warrior_bot.persistence.journal import Journal, _iso
 from warrior_bot.risk.account_state import AccountState
 from warrior_bot.risk.risk_manager import RiskManager
 from warrior_bot.scanner.catalyst import classify_headlines
@@ -43,6 +43,20 @@ logger = logging.getLogger("warrior_bot.main")
 
 def _bar_from_ib(b) -> Bar:
     return Bar(time=b.date, open=b.open, high=b.high, low=b.low, close=b.close, volume=b.volume)
+
+
+def _split_exec_id(exec_id: str | None, row_id: int, row_count: int) -> str | None:
+    """A distinct-but-deterministic exec_id for a split flatten fill.
+
+    IBKR reports ONE execution, but a flatten covering a symbol with two
+    lots is journaled as one row per lot -- and fills.exec_id is UNIQUE, so
+    the second row would be silently dropped by INSERT OR IGNORE. Suffixing
+    with the order row keeps each part unique while staying deterministic,
+    so a re-delivered execution still dedups to the same rows rather than
+    doubling the exit. A single, unsplit row keeps the raw id."""
+    if exec_id is None or row_count <= 1:
+        return exec_id
+    return f"{exec_id}#{row_id}"
 
 
 class WarriorBot:
@@ -87,6 +101,7 @@ class WarriorBot:
         self._last_productive_at: datetime | None = None
         self._idle_alert_sent = False
         self._signals_today = 0
+        self._last_equity_snapshot_at: datetime | None = None
         self.ib.connectedEvent += self._on_connected
 
         conn = get_connection(config.resolve_path(config.journal.db_path))
@@ -583,12 +598,34 @@ class WarriorBot:
             try:
                 self._check_new_trading_day()
                 self._check_flatten_triggers()
+                self._maybe_record_equity()
                 self.position_manager.cancel_stale_entries(
                     self.config.risk.entry_fill_timeout_seconds
                 )
             except Exception:
                 self.logger.exception("Risk loop iteration failed")
             await asyncio.sleep(self.config.exits.risk_loop_interval_seconds)
+
+    # account_snapshots was written exactly once, in start() -- 46 rows in
+    # six weeks, one per process restart. There was therefore no equity
+    # curve at all: no max drawdown, no time-to-recovery, no intraday
+    # excursion, and no independent check on the fill-reconstructed P&L.
+    # Once a minute (rather than every 15s risk tick) is ample resolution
+    # and matches the heartbeat cadence.
+    EQUITY_SNAPSHOT_INTERVAL_SECONDS = 60.0
+
+    def _maybe_record_equity(self) -> None:
+        now = datetime.now(timezone.utc)
+        if (
+            self._last_equity_snapshot_at is not None
+            and (now - self._last_equity_snapshot_at).total_seconds() < self.EQUITY_SNAPSHOT_INTERVAL_SECONDS
+        ):
+            return
+        snapshot = self.account_state.snapshot()
+        if snapshot.net_liquidation is None:
+            return  # nothing worth recording; see AccountState._account_value
+        self._last_equity_snapshot_at = now
+        self.journal.record_account_snapshot(snapshot)
 
     def _check_new_trading_day(self) -> None:
         """Runs reset_daily_state() the first time this loop notices the ET
@@ -704,42 +741,69 @@ class WarriorBot:
         watchdog already found completely orphaned."""
         lots = self.position_manager.lots_for_symbol(symbol)
         total_qty = sum(lot.remaining_qty for lot in lots)
-        if not lots or total_qty <= 0:
+
+        if lots and total_qty > 0:
+            # Attributable: split proportionally across this symbol's lots.
+            row_shares = [
+                (
+                    self.journal.record_order(
+                        signal_id=lot.signal_id,
+                        symbol=symbol,
+                        ib_order_id=order.orderId,
+                        role="emergency_flatten",
+                        action=order.action,
+                        qty=round(order.totalQuantity * (lot.remaining_qty / total_qty), 4),
+                        order_type=order.orderType,
+                        limit_price=getattr(order, "lmtPrice", None),
+                        stop_price=None,
+                        oca_group=None,
+                        status=trade.orderStatus.status,
+                    ),
+                    lot.remaining_qty / total_qty,
+                )
+                for lot in lots
+            ]
+        else:
+            # Unattributable, and recorded anyway. This branch used to
+            # `return`, because orders.signal_id was NOT NULL and there was
+            # no signal to point at -- which is the single biggest reason
+            # only ~45% of traded notional had a journaled exit, and why
+            # there were 2 emergency_flatten rows in six weeks. The shares
+            # genuinely left the account; the row belongs in the journal
+            # with signal_id NULL and the symbol carrying the attribution.
             self.logger.warning(
-                "Flatten fill for %s has no tracked lot to journal against -- its exit won't appear in dashboard P&L",
+                "Flatten fill for %s has no tracked lot -- journaling it against the symbol "
+                "with no signal attribution",
                 symbol,
             )
-            return
-
-        row_shares = [
-            (
-                self.journal.record_order(
-                    signal_id=lot.signal_id,
-                    ib_order_id=order.orderId,
-                    role="emergency_flatten",
-                    action=order.action,
-                    qty=round(order.totalQuantity * (lot.remaining_qty / total_qty), 4),
-                    order_type=order.orderType,
-                    limit_price=getattr(order, "lmtPrice", None),
-                    stop_price=None,
-                    oca_group=None,
-                    status=trade.orderStatus.status,
-                ),
-                lot.remaining_qty / total_qty,
-            )
-            for lot in lots
-        ]
+            row_shares = [
+                (
+                    self.journal.record_order(
+                        signal_id=None,
+                        symbol=symbol,
+                        ib_order_id=order.orderId,
+                        role="emergency_flatten",
+                        action=order.action,
+                        qty=order.totalQuantity,
+                        order_type=order.orderType,
+                        limit_price=getattr(order, "lmtPrice", None),
+                        stop_price=None,
+                        oca_group=None,
+                        status=trade.orderStatus.status,
+                    ),
+                    1.0,
+                )
+            ]
 
         def on_fill(t, fill) -> None:
-            commission = fill.commissionReport.commission if fill.commissionReport is not None else None
             for row_id, share in row_shares:
                 self.journal.record_fill(
                     order_row_id=row_id,
                     ib_order_id=order.orderId,
                     fill_qty=fill.execution.shares * share,
                     fill_price=fill.execution.price,
-                    commission=commission * share if commission is not None else None,
-                    realized_pnl=None,
+                    exec_id=_split_exec_id(getattr(fill.execution, "execId", None), row_id, len(row_shares)),
+                    exec_ts=_iso(getattr(fill.execution, "time", None)),
                 )
 
         trade.fillEvent += on_fill

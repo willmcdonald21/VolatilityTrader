@@ -759,7 +759,12 @@ def test_reconciliation_flattens_naked_short_regardless_of_resting_orders(tmp_pa
     bot.ib.positions = lambda: [_FakePosition("NRXS", -850.0)]
     bot.ib.openTrades = lambda: [_FakeTrade("NRXS", "BUY", "STP LMT", 850.0)]
     placed = []
-    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    def _place(contract, order):
+        placed.append((contract, order))
+        return _fake_placed_trade(action=order.action, totalQuantity=order.totalQuantity)[0]
+
+    bot.ib.placeOrder = _place
 
     bot._check_position_reconciliation()
 
@@ -776,7 +781,12 @@ def test_reconciliation_flattens_long_position_with_no_resting_stop(tmp_path, mo
     bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
     bot.ib.openTrades = lambda: []  # nothing resting at all
     placed = []
-    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    def _place(contract, order):
+        placed.append((contract, order))
+        return _fake_placed_trade(action=order.action, totalQuantity=order.totalQuantity)[0]
+
+    bot.ib.placeOrder = _place
 
     bot._check_position_reconciliation()
 
@@ -793,7 +803,12 @@ def test_reconciliation_leaves_protected_long_position_alone(tmp_path, monkeypat
     bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
     bot.ib.openTrades = lambda: [_FakeTrade("UCAR", "SELL", "STP LMT", 770.0)]
     placed = []
-    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    def _place(contract, order):
+        placed.append((contract, order))
+        return _fake_placed_trade(action=order.action, totalQuantity=order.totalQuantity)[0]
+
+    bot.ib.placeOrder = _place
 
     bot._check_position_reconciliation()
 
@@ -808,7 +823,12 @@ def test_reconciliation_treats_take_profit_limit_order_as_no_protection(tmp_path
     bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
     bot.ib.openTrades = lambda: [_FakeTrade("UCAR", "SELL", "LMT", 770.0)]
     placed = []
-    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    def _place(contract, order):
+        placed.append((contract, order))
+        return _fake_placed_trade(action=order.action, totalQuantity=order.totalQuantity)[0]
+
+    bot.ib.placeOrder = _place
 
     bot._check_position_reconciliation()
 
@@ -824,7 +844,12 @@ def test_reconciliation_sums_partial_stop_coverage_across_multiple_orders(tmp_pa
         _FakeTrade("UCAR", "SELL", "STP", 370.0),  # 400+370=770, exactly covers it
     ]
     placed = []
-    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    def _place(contract, order):
+        placed.append((contract, order))
+        return _fake_placed_trade(action=order.action, totalQuantity=order.totalQuantity)[0]
+
+    bot.ib.placeOrder = _place
 
     bot._check_position_reconciliation()
 
@@ -900,7 +925,15 @@ def test_journal_flatten_fill_splits_proportionally_across_two_lots(tmp_path, mo
     assert fills_b[0]["order_qty"] == 700.0
 
 
-def test_journal_flatten_fill_splits_commission_proportionally(tmp_path, monkeypatch):
+def test_journal_flatten_fill_splits_a_shared_execution_across_lots(tmp_path, monkeypatch):
+    # One IBKR execution, two lots -> two rows. fills.exec_id is UNIQUE, so
+    # each part needs a distinct-but-deterministic id or INSERT OR IGNORE
+    # would silently drop the second (see _split_exec_id).
+    #
+    # Commission is no longer asserted here: ib_async emits fillEvent with an
+    # empty CommissionReport and sends the real numbers separately, so
+    # reading it at fill time always recorded 0.0. It now arrives via
+    # OrderManager._on_commission_report.
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
     lot_a = _fake_lot(bot, "UCAR", remaining_qty=250.0)  # 25%
@@ -912,25 +945,52 @@ def test_journal_flatten_fill_splits_commission_proportionally(tmp_path, monkeyp
     trade.fillEvent.emit(
         trade,
         SimpleNamespace(
-            execution=SimpleNamespace(shares=1000.0, price=2.0),
-            commissionReport=SimpleNamespace(commission=4.0, realizedPNL=None),
+            execution=SimpleNamespace(shares=1000.0, price=2.0, execId="exec-shared", time=None),
+            commissionReport=None,
         ),
     )
 
     fills_a = _fetch_fills_for_signal(bot, lot_a.signal_id)
     fills_b = _fetch_fills_for_signal(bot, lot_b.signal_id)
-    assert fills_a[0]["commission"] == 1.0
-    assert fills_b[0]["commission"] == 3.0
+    assert fills_a[0]["fill_qty"] == 250.0
+    assert fills_b[0]["fill_qty"] == 750.0
+    exec_ids = {
+        r[0]
+        for r in bot.journal.conn.execute("SELECT exec_id FROM fills WHERE exec_id IS NOT NULL")
+    }
+    assert len(exec_ids) == 2  # both parts survived the UNIQUE index
+    assert all(e.startswith("exec-shared#") for e in exec_ids)
 
 
-def test_journal_flatten_fill_skips_when_no_tracked_lot(tmp_path, monkeypatch):
+def test_unattributable_flatten_is_journaled_against_the_symbol(tmp_path, monkeypatch):
+    # THE Round 2 fix. This used to `return` without writing anything,
+    # because orders.signal_id was NOT NULL and there was no signal to point
+    # at -- the single biggest reason only ~45% of traded notional had a
+    # journaled exit, and why there were 2 emergency_flatten rows in six
+    # weeks. The shares genuinely left the account; the row belongs in the
+    # journal with signal_id NULL and the symbol carrying attribution.
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
-    trade, order = _fake_placed_trade()
+    trade, order = _fake_placed_trade(action="SELL", totalQuantity=500.0)
 
-    bot._journal_flatten_fill("GHOST", trade, order)  # nothing tracked for GHOST -- must not raise
+    bot._journal_flatten_fill("GHOST", trade, order)
+    trade.fillEvent.emit(
+        trade,
+        SimpleNamespace(
+            execution=SimpleNamespace(shares=500.0, price=3.0, execId="exec-ghost", time=None),
+            commissionReport=None,
+        ),
+    )
 
-    assert bot.journal.conn.execute("SELECT count(*) FROM orders").fetchone()[0] == 0
+    rows = bot.journal.conn.execute(
+        "SELECT signal_id, symbol, role FROM orders WHERE symbol = 'GHOST'"
+    ).fetchall()
+    assert rows == [(None, "GHOST", "emergency_flatten")]
+    fills = bot.journal.conn.execute(
+        "SELECT f.fill_qty, f.fill_price FROM fills f JOIN orders o ON o.id = f.order_id "
+        "WHERE o.symbol = 'GHOST'"
+    ).fetchall()
+    assert fills == [(500.0, 3.0)]
 
 
 def test_journal_flatten_fill_wired_through_emergency_flatten_end_to_end(tmp_path, monkeypatch):
@@ -1274,7 +1334,12 @@ def test_triggered_but_unfilled_stop_limit_no_longer_counts_as_protection(tmp_pa
     bot.ib.positions = lambda: [_FakePosition("GAPR", 100.0)]
     bot.ib.openTrades = lambda: [_stranded_stop_trade()]
     placed = []
-    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    def _place(contract, order):
+        placed.append((contract, order))
+        return _fake_placed_trade(action=order.action, totalQuantity=order.totalQuantity)[0]
+
+    bot.ib.placeOrder = _place
 
     bot._check_position_reconciliation()
 
@@ -1289,7 +1354,12 @@ def test_stop_limit_sitting_near_its_trigger_still_counts_as_protection(tmp_path
     bot.ib.positions = lambda: [_FakePosition("CALM", 100.0)]
     bot.ib.openTrades = lambda: [_stranded_stop_trade(symbol="CALM")]
     placed = []
-    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    def _place(contract, order):
+        placed.append((contract, order))
+        return _fake_placed_trade(action=order.action, totalQuantity=order.totalQuantity)[0]
+
+    bot.ib.placeOrder = _place
 
     bot._check_position_reconciliation()
 
@@ -1304,7 +1374,12 @@ def test_stranded_check_is_skipped_without_a_price_reference(tmp_path, monkeypat
     bot.ib.positions = lambda: [_FakePosition("NOCTX", 100.0)]
     bot.ib.openTrades = lambda: [_stranded_stop_trade(symbol="NOCTX")]
     placed = []
-    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    def _place(contract, order):
+        placed.append((contract, order))
+        return _fake_placed_trade(action=order.action, totalQuantity=order.totalQuantity)[0]
+
+    bot.ib.placeOrder = _place
 
     bot._check_position_reconciliation()
 
@@ -1547,3 +1622,51 @@ def test_no_idle_alert_while_disconnected(tmp_path, monkeypatch):
 
     assert alerts == []
     assert _heartbeat_rows(bot)[0]["connected"] == 0  # still recorded
+
+
+# -- Round 2: equity curve --
+
+
+def test_equity_is_snapshotted_from_the_risk_loop(tmp_path, monkeypatch):
+    # account_snapshots was written exactly once, in start() -- 46 rows in
+    # six weeks, one per restart. No equity curve meant no drawdown, no
+    # intraday excursion, and no independent check on fill-derived P&L.
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.account_state.snapshot = lambda: _fake_snapshot()
+
+    bot._maybe_record_equity()
+
+    rows = bot.journal.conn.execute("SELECT count(*) FROM account_snapshots").fetchone()[0]
+    assert rows == 1
+
+
+def test_equity_snapshot_is_throttled(tmp_path, monkeypatch):
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.account_state.snapshot = lambda: _fake_snapshot()
+
+    bot._maybe_record_equity()
+    bot._maybe_record_equity()  # immediately again -- must not double-write
+
+    assert bot.journal.conn.execute("SELECT count(*) FROM account_snapshots").fetchone()[0] == 1
+
+    bot._last_equity_snapshot_at = datetime.now(timezone.utc) - timedelta(seconds=120)
+    bot._maybe_record_equity()
+    assert bot.journal.conn.execute("SELECT count(*) FROM account_snapshots").fetchone()[0] == 2
+
+
+def test_equity_snapshot_skipped_when_account_values_are_missing(tmp_path, monkeypatch):
+    # A post-reconnect empty accountValues must not be recorded as a real
+    # equity reading -- that is the same class of bug as the zero-equity
+    # halt fixed in Round 1.
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.account_state.snapshot = lambda: AccountSnapshot(
+        net_liquidation=None, available_funds=None, buying_power=None,
+        open_positions_count=0, daily_realized_pnl=0.0,
+    )
+
+    bot._maybe_record_equity()
+
+    assert bot.journal.conn.execute("SELECT count(*) FROM account_snapshots").fetchone()[0] == 0

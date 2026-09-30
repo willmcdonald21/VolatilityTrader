@@ -11,7 +11,7 @@ from ib_async import IB, Contract, Order, StopLimitOrder, StopOrder, Trade
 from warrior_bot.config import ExitsConfig, NotificationsConfig
 from warrior_bot.logging_setup import alert
 from warrior_bot.notify.discord import build_pnl_message, send_discord_message
-from warrior_bot.persistence.journal import Journal
+from warrior_bot.persistence.journal import Journal, _iso
 from warrior_bot.risk.account_state import AccountState
 from warrior_bot.signals.signal import Signal
 from warrior_bot.strategies.base_strategy import SymbolContext
@@ -671,19 +671,72 @@ class PositionManager:
         # stayed disabled in config until now (docs/strategy_decisions.md,
         # "Deferred: marketable-limit conversion...") -- the signals
         # themselves were never in question, only this order-placement gap.
-        # Note: unlike a normal stop-loss fill, this fill is not journaled
-        # to data/journal.sqlite3 (flatten_position's order isn't any of
-        # this lot's own tracked orders, so there's no correct existing row
-        # to attribute it to) -- same follow-up gap main.py's
-        # _journal_flatten_fill closed for the account-wide emergency/EOD
-        # flatten path, not yet done here.
-        flatten_position(self.ib, SimpleNamespace(contract=pos.contract, position=pos.remaining_qty), channel="limits")
+        # The exit IS journaled now. Until 2026-09-30 this passed no
+        # on_order_placed hook at all, so a reversal exit produced no orders
+        # row and no fills row -- the trade stayed "open, $0 realized"
+        # forever in dashboard_report.py and was silently dropped entirely by
+        # win_rate_analysis.py. Confirmed live: LABT (2026-09-28) plus BKYI,
+        # CNTB and VBIO this week all read as open positions after they had
+        # demonstrably been flattened. Pointedly, reversal_exit was enabled
+        # to attack the 120min+ duration bucket, and every trade it produced
+        # was invisible to the duration report.
+        flatten_position(
+            self.ib,
+            SimpleNamespace(contract=pos.contract, position=pos.remaining_qty),
+            channel="limits",
+            on_order_placed=lambda symbol, trade, order: self._journal_reversal_exit_fill(
+                symbol, trade, order, signal_id=pos.signal_id
+            ),
+        )
         reason_str = ",".join(reasons)
         logger.warning("Reversal exit for %s: %s (qty=%d)", pos.symbol, reason_str, pos.remaining_qty)
         self.journal.record_kill_switch_event(
             triggered_by=f"reversal_exit:{pos.symbol}:{reason_str}", action_taken="market_exit_position"
         )
         self._untrack(pos)
+
+    def _journal_reversal_exit_fill(
+        self, symbol: str, trade: Trade, order: Order, signal_id: int | None = None
+    ) -> None:
+        """Records a reversal exit's order and fill against its own lot.
+
+        Simpler than main._journal_flatten_fill's proportional split: a
+        reversal exit is issued for one specific lot, so the signal_id is
+        known and there is nothing to apportion. It is passed in rather than
+        looked up, because the caller untracks the lot immediately after --
+        a lookup here would race that and silently lose the attribution."""
+        try:
+            row_id = self.journal.record_order(
+                signal_id=signal_id,
+                symbol=symbol,
+                ib_order_id=order.orderId,
+                role="reversal_exit",
+                action=order.action,
+                qty=order.totalQuantity,
+                order_type=order.orderType,
+                limit_price=getattr(order, "lmtPrice", None),
+                stop_price=None,
+                oca_group=None,
+                status=trade.orderStatus.status,
+            )
+        except Exception:
+            logger.exception("Could not journal reversal-exit order for %s", symbol)
+            return
+
+        def on_fill(t: Trade, fill) -> None:
+            try:
+                self.journal.record_fill(
+                    order_row_id=row_id,
+                    ib_order_id=order.orderId,
+                    fill_qty=fill.execution.shares,
+                    fill_price=fill.execution.price,
+                    exec_id=getattr(fill.execution, "execId", None),
+                    exec_ts=_iso(getattr(fill.execution, "time", None)),
+                )
+            except Exception:
+                logger.exception("Could not journal reversal-exit fill for %s", symbol)
+
+        trade.fillEvent += on_fill
 
     def _schedule_stop_resize(self, pos: ManagedPosition) -> None:
         """Debounced entry point for quantity-only stop resizes (fill-driven,
@@ -817,6 +870,7 @@ class PositionManager:
 
         new_row_id = self.journal.record_order(
             signal_id=pos.signal_id,
+            symbol=pos.symbol,
             ib_order_id=new_order.orderId,
             role="stop",
             action=new_order.action,
@@ -916,21 +970,17 @@ class PositionManager:
         # current row only for callers that predate the binding.
         target_row_id = row_id if row_id is not None else pos.stop_row_id
         if journal_fill:
-            commission = None
-            realized_pnl = None
-            if fill.commissionReport is not None:
-                commission = fill.commissionReport.commission
-                # UNSET_DOUBLE sentinel on the opening leg of a round trip; see account_state.py
-                pnl = fill.commissionReport.realizedPNL
-                if pnl is not None and abs(pnl) < 1e15:
-                    realized_pnl = pnl
+            # commission/realized_pnl deliberately omitted: ib_async emits
+            # fillEvent with an empty CommissionReport and sends the real
+            # values separately, keyed on execId. They arrive on the row via
+            # OrderManager._on_commission_report.
             self.journal.record_fill(
                 order_row_id=target_row_id,
                 ib_order_id=trade.order.orderId,
                 fill_qty=fill.execution.shares,
                 fill_price=fill.execution.price,
-                commission=commission,
-                realized_pnl=realized_pnl,
+                exec_id=getattr(fill.execution, "execId", None),
+                exec_ts=_iso(getattr(fill.execution, "time", None)),
             )
             # journal_fill=True means this stop was cancel-and-replaced at
             # least once (breakeven/trailing) -- track()'s ORIGINAL stop is
@@ -942,13 +992,13 @@ class PositionManager:
             # already moved to breakeven or was trailing (i.e. most winning
             # or scratched trades) was silently invisible in trade_activity,
             # journaled but never notified.
-            self._notify_stop_fill(pos, fill, commission)
+            self._notify_stop_fill(pos, fill)
 
         self._apply_exit_fill(pos, fill.execution.shares)
         if pos.remaining_qty <= 0:
             self._close_out(pos, cancel_stop=False, cancel_target=True)
 
-    def _notify_stop_fill(self, pos: ManagedPosition, fill, commission: float | None) -> None:
+    def _notify_stop_fill(self, pos: ManagedPosition, fill) -> None:
         """trade_activity line + pnl channel message for a fill on a
         replaced stop -- same message shapes and same (exit - entry) *
         shares P&L computation OrderManager.on_fill already uses for every
@@ -958,8 +1008,10 @@ class PositionManager:
         sent the trade_activity line (2026-09-23 fix) -- the pnl channel
         stayed just as silent on a replaced stop's fill as it was before
         that fix, since nothing here ever called build_pnl_message."""
-        commission_cost = commission if commission is not None and abs(commission) < 1e15 else 0.0
-        trade_pnl = (fill.execution.price - pos.signal.entry_price) * fill.execution.shares - commission_cost
+        # Gross of commission -- it is not known at fill time (see
+        # record_fill), and the net figure lands on the journal row shortly
+        # after via OrderManager._on_commission_report.
+        trade_pnl = (fill.execution.price - pos.signal.entry_price) * fill.execution.shares
 
         if self.notifications_config.enabled and self.notifications_config.notify_on_fill:
             send_discord_message(

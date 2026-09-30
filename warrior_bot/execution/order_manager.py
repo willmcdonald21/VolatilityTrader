@@ -15,7 +15,7 @@ from warrior_bot.notify.discord import (
     send_discord_embed,
     send_discord_message,
 )
-from warrior_bot.persistence.journal import Journal
+from warrior_bot.persistence.journal import Journal, _iso
 from warrior_bot.risk.account_state import AccountState
 from warrior_bot.signals.signal import Signal
 from warrior_bot.utils.rounding import round_to_tick
@@ -69,6 +69,15 @@ class OrderManager:
         # mislabeled Discord message, not a wrong trade.
         self.trading_mode = trading_mode
         self._order_row_ids: dict[int, int] = {}  # ib order id -> journal orders.id
+        # The ONLY place real commissions can be captured. ib_async emits
+        # fillEvent with an empty CommissionReport and sends the actual
+        # numbers separately, keyed on execId -- so every commission in six
+        # weeks of journal was 0.00, and would be in live trading too.
+        # Subscribed once here rather than per-trade so it also catches
+        # reports for orders whose Trade object was replaced by a reconnect.
+        # Guarded: several tests construct this with a stub (or no) IB.
+        if getattr(ib, "commissionReportEvent", None) is not None:
+            self.ib.commissionReportEvent += self._on_commission_report
         # signal_id -> accumulator for the trade_activity_summary embed (see
         # _accumulate_entry_fill/_send_entry_summary). Kept around (not
         # popped) after a summary is sent so a later pyramid add-on on the
@@ -108,6 +117,7 @@ class OrderManager:
             role = role_by_order_id[order.orderId]
             row_id = self.journal.record_order(
                 signal_id=signal_id,
+                symbol=signal.symbol,
                 ib_order_id=order.orderId,
                 role=role,
                 action=order.action,
@@ -148,6 +158,25 @@ class OrderManager:
             target_roles=bracket.target_roles,
         )
         return bracket
+
+    def _on_commission_report(self, trade: Trade, fill, report) -> None:
+        """Backfills a fill row's commission and realized P&L.
+
+        ib_async's wrapper already normalises UNSET_DOUBLE to 0.0 on this
+        path, so the values are usable as-is. A report for a fill this
+        process never journaled (an order from before a restart) simply
+        matches nothing -- logged at debug, not an error."""
+        exec_id = getattr(getattr(fill, "execution", None), "execId", None)
+        if not exec_id:
+            return
+        try:
+            commission = getattr(report, "commission", None)
+            realized_pnl = getattr(report, "realizedPNL", None)
+            updated = self.journal.update_fill_commission(exec_id, commission, realized_pnl)
+            if not updated:
+                logger.debug("Commission report for an unjournaled fill (execId=%s)", exec_id)
+        except Exception:
+            logger.exception("Failed to record commission for execId=%s", exec_id)
 
     def _profit_tier_specs(self, signal: Signal, quantity: int) -> list[tuple[int, float]]:
         """(qty, price) per configured profit tier, each qty a floor of `pct`
@@ -191,21 +220,22 @@ class OrderManager:
             self.journal.update_order_status(row_id, t.orderStatus.status)
 
         def on_fill(t: Trade, fill) -> None:
-            realized_pnl = None
-            commission = None
-            if fill.commissionReport is not None:
-                commission = fill.commissionReport.commission
-                # UNSET_DOUBLE sentinel on the opening leg of a round trip; see account_state.py
-                pnl = fill.commissionReport.realizedPNL
-                if pnl is not None and abs(pnl) < 1e15:
-                    realized_pnl = pnl
+            # commission/realized_pnl are deliberately NOT read here.
+            # ib_async's wrapper.execDetails emits fillEvent immediately with
+            # an EMPTY CommissionReport (defaults commission=0.0,
+            # realizedPNL=0.0) and only populates it when the separate
+            # commissionReport message arrives moments later. Reading it
+            # synchronously therefore always recorded 0.0 -- every one of the
+            # 3,925 fills in the journal -- live or paper. The real values
+            # land via ib.commissionReportEvent, keyed on execId (see
+            # OrderManager._on_commission_report).
             self.journal.record_fill(
                 order_row_id=row_id,
                 ib_order_id=trade.order.orderId,
                 fill_qty=fill.execution.shares,
                 fill_price=fill.execution.price,
-                commission=commission,
-                realized_pnl=realized_pnl,
+                exec_id=fill.execution.execId,
+                exec_ts=_iso(fill.execution.time),
             )
             # Not realized_pnl (above): IBKR's paper simulator reports
             # commissionReport.realizedPNL as ~0.0 on every genuine closing
@@ -221,10 +251,13 @@ class OrderManager:
             # signal that opened it), not a symbol-wide blend, so an add-on
             # lot's trim/stop is priced against its own cost, not the
             # other lot's -- correct even with two lots open at once.
+            # Gross of commission: the real figure isn't known yet at fill
+            # time (see above), and it lands on the journal row shortly
+            # after via the commissionReportEvent hook. Subtracting the
+            # always-zero placeholder here only made it look accounted for.
             trade_pnl = None
             if role != "parent" and entry_price is not None:
-                commission_cost = commission if commission is not None and abs(commission) < 1e15 else 0.0
-                trade_pnl = (fill.execution.price - entry_price) * fill.execution.shares - commission_cost
+                trade_pnl = (fill.execution.price - entry_price) * fill.execution.shares
             if self.notifications_config.enabled and self.notifications_config.notify_on_fill:
                 label = _FILL_LABELS.get(role, "SELL")
                 pnl_str = f" (P&L ${trade_pnl:.2f})" if trade_pnl is not None else ""

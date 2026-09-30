@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -107,7 +108,17 @@ class FakeJournal:
     def update_order_status(self, row_id, status):
         pass
 
-    def record_fill(self, order_row_id, ib_order_id, fill_qty, fill_price, commission, realized_pnl):
+    def record_fill(
+        self,
+        order_row_id,
+        ib_order_id,
+        fill_qty,
+        fill_price,
+        commission=None,
+        realized_pnl=None,
+        exec_id=None,
+        exec_ts=None,
+    ):
         self.fills.append(
             {
                 "order_row_id": order_row_id,
@@ -115,8 +126,15 @@ class FakeJournal:
                 "fill_price": fill_price,
                 "commission": commission,
                 "realized_pnl": realized_pnl,
+                "exec_id": exec_id,
+                "exec_ts": exec_ts,
             }
         )
+
+    def update_fill_commission(self, exec_id, commission, realized_pnl):
+        self.commission_updates = getattr(self, "commission_updates", [])
+        self.commission_updates.append((exec_id, commission, realized_pnl))
+        return True
 
 
 class FakeAccountState:
@@ -127,13 +145,31 @@ class FakeAccountState:
         return self._snapshot
 
 
-def make_fill(shares=100, price=10.0, commission=None, realized_pnl=None):
+_exec_seq = itertools.count(1)
+
+
+def make_fill(shares=100, price=10.0, commission=None, realized_pnl=None, exec_id=None, exec_time=None):
+    """Mirrors ib_async's Fill closely enough to matter.
+
+    execId and execution.time are REQUIRED shape now, not optional detail:
+    exec_id is the dedup key the journal's UNIQUE index relies on, and
+    exec_ts is what duration is measured from. A fake missing them would let
+    a regression in either pass unnoticed. Each fill gets a distinct execId
+    by default, matching IBKR (they are globally unique)."""
     commission_report = None
     if commission is not None or realized_pnl is not None:
         commission_report = SimpleNamespace(
             commission=commission if commission is not None else 1.0, realizedPNL=realized_pnl
         )
-    return SimpleNamespace(execution=SimpleNamespace(shares=shares, price=price), commissionReport=commission_report)
+    return SimpleNamespace(
+        execution=SimpleNamespace(
+            shares=shares,
+            price=price,
+            execId=exec_id if exec_id is not None else f"exec-{next(_exec_seq)}",
+            time=exec_time if exec_time is not None else datetime.now(timezone.utc),
+        ),
+        commissionReport=commission_report,
+    )
 
 
 def make_order_manager(
@@ -204,7 +240,13 @@ def test_full_exit_fill_labeled_sell_with_pnl(monkeypatch):
     # commissionReport.realizedPNL (114.0 here) must NOT drive the message --
     # see test_pnl_message_ignores_brokers_realized_pnl_field below for the
     # regression this guards against. The P&L shown is computed from
-    # entry_price vs. the fill, net of commission: (6.08 - 5.0) * 100 - 1.0.
+    # entry_price vs. the fill and is GROSS of commission: (6.08 - 5.0) * 100.
+    # Commission is genuinely unknown at fill time -- ib_async emits
+    # fillEvent with an empty CommissionReport and sends the real numbers
+    # separately (see OrderManager._on_commission_report), so the old
+    # `- commission` only ever subtracted a placeholder zero in production
+    # while looking accounted for. The authoritative net figure lands on the
+    # journal row shortly after via that hook.
     om = make_order_manager(daily_realized_pnl=340.5)
     sent = _capture_sends(monkeypatch, om)
     trade = FakeTrade(FakeOrder(action="SELL"))
@@ -213,10 +255,10 @@ def test_full_exit_fill_labeled_sell_with_pnl(monkeypatch):
     trade.fillEvent.emit(trade, make_fill(shares=100, price=6.08, commission=1.0, realized_pnl=114.0))
 
     trade_activity = _by_channel(sent, "trade_activity")
-    assert "SELL AAPL 100 @ $6.08 (P&L $107.00)" in trade_activity[0]
+    assert "SELL AAPL 100 @ $6.08 (P&L $108.00)" in trade_activity[0]
 
     pnl_messages = _by_channel(sent, "pnl")
-    assert pnl_messages == ["📈 AAPL: +$107.00\n📈 Daily P&L: +$340.50"]
+    assert pnl_messages == ["📈 AAPL: +$108.00\n📈 Daily P&L: +$340.50"]
 
 
 def test_pnl_message_ignores_brokers_realized_pnl_field(monkeypatch):
@@ -235,9 +277,9 @@ def test_pnl_message_ignores_brokers_realized_pnl_field(monkeypatch):
     trade.fillEvent.emit(trade, make_fill(shares=100, price=4.5, commission=1.0, realized_pnl=0.0))
 
     trade_activity = _by_channel(sent, "trade_activity")
-    assert "(P&L $-51.00)" in trade_activity[0]
+    assert "(P&L $-50.00)" in trade_activity[0]  # gross; see the target-fill test above
     pnl_messages = _by_channel(sent, "pnl")
-    assert pnl_messages[0].startswith("📉 AAPL: -$51.00")
+    assert pnl_messages[0].startswith("📉 AAPL: -$50.00")
 
 
 def test_stop_exit_fill_also_labeled_sell(monkeypatch):
@@ -251,7 +293,7 @@ def test_stop_exit_fill_also_labeled_sell(monkeypatch):
     trade_activity = _by_channel(sent, "trade_activity")
     assert "SELL AAPL" in trade_activity[0]
     pnl_messages = _by_channel(sent, "pnl")
-    assert pnl_messages[0].startswith("📉 AAPL: -$51.00")
+    assert pnl_messages[0].startswith("📉 AAPL: -$50.00")  # gross of commission
 
 
 def test_scale_out_fill_labeled_trim(monkeypatch):
@@ -686,3 +728,43 @@ def test_non_parent_fill_does_not_accumulate_or_send_embed(monkeypatch):
 
     assert om._entry_fill_state[1]["qty"] == 0.0  # stop fill never touches the entry accumulator
     assert embeds == []
+
+
+# -- Round 2: commissions arrive AFTER the fill --
+
+
+def test_fill_is_journaled_with_exec_id_and_exec_ts(monkeypatch):
+    om = make_order_manager()
+    _capture_sends(monkeypatch, om)
+    trade = FakeTrade(FakeOrder(action="BUY"))
+    om._attach_tracking(trade, row_id=1, role="parent")
+
+    trade.fillEvent.emit(trade, make_fill(shares=100, price=5.5, exec_id="0001.abc"))
+
+    assert om.journal.fills[0]["exec_id"] == "0001.abc"
+    assert om.journal.fills[0]["exec_ts"] is not None
+    # Deliberately not read at fill time -- ib_async has not populated it yet.
+    assert om.journal.fills[0]["commission"] is None
+
+
+def test_commission_report_updates_the_fill_row(monkeypatch):
+    # ib_async emits fillEvent with an EMPTY CommissionReport and sends the
+    # real numbers separately, keyed on execId. Reading it synchronously is
+    # why all 3,925 journal fills carried commission 0.00 -- and it would be
+    # wrong in live trading too, not just paper.
+    om = make_order_manager()
+    fill = make_fill(shares=100, price=5.5, exec_id="0001.abc")
+    report = SimpleNamespace(commission=1.37, realizedPNL=42.0)
+
+    om._on_commission_report(FakeTrade(), fill, report)
+
+    assert om.journal.commission_updates == [("0001.abc", 1.37, 42.0)]
+
+
+def test_commission_report_without_an_exec_id_is_ignored():
+    om = make_order_manager()
+    fill = SimpleNamespace(execution=SimpleNamespace(execId=""))
+
+    om._on_commission_report(FakeTrade(), fill, SimpleNamespace(commission=1.0, realizedPNL=0.0))
+
+    assert getattr(om.journal, "commission_updates", []) == []

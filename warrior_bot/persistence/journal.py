@@ -1,16 +1,48 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from warrior_bot.risk.account_state import AccountSnapshot
 from warrior_bot.risk.risk_manager import RiskDecision
 from warrior_bot.signals.signal import Signal
 
+logger = logging.getLogger("warrior_bot.persistence.journal")
+
+# ib_async's Order declares lmtPrice/auxPrice defaulting to UNSET_DOUBLE
+# (~1.797e308) and the attributes always exist, so `getattr(order, ..., None)`
+# returns the sentinel rather than None. Anything at/above this is not a price.
+_UNSET_DOUBLE_FLOOR = 1e15
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _real_price(value: float | None) -> float | None:
+    """None for a missing price, including IBKR's UNSET_DOUBLE sentinel."""
+    if value is None:
+        return None
+    try:
+        if abs(float(value)) >= _UNSET_DOUBLE_FLOOR:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return value
+
+
+def _iso(value) -> str | None:
+    """IBKR execution timestamps arrive as datetimes; store them as ISO."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+    return str(value)
 
 
 class Journal:
@@ -68,7 +100,7 @@ class Journal:
 
     def record_order(
         self,
-        signal_id: int,
+        signal_id: int | None,
         ib_order_id: int,
         role: str,
         action: str,
@@ -78,12 +110,39 @@ class Journal:
         stop_price: float | None,
         oca_group: str | None,
         status: str,
+        symbol: str | None = None,
     ) -> int:
+        """`signal_id` may be None for an exit with no known originating
+        signal (an emergency/EOD flatten on a symbol with no tracked lot) --
+        pass `symbol` in that case so the row is still attributable. While
+        the column was NOT NULL those exits could not be recorded at all,
+        which is the main reason only ~45% of traded notional had a
+        journaled exit.
+
+        limit_price/stop_price are sanitised: ib_async's Order declares both
+        lmtPrice and auxPrice defaulting to UNSET_DOUBLE (1.797e308), and the
+        attribute always exists, so `getattr(order, "auxPrice", None)` never
+        returns None -- it returns the sentinel. 1,038 of 2,190 order rows
+        (47%) carried it before this."""
         cur = self.conn.execute(
             """INSERT INTO orders
-               (signal_id, ib_order_id, role, action, qty, order_type, limit_price, stop_price, oca_group, status, ts_submitted, ts_last_update)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            (signal_id, ib_order_id, role, action, qty, order_type, limit_price, stop_price, oca_group, status, _now(), _now()),
+               (signal_id, symbol, ib_order_id, role, action, qty, order_type, limit_price, stop_price, oca_group, status, ts_submitted, ts_last_update)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                signal_id,
+                symbol,
+                ib_order_id,
+                role,
+                action,
+                qty,
+                order_type,
+                _real_price(limit_price),
+                _real_price(stop_price),
+                oca_group,
+                status,
+                _now(),
+                _now(),
+            ),
         )
         self.conn.commit()
         return cur.lastrowid
@@ -126,16 +185,70 @@ class Journal:
         ib_order_id: int,
         fill_qty: float,
         fill_price: float,
-        commission: float | None,
-        realized_pnl: float | None,
+        commission: float | None = None,
+        realized_pnl: float | None = None,
+        exec_id: str | None = None,
+        exec_ts: str | None = None,
     ) -> int:
+        """INSERT OR IGNORE on IBKR's globally-unique execution id.
+
+        This is what makes fill dedup exact. Without exec_id a re-delivered
+        fill and a genuine repeat partial at the same size and price are
+        indistinguishable by construction -- which is why
+        dashboard_report.dedup_stop_fills exists, and that heuristic only
+        filters role='stop', missing the scale_out overfills (7 of 11 orders,
+        up to 2.95x) that bias reported P&L upward on exactly the profitable
+        exits.
+
+        commission/realized_pnl are deliberately left None here: ib_async
+        emits fillEvent with an EMPTY CommissionReport and only populates it
+        later via a separate message, so reading it synchronously always
+        yields 0.0 -- live or paper. See update_fill_commission."""
         cur = self.conn.execute(
-            """INSERT INTO fills (order_id, ib_order_id, ts, fill_qty, fill_price, commission, realized_pnl)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (order_row_id, ib_order_id, _now(), fill_qty, fill_price, commission, realized_pnl),
+            """INSERT OR IGNORE INTO fills
+               (order_id, ib_order_id, ts, exec_id, exec_ts, fill_qty, fill_price, commission, realized_pnl)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (order_row_id, ib_order_id, _now(), exec_id, exec_ts, fill_qty, fill_price, commission, realized_pnl),
         )
         self.conn.commit()
+        if cur.rowcount == 0 and exec_id:
+            logger.debug("Duplicate fill ignored (exec_id=%s)", exec_id)
         return cur.lastrowid
+
+    @contextmanager
+    def transaction(self):
+        """Groups several writes into one atomic unit.
+
+        Every method here commits individually, so a signal, its risk
+        decision and its order rows were three independent commits -- a
+        crash between them leaves a signal with no order, or an order with
+        no fill, both of which the reports read as a legitimate "never
+        filled" / "still open" outcome. There is no way to tell a crash
+        artifact from a real one after the fact."""
+        try:
+            with self.conn:  # BEGIN ... COMMIT, ROLLBACK on exception
+                yield self
+        except Exception:
+            logger.exception("Journal transaction rolled back")
+            raise
+
+    def update_fill_commission(
+        self, exec_id: str, commission: float | None, realized_pnl: float | None
+    ) -> bool:
+        """Fills in the commission once IBKR actually sends it.
+
+        ib_async's wrapper.execDetails emits fillEvent immediately with
+        `CommissionReport()` at its defaults (commission=0.0,
+        realizedPNL=0.0); the real values arrive in a separate
+        commissionReport message, re-emitted as ib.commissionReportEvent
+        keyed on execId. Every commission in this journal was 0.00 because
+        the bot only ever read the former."""
+        cur = self.conn.execute(
+            "UPDATE fills SET commission = ?, realized_pnl = ? WHERE exec_id = ?",
+            (commission, realized_pnl, exec_id),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
 
     def record_account_snapshot(self, snapshot: AccountSnapshot) -> None:
         self.conn.execute(

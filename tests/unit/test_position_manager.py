@@ -1731,3 +1731,65 @@ def test_has_unfilled_entry_tracks_the_working_parent():
     pos = pm._positions["TEST"][0]
     pos.parent_done = True
     assert pm.has_unfilled_entry("TEST") is False
+
+
+# -- 2026-09-30 (Round 2): reversal exits are journaled --
+
+
+def test_reversal_exit_journals_its_order_and_fill(monkeypatch):
+    # Until now _reversal_exit passed no on_order_placed hook, so it wrote
+    # nothing: the trade read "open, $0 realized" forever in
+    # dashboard_report and was dropped entirely by win_rate_analysis.
+    # Confirmed live on LABT (09-28) and BKYI/CNTB/VBIO this week.
+    ib = FakeIB()
+    journal = FakeJournal()
+    pm = PositionManager(ib, journal, make_exits_config(reversal_exit_enabled=True))
+    captured = {}
+
+    def fake_flatten(ib_, position, channel="kill_switch", on_order_placed=None, **kwargs):
+        # The real flatten_position invokes the hook synchronously, before
+        # _reversal_exit untracks the lot -- mirror that ordering.
+        captured["hook"] = on_order_placed
+        if on_order_placed is not None:
+            order = FakeOrder("SELL", 100, orderId=777, orderType="MKT")
+            trade = FakeTrade(order)
+            on_order_placed("TEST", trade, order)
+            captured["trade"] = trade
+        return True
+
+    monkeypatch.setattr(position_manager_module, "flatten_position", fake_flatten)
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, quantity=100)
+    pos = pm._positions["TEST"][0]
+
+    bars = make_bars([(10.0, 10.5, 9.9, 10.4, 1000), (10.4, 11.0, 10.35, 10.45, 1000)])
+    pm.on_bar(FakeCtx("TEST", last_price=10.45, bars=bars))
+
+    assert captured.get("hook") is not None, "_reversal_exit must pass a journaling hook"
+    captured["trade"].fillEvent.emit(captured["trade"], make_fill(100, price=9.8))
+
+    roles = [o["role"] for o in journal.orders_recorded]
+    assert "reversal_exit" in roles
+    exit_order = next(o for o in journal.orders_recorded if o["role"] == "reversal_exit")
+    assert exit_order["signal_id"] == pos.signal_id
+    assert exit_order["symbol"] == "TEST"
+    assert len(journal.fills_recorded) >= 1
+    assert journal.fills_recorded[-1]["fill_price"] == 9.8
+
+
+def test_reversal_exit_journaling_failure_does_not_block_the_exit(monkeypatch):
+    # Getting flat matters more than recording it.
+    ib = FakeIB()
+    journal = FakeJournal()
+
+    def boom(**kwargs):
+        raise RuntimeError("db locked")
+
+    journal.record_order = boom
+    pm = PositionManager(ib, journal, make_exits_config(trailing_enabled=False))
+    signal = make_signal(entry=10.0, stop=9.0)
+    track_position(pm, signal, quantity=100)
+
+    order = FakeOrder("SELL", 100, orderId=778, orderType="MKT")
+    trade = FakeTrade(order)
+    pm._journal_reversal_exit_fill("TEST", trade, order)  # must not raise
