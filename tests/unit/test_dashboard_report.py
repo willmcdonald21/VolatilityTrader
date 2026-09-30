@@ -6,7 +6,14 @@ from datetime import datetime, timedelta, timezone
 from warrior_bot.persistence.db import get_connection
 from warrior_bot.utils.time_utils import EASTERN
 
-from scripts.dashboard_report import build_report, dedup_stop_fills, et_day_utc_bounds
+# dedup_stop_fills and et_day_utc_bounds moved to warrior_bot.analysis.trades
+# (one shared reconstruction -- dashboard_report and win_rate_analysis used
+# to disagree by 13% on which trades existed). The dedup is now also
+# date-bounded to pre-2026-09-15 rows, because on later data it was
+# deleting genuine repeat partials.
+from scripts.dashboard_report import build_report
+from warrior_bot.analysis.trades import _dedup_legacy_stop_fills as dedup_stop_fills
+from warrior_bot.analysis.trades import et_day_utc_bounds
 
 DAY = datetime(2026, 9, 14, tzinfo=EASTERN).date()
 
@@ -16,10 +23,15 @@ def _make_rows(conn: sqlite3.Connection, specs: list[dict]) -> list[sqlite3.Row]
     dict-style access, not a hand-rolled stand-in) from a throwaway table
     shaped like the join projection dedup_stop_fills actually receives."""
     conn.execute(
-        "CREATE TABLE t (order_id INTEGER, role TEXT, fill_qty REAL, fill_price REAL, fill_ts TEXT)"
+        "CREATE TABLE t (fill_id INTEGER, order_id INTEGER, role TEXT, fill_qty REAL, "
+        "fill_price REAL, fill_ts TEXT, exec_ts TEXT)"
     )
+    for i, spec in enumerate(specs, start=1):
+        spec.setdefault("fill_id", i)
+        spec.setdefault("exec_ts", None)  # legacy rows predate exec_id/exec_ts
     conn.executemany(
-        "INSERT INTO t VALUES (:order_id, :role, :fill_qty, :fill_price, :fill_ts)", specs
+        "INSERT INTO t VALUES (:fill_id, :order_id, :role, :fill_qty, :fill_price, :fill_ts, :exec_ts)",
+        specs,
     )
     conn.commit()
     conn.row_factory = sqlite3.Row
@@ -54,6 +66,26 @@ def test_dedup_keeps_two_genuine_separate_stop_fills():
     )
     result = dedup_stop_fills(rows)
     assert len(result) == 2
+
+
+def test_dedup_leaves_post_fix_rows_alone_even_when_they_look_duplicate():
+    # The date bound, added 2026-09-30. The double-journal bug was fixed on
+    # 2026-09-14; after that an identical-looking adjacent pair is a genuine
+    # repeat partial, which this bot's thin universe produces constantly
+    # (MTEN: 23 fills in ~6 seconds). Measured on the live journal, 95 of
+    # 148 such pairs were post-fix -- deleting them turned clean round trips
+    # into "partial" (APUS bought 363, sold 363, came out showing 163 sold).
+    conn = sqlite3.connect(":memory:")
+    t0 = "2026-09-24T14:00:00.000000+00:00"
+    t1 = "2026-09-24T14:00:00.050000+00:00"
+    rows = _make_rows(
+        conn,
+        [
+            {"order_id": 1, "role": "stop", "fill_qty": 100.0, "fill_price": 9.0, "fill_ts": t0},
+            {"order_id": 1, "role": "stop", "fill_qty": 100.0, "fill_price": 9.0, "fill_ts": t1},
+        ],
+    )
+    assert len(dedup_stop_fills(rows)) == 2
 
 
 def test_dedup_ignores_non_stop_roles():

@@ -30,13 +30,14 @@ import json
 import sqlite3
 import sys
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from scripts.dashboard_report import dedup_stop_fills
+from warrior_bot.analysis.trades import coverage, et_day_utc_bounds, reconstruct_trades
 from warrior_bot.config import load_config
+from warrior_bot.persistence.db import get_connection
 
 MIN_TRADES_FOR_CONCLUSIONS = 100
 
@@ -83,99 +84,19 @@ def _extension_pct(context_json: str | None, entry_price: float) -> float | None
     return (entry_price - trigger_level) / trigger_level * 100.0
 
 
-def build_trades(conn: sqlite3.Connection) -> list[dict]:
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        """
-        SELECT s.id AS signal_id, s.ts AS signal_ts, s.symbol, s.strategy, s.side,
-               s.entry_price AS planned_entry, s.context_json,
-               o.id AS order_id, o.role, o.action,
-               f.id AS fill_id, f.ts AS fill_ts, f.fill_qty, f.fill_price, f.commission
-        FROM signals s
-        JOIN risk_decisions rd ON rd.signal_id = s.id AND rd.decision = 'accepted'
-        LEFT JOIN orders o ON o.signal_id = s.id
-        LEFT JOIN fills f ON f.order_id = o.id
-        ORDER BY s.id, o.id, f.ts
-        """
-    ).fetchall()
-    rows = dedup_stop_fills(rows)
-
-    signals: dict[int, dict] = {}
-    for r in rows:
-        sig = signals.get(r["signal_id"])
-        if sig is None:
-            sig = signals[r["signal_id"]] = {
-                "signal_id": r["signal_id"],
-                "symbol": r["symbol"],
-                "strategy": r["strategy"],
-                "planned_entry": r["planned_entry"],
-                "context_json": r["context_json"],
-                "entry_qty": 0.0,
-                "entry_notional": 0.0,
-                "exit_qty": 0.0,
-                "exit_notional": 0.0,
-                "commission_total": 0.0,
-                "exit_roles": set(),
-                "first_fill_ts": None,
-                "last_fill_ts": None,
-            }
-        if r["fill_id"] is None:
-            continue
-        if r["fill_ts"] is not None:
-            if sig["first_fill_ts"] is None or r["fill_ts"] < sig["first_fill_ts"]:
-                sig["first_fill_ts"] = r["fill_ts"]
-            if sig["last_fill_ts"] is None or r["fill_ts"] > sig["last_fill_ts"]:
-                sig["last_fill_ts"] = r["fill_ts"]
-        if r["commission"]:
-            sig["commission_total"] += r["commission"]
-        if r["action"] == "BUY":
-            sig["entry_qty"] += r["fill_qty"]
-            sig["entry_notional"] += r["fill_qty"] * r["fill_price"]
-        elif r["action"] == "SELL":
-            sig["exit_qty"] += r["fill_qty"]
-            sig["exit_notional"] += r["fill_qty"] * r["fill_price"]
-            sig["exit_roles"].add(r["role"])
-
-    trades = []
-    for sig in signals.values():
-        if sig["entry_qty"] == 0 or sig["exit_qty"] == 0:
-            continue  # never opened, or opened but never closed -- see dashboard_report.py's still_open handling
-        avg_entry = sig["entry_notional"] / sig["entry_qty"]
-        avg_exit = sig["exit_notional"] / sig["exit_qty"]
-        closed_qty = min(sig["entry_qty"], sig["exit_qty"])  # matched portion only -- see dashboard_report.py
-        pnl = round((avg_exit - avg_entry) * closed_qty - sig["commission_total"], 2)
-        duration_minutes = None
-        if sig["first_fill_ts"] and sig["last_fill_ts"]:
-            duration_minutes = (
-                datetime.fromisoformat(sig["last_fill_ts"]) - datetime.fromisoformat(sig["first_fill_ts"])
-            ).total_seconds() / 60.0
-        trades.append(
-            {
-                "symbol": sig["symbol"],
-                "strategy": sig["strategy"],
-                "pnl": pnl,
-                "exit_roles": sig["exit_roles"],
-                "duration_minutes": duration_minutes,
-                "extension_pct": _extension_pct(sig["context_json"], avg_entry),
-                "open_ts": sig["first_fill_ts"],
-            }
-        )
-    return trades
-
-
 def _print_bucket_table(title: str, buckets: dict[str, list[dict]]) -> None:
     print(f"\n{title}")
     print(f"{'Bucket':<14} {'N':>5} {'Win%':>7} {'PF':>8} {'Total P&L':>12}")
     for label, trades in buckets.items():
-        wins = [t for t in trades if t["pnl"] > 0]
-        losses = [t for t in trades if t["pnl"] <= 0]
-        gross_win = sum(t["pnl"] for t in wins)
-        gross_loss = -sum(t["pnl"] for t in losses)
+        wins = [t for t in trades if t.net_pnl > 0]
+        losses = [t for t in trades if t.net_pnl <= 0]
+        gross_win = sum(t.net_pnl for t in wins)
+        gross_loss = -sum(t.net_pnl for t in losses)
         pf = (gross_win / gross_loss) if gross_loss > 0 else float("inf") if gross_win > 0 else 0.0
         win_pct = len(wins) / len(trades) * 100 if trades else 0.0
         flag = " *" if len(trades) < MIN_TRADES_FOR_CONCLUSIONS else ""
         pf_str = "inf" if pf == float("inf") else f"{pf:.2f}"
-        print(f"{label:<14} {len(trades):>5} {win_pct:>6.1f}% {pf_str:>8} {sum(t['pnl'] for t in trades):>12.2f}{flag}")
+        print(f"{label:<14} {len(trades):>5} {win_pct:>6.1f}% {pf_str:>8} {sum(t.net_pnl for t in trades):>12.2f}{flag}")
 
 
 def main() -> None:
@@ -186,67 +107,100 @@ def main() -> None:
 
     config = load_config()
     db_path = config.resolve_path(config.journal.db_path)
-    conn = sqlite3.connect(str(db_path))
+    # get_connection rather than a raw connect: it applies any pending
+    # additive migrations, so a report can never read a stale schema.
+    conn = get_connection(db_path)
 
-    trades = build_trades(conn)
+    all_trades = reconstruct_trades(conn)
+
+    # ET-date filtering via UTC bounds. Comparing an ET date string directly
+    # against a UTC timestamp (as this did before) is wrong by the offset:
+    # a trade at 20:00 ET on the 24th is 2026-09-25T00:00Z.
+    trades = all_trades
     if args.since:
-        trades = [t for t in trades if t["open_ts"] and t["open_ts"] >= args.since]
+        start, _ = et_day_utc_bounds(date.fromisoformat(args.since))
+        trades = [t for t in trades if t.ts >= start]
     if args.until:
-        trades = [t for t in trades if t["open_ts"] and t["open_ts"] < args.until]
+        start, _ = et_day_utc_bounds(date.fromisoformat(args.until))
+        trades = [t for t in trades if t.ts < start]
 
     if not trades:
-        print("No closed trades found in the journal for this range.")
+        print("No trades found in the journal for this range.")
         return
 
-    wins = [t for t in trades if t["pnl"] > 0]
-    losses = [t for t in trades if t["pnl"] <= 0]
-    gross_win = sum(t["pnl"] for t in wins)
-    gross_loss = -sum(t["pnl"] for t in losses)
-    pf = (gross_win / gross_loss) if gross_loss > 0 else float("inf") if gross_win > 0 else 0.0
-    print(f"Overall: {len(trades)} closed trades, {len(wins)/len(trades)*100:.1f}% win rate, "
-          f"profit factor {pf if pf == float('inf') else round(pf, 2)}, net P&L {sum(t['pnl'] for t in trades):.2f}")
-    if len(trades) < MIN_TRADES_FOR_CONCLUSIONS:
-        print(f"* fewer than {MIN_TRADES_FOR_CONCLUSIONS} trades total -- too small a sample to draw conclusions from yet.")
+    cov = coverage(trades)
+    settled = [t for t in trades if t.is_settled]
 
-    by_strategy: dict[str, list[dict]] = defaultdict(list)
-    for t in trades:
-        by_strategy[t["strategy"]].append(t)
+    print("=" * 78)
+    print("WHAT THIS REPORT CAN AND CANNOT TELL YOU")
+    print("=" * 78)
+    print(f"{cov.trade_count} accepted signals: " + ", ".join(
+        f"{n} {status}" for status, n in cov.by_status.items() if n
+    ))
+    print(f"Win rate and P&L below cover the {len(settled)} SETTLED (fully round-tripped) trades only.")
+    for caveat in cov.caveats():
+        print(f"  ! {caveat}")
+    print("=" * 78)
+    print()
+
+    if not settled:
+        print("No settled trades in this range -- nothing to compute a win rate from.")
+        return
+
+    wins = [t for t in settled if t.net_pnl > 0]
+    losses = [t for t in settled if t.net_pnl <= 0]
+    gross_win = sum(t.net_pnl for t in wins)
+    gross_loss = -sum(t.net_pnl for t in losses)
+    pf = (gross_win / gross_loss) if gross_loss > 0 else float("inf") if gross_win > 0 else 0.0
+    print(
+        f"Overall: {len(settled)} settled trades, {len(wins) / len(settled) * 100:.1f}% win rate, "
+        f"profit factor {pf if pf == float('inf') else round(pf, 2)}, net P&L {sum(t.net_pnl for t in settled):.2f}"
+    )
+    if len(settled) < MIN_TRADES_FOR_CONCLUSIONS:
+        print(f"* fewer than {MIN_TRADES_FOR_CONCLUSIONS} settled trades -- too small a sample to conclude from.")
+
+    by_strategy: dict[str, list] = defaultdict(list)
+    for t in settled:
+        by_strategy[t.strategy].append(t)
     _print_bucket_table("By strategy:", dict(sorted(by_strategy.items())))
 
-    by_exit_role: dict[str, list[dict]] = defaultdict(list)
-    for t in trades:
-        if "stop" in t["exit_roles"]:
+    by_exit_role: dict[str, list] = defaultdict(list)
+    for t in settled:
+        if "stop" in t.exit_roles:
             key = "stop"
-        elif t["exit_roles"] & {"target", "scale_out"}:
+        elif t.exit_roles & {"target", "scale_out"}:
             key = "target/scale_out"
-        elif t["exit_roles"]:
-            key = ",".join(sorted(t["exit_roles"]))
+        elif t.exit_roles:
+            key = ",".join(sorted(t.exit_roles))
         else:
             key = "unknown"
         by_exit_role[key].append(t)
     _print_bucket_table("By exit role:", dict(sorted(by_exit_role.items(), key=lambda kv: -len(kv[1]))))
 
-    by_duration: dict[str, list[dict]] = defaultdict(list)
-    for t in trades:
-        if t["duration_minutes"] is None:
+    by_duration: dict[str, list] = defaultdict(list)
+    for t in settled:
+        if t.duration_minutes is None:
             continue
-        label = _bucket(t["duration_minutes"], DURATION_BUCKETS)
+        label = _bucket(t.duration_minutes, DURATION_BUCKETS)
         if label:
             by_duration[label].append(t)
-    ordered_duration = {label: by_duration[label] for label, _, _ in DURATION_BUCKETS if label in by_duration}
-    _print_bucket_table("By trade duration:", ordered_duration)
+    ordered = {label: by_duration[label] for label, _, _ in DURATION_BUCKETS if label in by_duration}
+    _print_bucket_table("By trade duration:", ordered)
 
     for strategy_name in ("gap_and_go", "vwap_reversion"):
-        by_extension: dict[str, list[dict]] = defaultdict(list)
-        for t in trades:
-            if t["strategy"] != strategy_name or t["extension_pct"] is None:
+        by_extension: dict[str, list] = defaultdict(list)
+        for t in settled:
+            if t.strategy != strategy_name:
                 continue
-            label = _bucket(t["extension_pct"], EXTENSION_BUCKETS)
+            ext = _extension_pct(t.context_json, t.avg_entry or 0.0)
+            if ext is None:
+                continue
+            label = _bucket(ext, EXTENSION_BUCKETS)
             if label:
                 by_extension[label].append(t)
         if by_extension:
-            ordered_extension = {label: by_extension[label] for label, _, _ in EXTENSION_BUCKETS if label in by_extension}
-            _print_bucket_table(f"By entry-extension bucket ({strategy_name}):", ordered_extension)
+            ordered_ext = {label: by_extension[label] for label, _, _ in EXTENSION_BUCKETS if label in by_extension}
+            _print_bucket_table(f"By entry-extension bucket ({strategy_name}):", ordered_ext)
 
 
 if __name__ == "__main__":
