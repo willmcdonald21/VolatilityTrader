@@ -36,7 +36,12 @@ from warrior_bot.strategies.inverted_head_and_shoulders import InvertedHeadAndSh
 from warrior_bot.strategies.vwap_reversion import VwapReversionStrategy
 from warrior_bot.utils.panic import flatten_position, panic_stop
 from warrior_bot.utils.rounding import round_to_tick
-from warrior_bot.utils.time_utils import is_active_session, to_eastern
+from warrior_bot.utils.time_utils import (
+    is_active_session,
+    session_anchor,
+    set_premarket_volume_share,
+    to_eastern,
+)
 
 logger = logging.getLogger("warrior_bot.main")
 
@@ -64,6 +69,9 @@ class WarriorBot:
         self.config = config
         self.dry_run = dry_run
         self.logger = setup_logging(config)
+        # Session model feeds relative volume everywhere; set before any
+        # strategy can evaluate.
+        set_premarket_volume_share(config.session.premarket_volume_share)
         self.ib_client = IBClient(config)
         self.ib = self.ib_client.ib
 
@@ -1075,7 +1083,11 @@ class WarriorBot:
             self.logger.exception("Could not qualify contract for %s", symbol)
             return
 
-        ctx = SymbolContext(symbol=symbol, scanner_rank=scanner_rank)
+        # Anchored at onboarding rather than left None so VWAP and session
+        # volume measure the same session for every symbol regardless of when
+        # the scanner found it -- and so a reconnect-driven re-onboard at
+        # 11:00 doesn't silently re-anchor a symbol's VWAP to 11:00.
+        ctx = SymbolContext(symbol=symbol, scanner_rank=scanner_rank, session_anchor=session_anchor())
 
         try:
             ctx.prior_close = await asyncio.wait_for(fetch_prior_close(self.ib, contract), timeout=30)

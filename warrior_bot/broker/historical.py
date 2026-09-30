@@ -5,17 +5,41 @@ from datetime import datetime
 from ib_async import IB, Contract
 
 from warrior_bot.config import AppConfig
-from warrior_bot.utils.time_utils import now_eastern
+from warrior_bot.utils.time_utils import now_eastern, session_anchor
+
+# A fixed hour was never enough to seed a session-anchored VWAP, but there is
+# no point asking IBKR for more 1-minute bars than a session can contain
+# either. 04:00 to 20:00 ET is 16 hours; the floor keeps a symbol onboarded a
+# few minutes after the pre-market open from requesting a near-zero window.
+_MIN_WARMUP_SECONDS = 3600
+_MAX_WARMUP_SECONDS = 16 * 3600
 
 
-async def fetch_warmup_bars(ib: IB, contract: Contract, config: AppConfig, duration: str = "3600 S"):
-    """1-minute bars covering the last hour (pre-market + open), used to seed
+def warmup_duration(now: datetime | None = None) -> str:
+    """Seconds of 1-minute history needed to cover the session so far."""
+    now = now or now_eastern()
+    elapsed = int((now - session_anchor(now)).total_seconds())
+    return f"{min(max(elapsed, _MIN_WARMUP_SECONDS), _MAX_WARMUP_SECONDS)} S"
+
+
+async def fetch_warmup_bars(ib: IB, contract: Contract, config: AppConfig, duration: str | None = None):
+    """1-minute bars covering the session so far, used to seed
     VWAP/opening-range/relative-volume state before real-time bars take over.
+
+    Was a flat "3600 S". That hour is what made every session-scoped number
+    depend on discovery time: a symbol onboarded at 09:20 had five hours of
+    the pre-market session it was trading in simply missing from its VWAP and
+    cumulative volume, and the 5-minute MACD veto -- which needs 26 five-
+    minute bars, i.e. 130 minutes -- could not evaluate at all until roughly
+    80 minutes after onboarding. Fetching from the session anchor means the
+    indicators are correct from the first bar. Bars that precede the anchor
+    are harmless: SymbolContext.session_bars filters them out of VWAP and
+    session volume, while EMA/ATR/MACD legitimately want the extra depth.
     """
     return await ib.reqHistoricalDataAsync(
         contract,
         endDateTime="",
-        durationStr=duration,
+        durationStr=duration or warmup_duration(),
         barSizeSetting="1 min",
         whatToShow="TRADES",
         useRTH=config.trading.use_rth,

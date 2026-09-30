@@ -10,6 +10,7 @@ from warrior_bot.strategies.indicators import (
     Bar,
     average_true_range,
     ema,
+    ema_series,
     gap_pct,
     macd,
     opening_range,
@@ -37,8 +38,41 @@ class SymbolContext:
     # per bar.
     scanner_rank: int | None = None
 
+    # Start of the trading session these bars belong to (04:00 ET). VWAP
+    # and session volume are measured from here, NOT from whenever the
+    # scanner happened to find the symbol. Set at onboarding; None falls
+    # back to "use every bar held", the pre-2026-09-30 behaviour.
+    session_anchor: datetime | None = None
+
     def add_bar(self, bar: Bar) -> None:
         self.bars.append(bar)
+        self._cache.clear()
+
+    # Per-bar memo. Every indicator below is O(n) over the full bar list and
+    # several are recomputed many times per bar -- _check_engaged alone calls
+    # macd(9, 20) once per strategy, and validate_pullback recomputes VWAP,
+    # EMA and a 5-minute resample on top. With up to 90 subscriptions that is
+    # real CPU inside the event loop that also has to service fills.
+    _cache: dict = field(default_factory=dict, repr=False, compare=False)
+
+    def _memo(self, key, compute):
+        if key not in self._cache:
+            self._cache[key] = compute()
+        return self._cache[key]
+
+    @property
+    def session_bars(self) -> list[Bar]:
+        """Bars belonging to the current session only.
+
+        Without an anchor this is every bar held, which is what made VWAP
+        depend on discovery time: warmup fetches a fixed window, so a
+        symbol onboarded at 06:30 had a "VWAP" anchored at 05:30 and one
+        onboarded at 09:20 had a different one for the same stock at the
+        same moment. It also never re-anchored at the open and silently
+        re-anchored on every reconnect."""
+        if self.session_anchor is None:
+            return self.bars
+        return self._memo("session_bars", lambda: [b for b in self.bars if b.time >= self.session_anchor])
 
     @property
     def last_price(self) -> float | None:
@@ -46,19 +80,65 @@ class SymbolContext:
 
     @property
     def cumulative_volume(self) -> float:
-        return sum(b.volume for b in self.bars)
+        """Volume traded THIS SESSION.
+
+        Must share a clock with relative_volume's denominator, which is
+        "expected volume by now" measured from the session start. Summing
+        every bar held measured from onboarding instead -- two unrelated
+        clocks divided by each other."""
+        return self._memo("cumulative_volume", lambda: sum(b.volume for b in self.session_bars))
 
     @property
     def vwap(self) -> float | None:
-        return vwap(self.bars)
+        return self._memo("vwap", lambda: vwap(self.session_bars))
+
+    def vwap_at(self, index: int) -> float | None:
+        """Session VWAP as of bar `index` of `self.bars`.
+
+        pullback_validity compared the CURRENT VWAP against bars that closed
+        minutes earlier, so on a rising stock (every candidate here) the
+        comparison was systematically too strict -- it rejected pullbacks
+        that genuinely did hold VWAP at the time."""
+        series = self._memo("vwap_series", self._compute_vwap_series)
+        if not series or index < 0 or index >= len(series):
+            return None
+        return series[index]
+
+    def _compute_vwap_series(self) -> list[float | None]:
+        """Running session VWAP, one value per bar of self.bars. O(n) once
+        per bar rather than O(n) per lookup."""
+        out: list[float | None] = []
+        total_pv = 0.0
+        total_v = 0.0
+        for bar in self.bars:
+            if self.session_anchor is not None and bar.time < self.session_anchor:
+                out.append(None)
+                continue
+            total_pv += bar.typical_price * bar.volume
+            total_v += bar.volume
+            out.append(total_pv / total_v if total_v > 0 else None)
+        return out
+
+    def ema_9_at(self, index: int) -> float | None:
+        """EMA-9 as of bar `index` -- same point-in-time correctness as
+        vwap_at. The 9-EMA pullback-hold check compared every pullback bar
+        against the EMA's value at the BREAKOUT bar."""
+        series = self._memo("ema_9_series", lambda: ema_series(self.bars, 9))
+        if not series:
+            return None
+        # ema_series[i] corresponds to bars[period - 1 + i].
+        offset = index - 8
+        if offset < 0 or offset >= len(series):
+            return None
+        return series[offset]
 
     @property
     def ema_9(self) -> float | None:
-        return ema(self.bars, 9)
+        return self._memo("ema_9", lambda: ema(self.bars, 9))
 
     @property
     def ema_20(self) -> float | None:
-        return ema(self.bars, 20)
+        return self._memo("ema_20", lambda: ema(self.bars, 20))
 
     @property
     def ema_200(self) -> float | None:
@@ -86,10 +166,10 @@ class SymbolContext:
         return opening_range(self.bars, lookback_bars)
 
     def atr(self, period: int = 14) -> float | None:
-        return average_true_range(self.bars, period)
+        return self._memo(("atr", period), lambda: average_true_range(self.bars, period))
 
     def macd(self, fast: int = 12, slow: int = 26, signal: int = 9) -> tuple[float, float] | None:
-        return macd(self.bars, fast, slow, signal)
+        return self._memo(("macd", fast, slow, signal), lambda: macd(self.bars, fast, slow, signal))
 
 
 class BaseStrategy(ABC):
