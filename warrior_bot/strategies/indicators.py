@@ -51,7 +51,7 @@ def relative_volume(volume_so_far: float, avg_daily_volume: float, elapsed_fract
     return volume_so_far / expected_by_now
 
 
-def resample_bars(bars: list[Bar], bucket_minutes: int) -> list[Bar]:
+def resample_bars(bars: list[Bar], bucket_minutes: int, drop_partial: bool = False) -> list[Bar]:
     """Downsample 1-minute bars into `bucket_minutes`-wide OHLCV bars,
     aligned to absolute wall-clock boundaries (e.g. :00/:05/:10 for a
     5-minute bucket) rather than to the first bar's own timestamp.
@@ -62,6 +62,13 @@ def resample_bars(bars: list[Bar], bucket_minutes: int) -> list[Bar]:
     subscription needed. The trailing bucket may be partial (still forming)
     if the caller's `bars` don't yet span a full period; that's expected,
     same as how a live 5-minute chart's current candle is partial too.
+
+    `drop_partial=True` omits that still-forming bucket. Candle-SHAPE checks
+    need it: judging a 5-minute candle's wick one minute into the bucket is
+    judging a 1-minute candle, and an ordinary 1-minute upper wick was
+    vetoing entries as "5-minute topping tails" that the completed 5-minute
+    candle would not have shown. Trend indicators (MACD) are better off
+    keeping it, exactly as a live chart shows a forming candle.
     """
     if bucket_minutes <= 0 or not bars:
         return []
@@ -69,8 +76,18 @@ def resample_bars(bars: list[Bar], bucket_minutes: int) -> list[Bar]:
     for bar in bars:
         bucket_key = int(bar.time.timestamp() // 60 // bucket_minutes)
         buckets.setdefault(bucket_key, []).append(bar)
+    keys = sorted(buckets)
+    if drop_partial and keys:
+        # Only the trailing bucket can be partial. It is complete when it
+        # contains a 1-minute bar in the bucket's final minute -- a
+        # minute-count test would misjudge thin pre-market names, where a
+        # minute with no trades simply produces no bar.
+        last_group = buckets[keys[-1]]
+        final_minute = (keys[-1] + 1) * bucket_minutes * 60 - 60
+        if last_group[-1].time.timestamp() < final_minute:
+            keys = keys[:-1]
     resampled = []
-    for key in sorted(buckets):
+    for key in keys:
         group = buckets[key]
         resampled.append(
             Bar(
@@ -181,6 +198,13 @@ def _ema_series(values: list[float], period: int) -> list[float]:
     for value in values[period:]:
         series.append((value - series[-1]) * multiplier + series[-1])
     return series
+
+
+def ema_series(bars: list[Bar], period: int) -> list[float]:
+    """Full EMA-of-closes series. series[i] is the EMA as of
+    bars[period - 1 + i]. Exposed so callers can compare a past bar
+    against the EMA AS OF THAT BAR rather than against the latest value."""
+    return _ema_series([b.close for b in bars], period)
 
 
 def ema(bars: list[Bar], period: int) -> float | None:
@@ -339,7 +363,17 @@ def trailing_candidate(
 
 
 def average_true_range(bars: list[Bar], period: int = 14) -> float | None:
-    if len(bars) < 2:
+    """Simple average of the last `period` true ranges (not Wilder's RMA).
+
+    Returns None until there are genuinely enough bars. The old guard was
+    `len(bars) < 2`, so with two bars it returned a SINGLE true range and
+    called it a 14-period ATR -- the only indicator in this module that
+    returned a misleading number instead of None on insufficient data. It
+    feeds is_entry_too_extended's ATR check and the trailing stop's
+    distance, so on a fresh symbol one wild bar became the entire measure
+    of "normal volatility": the docstring there worries that ATR inflates
+    during a spike, but with too few bars the ATR simply IS the spike."""
+    if len(bars) < period + 1:
         return None
     window = bars[-(period + 1):]
     trs = []

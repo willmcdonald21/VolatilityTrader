@@ -83,13 +83,30 @@ def test_is_red_to_green_false_if_still_red():
 
 
 def test_average_true_range_flat_bars_is_zero():
-    bars = make_bars([(10, 10, 10, 10, 100)] * 5)
+    # 15 bars, not 5: average_true_range now requires period + 1 bars for a
+    # `period`-length ATR. With 5 it averaged 4 true ranges and called the
+    # result a 14-period ATR -- which is what fed the extension gate.
+    bars = make_bars([(10, 10, 10, 10, 100)] * 15)
     assert average_true_range(bars) == 0.0
+
+
+def test_average_true_range_shorter_period_needs_only_that_period():
+    bars = make_bars([(10, 10, 10, 10, 100)] * 4)
+    assert average_true_range(bars, period=3) == 0.0
 
 
 def test_average_true_range_none_with_insufficient_bars():
     bars = make_bars([(10, 10, 10, 10, 100)])
     assert average_true_range(bars) is None
+
+
+def test_average_true_range_none_when_fewer_than_period_plus_one():
+    # Added 2026-09-30. Previously any 2+ bars produced a number, so a
+    # symbol with 3 bars of history reported a "14-period ATR" built from
+    # two true ranges -- silently understating volatility right when the
+    # extension gate is most likely to be consulted.
+    bars = make_bars([(10, 10.5, 9.5, 10, 100)] * 14)
+    assert average_true_range(bars, period=14) is None
 
 
 def test_ema_flat_price_equals_price():
