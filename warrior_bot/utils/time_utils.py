@@ -24,8 +24,27 @@ def to_eastern(dt: datetime) -> datetime:
 
 
 def session_anchor(now: datetime | None = None) -> datetime:
-    """Start of the current trading session in ET: today's 04:00 pre-market
-    open (or yesterday's, if called before 04:00).
+    """Start of the trading session this ET calendar date belongs to:
+    today's 04:00 pre-market open, always.
+
+    Deliberately NOT "yesterday's 04:00, if called before 04:00". Three
+    reasons, all specific to this bot:
+
+      - reset_daily_state() clears contexts on the ET calendar date
+        change, i.e. at midnight, not at 04:00. A symbol onboarded at
+        02:00 with yesterday's anchor would keep it for the whole of
+        today's session, so its VWAP would fold in all of yesterday.
+      - session_elapsed_fraction already treats 00:00-04:00 as "before
+        this session started". Returning yesterday's anchor here made the
+        two functions disagree in exactly that window -- a VWAP measured
+        over yesterday's session divided against today's expected volume.
+      - the bot flattens at 15:55 and takes no entry before 06:30, so it
+        has no interest in the 20:00-04:00 overnight tape anyway.
+
+    Between midnight and 04:00 the anchor is therefore in the future and
+    session_bars is empty, which reads correctly as "this session has not
+    started": relative volume is 0 and nothing signals. Bars accumulate
+    normally from 04:00.
 
     This is the reference point VWAP and session volume are measured from.
     Before this existed, both were measured from whenever the scanner
@@ -37,10 +56,7 @@ def session_anchor(now: datetime | None = None) -> datetime:
     it is trading in would be meaningless there.
     """
     now = to_eastern(now) if now is not None else now_eastern()
-    anchor = now.replace(hour=PRE_MARKET_OPEN.hour, minute=PRE_MARKET_OPEN.minute, second=0, microsecond=0)
-    if now < anchor:
-        anchor -= timedelta(days=1)
-    return anchor
+    return now.replace(hour=PRE_MARKET_OPEN.hour, minute=PRE_MARKET_OPEN.minute, second=0, microsecond=0)
 
 
 # Share of a typical symbol's daily volume that trades in the 04:00-09:30

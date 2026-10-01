@@ -83,8 +83,24 @@ def test_anchor_is_todays_four_am():
     assert session_anchor(et(9, 30)) == et(4, 0)
 
 
-def test_anchor_before_four_am_belongs_to_the_previous_session():
-    assert session_anchor(et(2, 0, day=6)) == et(4, 0, day=5)
+def test_anchor_between_midnight_and_four_am_is_todays_open_not_yesterdays():
+    # reset_daily_state() clears contexts at the ET calendar date change,
+    # so a symbol onboarded at 02:00 keeps whatever anchor it was given for
+    # the whole of today. Yesterday's anchor would fold all of yesterday's
+    # session into today's VWAP -- and would disagree with
+    # session_elapsed_fraction, which already treats 00:00-04:00 as
+    # "before this session started".
+    assert session_anchor(et(2, 0, day=6)) == et(4, 0, day=6)
+    assert session_elapsed_fraction(et(2, 0, day=6)) == pytest.approx(0.001)
+
+
+def test_before_the_open_the_session_has_no_bars_yet():
+    anchor = session_anchor(et(2, 0))
+    overnight = make_bars([(10, 10, 10, 10, 100)] * 5, start=et(1, 0))
+    ctx = SymbolContext(symbol="T", bars=overnight, session_anchor=anchor)
+    assert ctx.session_bars == []
+    assert ctx.cumulative_volume == 0
+    assert ctx.vwap is None
 
 
 def test_session_volume_and_vwap_ignore_bars_before_the_anchor():
