@@ -1,16 +1,28 @@
 """Summarize win rate, realized PnL, and average R-multiple per strategy
 from the trade journal. This is the primary feedback loop for tuning
-strategy parameters, since backtesting this style of setup is unreliable."""
+strategy parameters, since backtesting this style of setup is unreliable.
+
+Built on warrior_bot.analysis.trades, the single shared reconstruction, so
+this agrees with win_rate_analysis.py and dashboard_report.py by
+construction. It previously did its own SQL join and summed
+`fills.realized_pnl` -- a column that is structurally zero, because the bot
+read `fill.commissionReport` synchronously before ib_async had populated it
+(fixed 2026-09-30, but historical rows stay zero). That made this report
+state a 0.0% win rate and $0.00 P&L for gap_and_go and vwap_reversion
+indefinitely, while counting all 374 accepted signals -- never-filled and
+still-open included -- as settled "trades".
+"""
 
 from __future__ import annotations
 
-import sqlite3
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from warrior_bot.analysis.trades import coverage, reconstruct_trades
 from warrior_bot.config import load_config
+from warrior_bot.persistence.db import get_connection
 
 # Ross Cameron's own stated rule: don't draw conclusions about a strategy's
 # edge from fewer than ~100 trades -- a handful of losses is statistically
@@ -23,39 +35,50 @@ MIN_TRADES_FOR_CONCLUSIONS = 100
 def main() -> None:
     config = load_config()
     db_path = config.resolve_path(config.journal.db_path)
-    conn = sqlite3.connect(str(db_path))
-    conn.row_factory = sqlite3.Row
+    # get_connection rather than a raw connect: it applies any pending
+    # additive migrations, so this never reads a stale schema.
+    conn = get_connection(db_path)
 
-    rows = conn.execute(
-        """
-        SELECT s.id as signal_id, s.symbol, s.strategy, s.entry_price, s.stop_price,
-               rd.sized_qty,
-               COALESCE(SUM(f.realized_pnl), 0) as realized_pnl
-        FROM signals s
-        JOIN risk_decisions rd ON rd.signal_id = s.id AND rd.decision = 'accepted'
-        LEFT JOIN orders o ON o.signal_id = s.id
-        LEFT JOIN fills f ON f.order_id = o.id
-        GROUP BY s.id
-        ORDER BY s.ts
-        """
-    ).fetchall()
+    all_trades = reconstruct_trades(conn)
+    # Only settled trades can be scored. A signal that never filled is not a
+    # 0% win, and a position still running has no realized result yet --
+    # counting them as trades is what produced "180 trades, 0.0% win,
+    # $0.00" for gap_and_go.
+    trades = [t for t in all_trades if t.status == "closed"]
+
+    cov = coverage(all_trades)
+    print("=" * 78)
+    print("WHAT THIS REPORT CAN AND CANNOT TELL YOU")
+    print("=" * 78)
+    counts = ", ".join(f"{n} {s}" for s, n in cov.by_status.items() if n)
+    print(f"{cov.trade_count} accepted signals: {counts}")
+    print(f"Win rate, P&L and R below cover the {len(trades)} SETTLED trades only.")
+    for caveat in cov.caveats():
+        print(f"  ! {caveat}")
+    print("=" * 78)
+    print()
 
     by_strategy: dict[str, dict] = {}
-    for row in rows:
-        risk_dollars = abs(row["entry_price"] - row["stop_price"]) * row["sized_qty"]
-        r_multiple = row["realized_pnl"] / risk_dollars if risk_dollars > 0 else 0.0
+    for t in trades:
+        risk_per_share = (
+            abs(t.planned_entry - t.stop_price)
+            if t.planned_entry is not None and t.stop_price is not None
+            else None
+        )
+        risk_dollars = (risk_per_share * t.entry_qty) if risk_per_share else 0.0
+        r_multiple = t.net_pnl / risk_dollars if risk_dollars > 0 else 0.0
         bucket = by_strategy.setdefault(
-            row["strategy"], {"trades": 0, "wins": 0, "pnl": 0.0, "r_sum": 0.0, "worst_r": 0.0}
+            t.strategy, {"trades": 0, "wins": 0, "pnl": 0.0, "r_sum": 0.0, "worst_r": 0.0}
         )
         bucket["trades"] += 1
-        if row["realized_pnl"] > 0:
+        if t.net_pnl > 0:
             bucket["wins"] += 1
-        bucket["pnl"] += row["realized_pnl"]
+        bucket["pnl"] += t.net_pnl
         bucket["r_sum"] += r_multiple
         bucket["worst_r"] = min(bucket["worst_r"], r_multiple)
 
     if not by_strategy:
-        print("No accepted trades in the journal yet.")
+        print("No settled trades in the journal yet.")
     else:
         # Worst-single-trade R is tracked separately from the average R
         # above deliberately: an average can look fine while still masking
