@@ -30,17 +30,38 @@ class FakeErrorEvent:
 
 
 class FakeScanIB:
-    """Emits `errors` through errorEvent during the scan, then returns `rows`."""
+    """Emits `errors` through errorEvent during the scan, then returns `rows`.
 
-    def __init__(self, rows=(), errors=()):
+    Mirrors the shape scan_candidates actually drives -- subscribe, await
+    the wrapper request, cancel -- so that `cancelled` can witness the
+    subscription cleanup that IBKR's ten-slot limit depends on.
+    """
+
+    def __init__(self, rows=(), errors=(), hang=False):
         self._rows = list(rows)
         self._errors = list(errors)
+        self._hang = hang
         self.errorEvent = FakeErrorEvent()
+        self.cancelled: list[int] = []
+        self.subscribed = 0
+        self.wrapper = SimpleNamespace(startReq=self._start_req)
 
-    async def reqScannerDataAsync(self, subscription):
+    def reqScannerSubscription(self, subscription, *args):
+        self.subscribed += 1
+        return SimpleNamespace(reqId=7)
+
+    def _start_req(self, reqId, container=None):
+        return self._scan()
+
+    async def _scan(self):
         for code, message in self._errors:
             self.errorEvent.emit(-1, code, message, None)
+        if self._hang:
+            await asyncio.sleep(3600)
         return self._rows
+
+    def cancelScannerSubscription(self, dataList):
+        self.cancelled.append(dataList.reqId)
 
 
 def _row(symbol):
@@ -98,10 +119,54 @@ def test_unrelated_error_with_empty_result_is_not_a_refusal(tmp_path):
 
 def test_listener_is_detached_even_when_the_request_raises(tmp_path):
     class BoomIB(FakeScanIB):
-        async def reqScannerDataAsync(self, subscription):
+        async def _scan(self):
             raise RuntimeError("connection reset")
 
     ib = BoomIB()
     with pytest.raises(RuntimeError):
         asyncio.run(scan_candidates(ib, _config(tmp_path)))
     assert ib.errorEvent.listeners == []
+    assert ib.cancelled == [7], "a failed scan must not leak its slot either"
+
+
+# --------------------------------------------------------------------------
+# Scanner subscription leak -- the 2026-09-28 and 2026-10-01 outages
+# --------------------------------------------------------------------------
+
+
+def test_scan_cancels_its_subscription_on_the_happy_path(tmp_path):
+    ib = FakeScanIB(rows=[_row("AAA")])
+    asyncio.run(scan_candidates(ib, _config(tmp_path)))
+    assert ib.cancelled == [7]
+
+
+def test_scan_cancels_its_subscription_when_it_times_out(tmp_path):
+    # THE regression. ib_async's reqScannerDataAsync only cancels the
+    # subscription on the line AFTER `await future`, so timing it out from
+    # outside skipped the cancel and leaked a slot server side. IBKR allows
+    # ten per connection: on 2026-10-01 overnight data-farm timeouts burned
+    # all ten in about six minutes, and every scan for the next three and a
+    # half hours was refused with code 322 -- one symbol onboarded, zero
+    # signals, for the whole pre-market session.
+    ib = FakeScanIB(hang=True)
+    with pytest.raises(asyncio.TimeoutError):
+        asyncio.run(scan_candidates(ib, _config(tmp_path), timeout=0.01))
+    assert ib.cancelled == [7], "timed-out scan must still release its slot"
+
+
+def test_scan_cancels_its_subscription_when_the_scan_is_refused(tmp_path):
+    ib = FakeScanIB(rows=[], errors=[(322, "Only 10 simultaneous API scanner subscriptions are allowed.")])
+    with pytest.raises(ScannerRefused):
+        asyncio.run(scan_candidates(ib, _config(tmp_path), timeout=5))
+    assert ib.cancelled == [7], "a refused scan must not leak its slot either"
+
+
+def test_repeated_timeouts_never_accumulate_subscriptions(tmp_path):
+    # The shape of the actual outage: the scan loop re-polls every few
+    # seconds, so a persistent timeout used to consume a slot per tick.
+    config = _config(tmp_path)
+    for _ in range(25):
+        ib = FakeScanIB(hang=True)
+        with pytest.raises(asyncio.TimeoutError):
+            asyncio.run(scan_candidates(ib, config, timeout=0.01))
+        assert len(ib.cancelled) == ib.subscribed

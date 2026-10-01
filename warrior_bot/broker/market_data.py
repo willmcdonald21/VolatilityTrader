@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from ib_async import IB, ScannerSubscription
@@ -53,19 +54,32 @@ def build_scanner_subscription(config: AppConfig) -> ScannerSubscription:
     )
 
 
-async def scan_candidates(ib: IB, config: AppConfig) -> list[str]:
+async def scan_candidates(ib: IB, config: AppConfig, timeout: float = 30.0) -> list[str]:
     """One-shot scan; returns a list of candidate symbols.
 
     Uses reqScannerData (request/response) rather than the long-lived
     reqScannerSubscription stream, since the strategy loop re-polls on
     `scanner.refresh_seconds` rather than reacting to push updates.
 
-    Raises ScannerRefused when IBKR rejected the request rather than
-    returning no matches. The two are indistinguishable from the return
-    value alone -- both are an empty list -- so errors raised during the
-    call are captured and inspected. Only an EMPTY result paired with a
-    refusal code counts: a scan that returned rows despite some incidental
-    error is a successful scan.
+    Owns its own timeout, and that is load-bearing -- do NOT wrap this call
+    in asyncio.wait_for again. ib_async's reqScannerDataAsync is:
+
+        dataList = self.reqScannerSubscription(...)
+        future = self.wrapper.startReq(dataList.reqId, container=dataList)
+        await future
+        self.client.cancelScannerSubscription(dataList.reqId)   # <-- skipped
+
+    Cancelling it from outside interrupts `await future`, so the cancel on
+    the last line never runs and the subscription stays open server side.
+    IBKR allows ten per connection. That is the mechanism behind the
+    outage described in ScannerRefused above, and it recurred on
+    2026-10-01: the scanner timed out repeatedly during overnight data-farm
+    maintenance, burned all ten slots in about six minutes, and every scan
+    for the next three and a half hours was refused with code 322. One
+    symbol onboarded and no signals fired for the whole pre-market session.
+
+    Subscribing explicitly and cancelling in `finally` makes the cleanup
+    unconditional -- on timeout, on refusal, and on cancellation from above.
     """
     subscription = build_scanner_subscription(config)
 
@@ -76,9 +90,18 @@ async def scan_candidates(ib: IB, config: AppConfig) -> list[str]:
             refusals.append((errorCode, errorString))
 
     ib.errorEvent += _capture_error
+    data_list = ib.reqScannerSubscription(subscription)
     try:
-        results = await ib.reqScannerDataAsync(subscription)
+        results = await asyncio.wait_for(
+            ib.wrapper.startReq(data_list.reqId, container=data_list), timeout
+        )
     finally:
+        try:
+            ib.cancelScannerSubscription(data_list)
+        except Exception:  # pragma: no cover - defensive
+            # Never let cleanup mask the original failure, but do say so:
+            # a cancel that silently fails is how the slots leak.
+            logger.warning("Could not cancel scanner subscription %s", data_list.reqId, exc_info=True)
         try:
             ib.errorEvent -= _capture_error
         except Exception:  # pragma: no cover - defensive

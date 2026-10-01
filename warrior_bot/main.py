@@ -491,7 +491,12 @@ class WarriorBot:
                 continue
             try:
                 try:
-                    symbols = await asyncio.wait_for(scan_candidates(self.ib, self.config), timeout=30)
+                    # NOT wrapped in asyncio.wait_for: scan_candidates owns
+                    # its timeout so it can cancel the scanner subscription
+                    # on the way out. Timing it out from here is what leaked
+                    # all ten of IBKR's slots on 2026-09-28 and again on
+                    # 2026-10-01 -- see scan_candidates' docstring.
+                    symbols = await scan_candidates(self.ib, self.config, timeout=30)
                 except ScannerRefused as exc:
                     await self._handle_scanner_refusal(exc)
                     await asyncio.sleep(self.config.scanner.refresh_seconds)
