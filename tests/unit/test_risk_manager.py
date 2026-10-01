@@ -28,10 +28,12 @@ class FakePositionManager:
         tracked: set | None = None,
         first_entry_age: float | None = None,
         holder_strategies: set | None = None,
+        losing_lots: int = 0,
     ):
         self._open_lots = open_lots
         self._tracked = tracked or set()
         self._first_entry_age = first_entry_age
+        self._losing_lots = losing_lots
         # Defaults to "gap_and_go" (make_signal's own default strategy)
         # whenever a lot is open and no explicit holders were given -- the
         # common case in these tests is exercising the add-on path itself,
@@ -43,6 +45,9 @@ class FakePositionManager:
 
     def open_lot_count(self, symbol: str) -> int:
         return self._open_lots
+
+    def losing_lots_today(self, symbol: str) -> int:
+        return self._losing_lots
 
     def open_lot_strategies(self, symbol: str) -> set:
         return set(self._holder_strategies)
@@ -85,9 +90,13 @@ def make_risk_manager(tmp_path, snapshot, open_lots: int = 0, **risk_overrides) 
         allow_cross_strategy_stacking=risk_overrides.get("allow_cross_strategy_stacking", False),
         round_number_size_multiplier=risk_overrides.get("round_number_size_multiplier", 1.15),
         flat_top_size_multiplier=risk_overrides.get("flat_top_size_multiplier", 1.15),
+        # Off unless a test opts in: every pre-existing test here predates
+        # the gate and asserts behaviour on a symbol with no loss history,
+        # which is exactly what 0 means.
+        max_losses_per_symbol_per_day=risk_overrides.get("max_losses_per_symbol_per_day", 0),
     )
     account_state = FakeAccountState(snapshot)
-    position_manager = FakePositionManager(open_lots)
+    position_manager = FakePositionManager(open_lots, losing_lots=risk_overrides.get("losing_lots", 0))
     return RiskManager(
         config,
         account_state,

@@ -1348,6 +1348,10 @@ class WarriorBot:
         self.risk_manager.mark_start_of_day(snapshot.net_liquidation)
         self._persist_daily_risk_state()
         self.position_manager.clear()
+        # Separate from clear() on purpose: clear() also runs mid-day on a
+        # flatten, where forgetting which symbols already burnt us would
+        # re-open every one of them.
+        self.position_manager.reset_daily_losses()
         self._eod_flatten_fired = False
         self._loss_limit_flatten_fired = False
         self._last_logged_breadth = None

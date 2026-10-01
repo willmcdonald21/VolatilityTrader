@@ -36,8 +36,10 @@ class RiskManager:
     """Every signal must pass through here before an order reaches IBKR.
 
     Rules are checked in a fixed order (kill switch -> daily loss halt ->
-    max concurrent positions -> position sizing) so the rejection reason is
-    always the first blocking condition, not the last one evaluated.
+    entry window -> max concurrent positions -> per-symbol rules
+    (symbol_loss_cap -> max lots -> cross-strategy conflict -> add-on age)
+    -> position sizing) so the rejection reason is always the first
+    blocking condition, not the last one evaluated.
     """
 
     def __init__(
@@ -238,6 +240,23 @@ class RiskManager:
                 reason = (
                     f"remaining slot reserved for scanner_rank <= {self.config.reserved_top_tier_max_rank} "
                     f"(open positions: {open_count})"
+                )
+                alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
+                return RiskDecision(False, 0, reason, snapshot)
+
+        if self.config.max_losses_per_symbol_per_day:
+            # A symbol that already took money off us today is done, no
+            # matter which strategy brings the next signal.
+            # allow_cross_strategy_stacking below only inspects OPEN lots,
+            # so once the first strategy has stopped out there is nothing
+            # left to conflict with and the next one walks straight back
+            # in. 38 of 200 closed trades (2026-09-14 onward) were exactly
+            # that: 23.7% win rate, -$1,616.81, a third of all losses.
+            prior_losses = self.position_manager.losing_lots_today(signal.symbol)
+            if prior_losses >= self.config.max_losses_per_symbol_per_day:
+                reason = (
+                    f"symbol_loss_cap: {signal.symbol} already closed {prior_losses} "
+                    f"losing lot(s) today (max {self.config.max_losses_per_symbol_per_day})"
                 )
                 alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
                 return RiskDecision(False, 0, reason, snapshot)

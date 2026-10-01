@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -98,6 +99,13 @@ class ManagedPosition:
     # pending_stop_request and applied once the in-flight one settles.
     stop_replace_pending: bool = False
     pending_stop_request: tuple[float | None, int | None] | None = None
+    # Running cash in/out for this lot, accumulated fill by fill, used only
+    # to decide whether the lot finished red (see _close_out ->
+    # _record_lot_outcome). Gross of commission, which is not known at fill
+    # time -- same treatment _notify_stop_fill already uses, and immaterial
+    # at these sizes for a yes/no "did this lose money" test.
+    entry_cost: float = 0.0
+    exit_proceeds: float = 0.0
 
 
 class PositionManager:
@@ -138,9 +146,24 @@ class PositionManager:
         # single fill's own P&L instead of the account's running total.
         self.account_state = account_state
         self._positions: dict[str, list[ManagedPosition]] = {}
+        # Symbols that have closed a losing lot today, and how many --
+        # what RiskManager's symbol_loss_cap gate reads. Deliberately NOT
+        # cleared by clear(): that is also called mid-day by
+        # _trigger_flatten, and wiping the day's loss record there would
+        # re-open every burnt symbol. Only reset_daily_losses(), called
+        # from reset_daily_state() on the ET calendar date, clears it.
+        self._symbol_losses: Counter[str] = Counter()
 
     def open_lot_count(self, symbol: str) -> int:
         return len(self._positions.get(symbol, []))
+
+    def losing_lots_today(self, symbol: str) -> int:
+        """How many lots in this symbol have closed net negative today.
+
+        Counts only *finished* lots: _close_out defers to parent_done, so
+        a position that is momentarily flat while its entry order is still
+        filling is not scored (the BLSG 2026-09-14 case)."""
+        return self._symbol_losses[symbol]
 
     def open_lot_strategies(self, symbol: str) -> set[str]:
         """Which strategy(ies) currently hold a lot in this symbol -- lets
@@ -260,6 +283,7 @@ class PositionManager:
         def on_entry_fill(t: Trade, fill) -> None:
             pos.entry_filled = True
             pos.remaining_qty += int(fill.execution.shares)
+            pos.entry_cost += fill.execution.price * fill.execution.shares
             # t.orderStatus.remaining reflects the parent's own state as of
             # *this* fill -- 0 means nothing is left to fill, ever. Until
             # that's true, a remaining_qty of 0 later on just means
@@ -508,6 +532,11 @@ class PositionManager:
             for pos in lots:
                 self._cancel_resize_task(pos)
         self._positions.clear()
+
+    def reset_daily_losses(self) -> None:
+        """Forgets which symbols burnt us today. Separate from clear() on
+        purpose -- see _symbol_losses' comment in __init__."""
+        self._symbol_losses.clear()
 
     def _cancel_resize_task(self, pos: ManagedPosition) -> None:
         """Kills any armed stop-resize before a lot stops being tracked.
@@ -917,15 +946,21 @@ class PositionManager:
 
         trade.statusEvent += on_status
 
-    def _apply_exit_fill(self, pos: ManagedPosition, filled_qty: float) -> None:
-        """Decrements remaining_qty, and treats an oversell as the incident
-        it is rather than clamping it away.
+    def _apply_exit_fill(self, pos: ManagedPosition, filled_qty: float, price: float) -> None:
+        """Decrements remaining_qty, accumulates the lot's exit proceeds,
+        and treats an oversell as the incident it is rather than clamping
+        it away.
+
+        `price` is required rather than optional on purpose: a caller that
+        forgot to pass it would leave proceeds short and make a winning
+        lot read as a loss to the symbol_loss_cap gate.
 
         Profit tiers are deliberately not OCA-linked to the stop
         (bracket_builder), so both legs stay independently live and can fill
         nearly simultaneously. `max(0, ...)` used to silently erase the
         evidence, leaving a real short at IBKR that only the reconciliation
         watchdog would notice, up to 30s later."""
+        pos.exit_proceeds += price * filled_qty
         remaining = pos.remaining_qty - int(round(filled_qty))
         if remaining < 0:
             logger.error(
@@ -944,7 +979,7 @@ class PositionManager:
         pos.remaining_qty = max(0, remaining)
 
     def _on_target_fill(self, pos: ManagedPosition, fill, role: str = "target") -> None:
-        self._apply_exit_fill(pos, fill.execution.shares)
+        self._apply_exit_fill(pos, fill.execution.shares, fill.execution.price)
         if role == "scale_out":
             pos.tier_fill_count += 1
         if pos.remaining_qty <= 0:
@@ -994,7 +1029,7 @@ class PositionManager:
             # journaled but never notified.
             self._notify_stop_fill(pos, fill)
 
-        self._apply_exit_fill(pos, fill.execution.shares)
+        self._apply_exit_fill(pos, fill.execution.shares, fill.execution.price)
         if pos.remaining_qty <= 0:
             self._close_out(pos, cancel_stop=False, cancel_target=True)
 
@@ -1046,9 +1081,34 @@ class PositionManager:
             for target_order in pos.target_orders:
                 self.ib.cancelOrder(target_order)
         if pos.parent_done:
+            self._record_lot_outcome(pos)
             self._untrack(pos)
         else:
             logger.info(
                 "%s flat for now but parent order still filling -- staying tracked so any further fills stay protected",
                 pos.symbol,
             )
+
+    def _record_lot_outcome(self, pos: ManagedPosition) -> None:
+        """Scores a genuinely finished lot red or green, for the
+        symbol_loss_cap gate in risk_manager.py.
+
+        Called only from _close_out's parent_done branch, so a lot that is
+        merely flat-for-now while its entry is still filling is never
+        scored (the BLSG 2026-09-14 case). A lot that never filled at all
+        has no cost basis and is not an outcome, so it is skipped rather
+        than counted as a free loss."""
+        if pos.entry_cost <= 0:
+            return
+        realized = pos.exit_proceeds - pos.entry_cost
+        if realized >= 0:
+            return
+        self._symbol_losses[pos.symbol] += 1
+        logger.info(
+            "%s (%s) closed red (%.2f): %d losing lot(s) today -- symbol now off limits "
+            "if that meets risk.max_losses_per_symbol_per_day",
+            pos.symbol,
+            pos.signal.strategy,
+            realized,
+            self._symbol_losses[pos.symbol],
+        )

@@ -1628,7 +1628,7 @@ def test_oversell_alerts_and_flattens_instead_of_clamping(monkeypatch):
     track_position(pm, signal, quantity=100)
     pos = pm._positions["TEST"][0]
 
-    pm._apply_exit_fill(pos, 150)  # sold 150 against a 100-share position
+    pm._apply_exit_fill(pos, 150, 9.0)  # sold 150 against a 100-share position
 
     assert pos.remaining_qty == 0
     assert len(flatten_calls) == 1

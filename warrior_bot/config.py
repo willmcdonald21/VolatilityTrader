@@ -167,6 +167,21 @@ class RiskConfig(BaseModel):
     # still gated by addon_min_seconds_after_first_entry below) is
     # unaffected either way.
     allow_cross_strategy_stacking: bool = False
+    # How many lots a symbol may close at a LOSS before it is off limits
+    # for the rest of the day. allow_cross_strategy_stacking above only
+    # covers the *concurrent* case -- it checks open lots, so by the time
+    # the first strategy has stopped out there is nothing left to conflict
+    # with and the next strategy walks straight back into the same name.
+    # Confirmed across the journal (2026-09-14 onward): 38 of 200 closed
+    # trades were entries into a symbol that had already stopped out that
+    # day -- 23.7% win rate, -$1,616.81, i.e. 34% of all losses. Typical
+    # shape is gap_and_go stopping out and vwap_reversion re-entering an
+    # hour later, taking the same loss under a different pattern name
+    # (PFSA x3 on 09-24, -$393.59; MASK x2 on 09-22, -$393.42).
+    # 0 disables the gate. A scratch-loss threshold was considered and
+    # dropped: counting only losses worse than 0.10R or 0.25R selects the
+    # identical 38 trades, so a plain net-negative test is enough.
+    max_losses_per_symbol_per_day: int = Field(default=1, ge=0)
 
     @model_validator(mode="after")
     def _guard_reserved_slots(self) -> "RiskConfig":
