@@ -305,3 +305,86 @@ def test_warmup_has_a_floor_just_after_the_open():
 
 def test_warmup_is_capped_at_a_session():
     assert int(warmup_duration(et(19, 0)).split()[0]) <= 16 * 3600
+
+
+# --------------------------------------------------------------------------
+# Warmup fallback
+# --------------------------------------------------------------------------
+
+
+class _FakeIB:
+    """Records every durationStr asked for, and can fail or return empty
+    for the wide window the way IBKR does."""
+
+    def __init__(self, mode="ok"):
+        self.mode = mode
+        self.requested: list[str] = []
+
+    async def reqHistoricalDataAsync(self, contract, *, durationStr, **kwargs):
+        self.requested.append(durationStr)
+        if durationStr != "3600 S":
+            if self.mode == "raise":
+                raise RuntimeError("IBKR refused the duration")
+            if self.mode == "empty":
+                return []
+        return ["bar"]
+
+
+class _FakeContract:
+    symbol = "T"
+
+
+def _run(coro):
+    import asyncio
+
+    return asyncio.run(coro)
+
+
+def _config():
+    from warrior_bot.config import load_config
+
+    return load_config()
+
+
+def test_warmup_falls_back_to_an_hour_when_the_wide_request_is_refused():
+    # The caller treats a warmup failure as "do not onboard this symbol",
+    # so an IBKR refusal of the widened window would take the whole
+    # strategy layer offline rather than degrade one symbol's VWAP.
+    from warrior_bot.broker.historical import fetch_warmup_bars
+
+    ib = _FakeIB(mode="raise")
+    bars = _run(fetch_warmup_bars(ib, _FakeContract(), _config(), duration="57600 S"))
+    assert bars == ["bar"]
+    assert ib.requested == ["57600 S", "3600 S"]
+
+
+def test_warmup_falls_back_when_the_wide_request_returns_nothing():
+    from warrior_bot.broker.historical import fetch_warmup_bars
+
+    ib = _FakeIB(mode="empty")
+    bars = _run(fetch_warmup_bars(ib, _FakeContract(), _config(), duration="57600 S"))
+    assert bars == ["bar"]
+    assert ib.requested == ["57600 S", "3600 S"]
+
+
+def test_warmup_does_not_retry_when_the_fallback_itself_fails():
+    from warrior_bot.broker.historical import fetch_warmup_bars
+
+    class AlwaysFails(_FakeIB):
+        async def reqHistoricalDataAsync(self, contract, *, durationStr, **kwargs):
+            self.requested.append(durationStr)
+            raise RuntimeError("down")
+
+    ib = AlwaysFails()
+    with pytest.raises(RuntimeError):
+        _run(fetch_warmup_bars(ib, _FakeContract(), _config(), duration="3600 S"))
+    assert ib.requested == ["3600 S"]
+
+
+def test_warmup_makes_a_single_request_on_the_happy_path():
+    from warrior_bot.broker.historical import fetch_warmup_bars
+
+    ib = _FakeIB(mode="ok")
+    bars = _run(fetch_warmup_bars(ib, _FakeContract(), _config(), duration="19200 S"))
+    assert bars == ["bar"]
+    assert ib.requested == ["19200 S"]

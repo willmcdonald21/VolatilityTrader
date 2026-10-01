@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 
 from ib_async import IB, Contract
 
 from warrior_bot.config import AppConfig
 from warrior_bot.utils.time_utils import now_eastern, session_anchor
+
+logger = logging.getLogger("warrior_bot.broker.historical")
+
+# The pre-2026-09-30 fixed window, kept as the degraded fallback.
+_FALLBACK_DURATION = "3600 S"
 
 # A fixed hour was never enough to seed a session-anchored VWAP, but there is
 # no point asking IBKR for more 1-minute bars than a session can contain
@@ -35,17 +41,55 @@ async def fetch_warmup_bars(ib: IB, contract: Contract, config: AppConfig, durat
     indicators are correct from the first bar. Bars that precede the anchor
     are harmless: SymbolContext.session_bars filters them out of VWAP and
     session volume, while EMA/ATR/MACD legitimately want the extra depth.
+
+    Falls back to the old one-hour window if the wider request fails. A
+    widened durationStr is the kind of thing IBKR can refuse for reasons
+    outside this bot's control (pacing, a contract with thin history, a
+    data-farm hiccup), and the caller treats a warmup failure as "do not
+    onboard this symbol" -- so without the fallback a refusal here takes
+    the whole strategy layer offline rather than degrading one symbol's
+    VWAP. A worse warmup beats no candidates.
     """
-    return await ib.reqHistoricalDataAsync(
-        contract,
-        endDateTime="",
-        durationStr=duration or warmup_duration(),
-        barSizeSetting="1 min",
-        whatToShow="TRADES",
-        useRTH=config.trading.use_rth,
-        formatDate=2,
-        keepUpToDate=False,
-    )
+    requested = duration or warmup_duration()
+
+    async def _request(dur: str):
+        return await ib.reqHistoricalDataAsync(
+            contract,
+            endDateTime="",
+            durationStr=dur,
+            barSizeSetting="1 min",
+            whatToShow="TRADES",
+            useRTH=config.trading.use_rth,
+            formatDate=2,
+            keepUpToDate=False,
+        )
+
+    try:
+        bars = await _request(requested)
+    except Exception:
+        if requested == _FALLBACK_DURATION:
+            raise
+        logger.warning(
+            "Warmup request for %s bars failed for %s -- retrying with %s; this symbol's VWAP "
+            "will be anchored short until the next re-onboard",
+            requested,
+            contract.symbol,
+            _FALLBACK_DURATION,
+        )
+        return await _request(_FALLBACK_DURATION)
+
+    if not bars and requested != _FALLBACK_DURATION:
+        # An empty result is the other way IBKR refuses a window: no
+        # exception, just nothing. Indistinguishable from a genuinely
+        # untraded symbol here, so retry once rather than onboard blind.
+        logger.warning(
+            "Warmup request for %s bars returned nothing for %s -- retrying with %s",
+            requested,
+            contract.symbol,
+            _FALLBACK_DURATION,
+        )
+        return await _request(_FALLBACK_DURATION)
+    return bars
 
 
 async def fetch_prior_close(ib: IB, contract: Contract) -> float | None:
