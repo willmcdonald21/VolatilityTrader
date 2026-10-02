@@ -3,8 +3,9 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import Counter
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from ib_async import IB, Contract, Order, StopLimitOrder, StopOrder, Trade
@@ -26,6 +27,7 @@ from warrior_bot.strategies.indicators import (
 )
 from warrior_bot.utils.panic import flatten_position
 from warrior_bot.utils.rounding import round_to_tick
+from warrior_bot.utils.time_utils import to_eastern
 
 logger = logging.getLogger("warrior_bot.execution.position_manager")
 
@@ -134,6 +136,7 @@ class PositionManager:
         stop_limit_offset_pct: float = 0.5,
         notifications_config: NotificationsConfig | None = None,
         account_state: AccountState | None = None,
+        trading_date_provider: Callable[[], date] | None = None,
     ):
         self.ib = ib
         self.journal = journal
@@ -152,7 +155,19 @@ class PositionManager:
         # _trigger_flatten, and wiping the day's loss record there would
         # re-open every burnt symbol. Only reset_daily_losses(), called
         # from reset_daily_state() on the ET calendar date, clears it.
+        #
+        # Mirrored to the symbol_loss_state table on every increment and
+        # rehydrated by WarriorBot.start, because this process gets
+        # crash-restarted by its supervisor mid-session and an in-memory
+        # count alone silently un-bans every symbol on the way back up.
         self._symbol_losses: Counter[str] = Counter()
+        # Injected rather than derived here: WarriorBot owns the ET
+        # trading day and advances it on rollover, and a lot closing in
+        # the window between that flip and a locally-computed date would
+        # persist under a different key than the one the restore reads.
+        self._trading_date_provider = trading_date_provider or (
+            lambda: to_eastern(datetime.now(timezone.utc)).date()
+        )
 
     def open_lot_count(self, symbol: str) -> int:
         return len(self._positions.get(symbol, []))
@@ -535,8 +550,25 @@ class PositionManager:
 
     def reset_daily_losses(self) -> None:
         """Forgets which symbols burnt us today. Separate from clear() on
-        purpose -- see _symbol_losses' comment in __init__."""
+        purpose -- see _symbol_losses' comment in __init__.
+
+        Deliberately does NOT delete anything from symbol_loss_state:
+        those rows are keyed by trading date, so the new day simply
+        writes under a new key and the old rows stay as analysis data."""
         self._symbol_losses.clear()
+
+    def restore_daily_losses(self, counts: Mapping[str, int]) -> None:
+        """Rehydrates today's losing-lot counts after a restart, from
+        Journal.load_symbol_losses. Replaces the Counter outright rather
+        than adding to it: the persisted rows are the authority, and this
+        runs before any fill of this session can have scored anything."""
+        self._symbol_losses = Counter(dict(counts))
+        if self._symbol_losses:
+            logger.info(
+                "Restored symbol loss counts: %s -- these symbols stay subject to "
+                "risk.max_losses_per_symbol_per_day despite the restart",
+                dict(self._symbol_losses),
+            )
 
     def _cancel_resize_task(self, pos: ManagedPosition) -> None:
         """Kills any armed stop-resize before a lot stops being tracked.
@@ -983,7 +1015,7 @@ class PositionManager:
         if role == "scale_out":
             pos.tier_fill_count += 1
         if pos.remaining_qty <= 0:
-            self._close_out(pos, cancel_stop=True, cancel_target=False)
+            self._close_out(pos, cancel_stop=True, cancel_target=False, exit_role=role)
             return
         # Resize the stop down after ANY partial target fill (not just a
         # scale_out tier) -- shares that already left via a target fill
@@ -1031,7 +1063,7 @@ class PositionManager:
 
         self._apply_exit_fill(pos, fill.execution.shares, fill.execution.price)
         if pos.remaining_qty <= 0:
-            self._close_out(pos, cancel_stop=False, cancel_target=True)
+            self._close_out(pos, cancel_stop=False, cancel_target=True, exit_role="stop")
 
     def _notify_stop_fill(self, pos: ManagedPosition, fill) -> None:
         """trade_activity line + pnl channel message for a fill on a
@@ -1059,7 +1091,13 @@ class PositionManager:
             daily_pnl = self.account_state.snapshot().daily_realized_pnl if self.account_state else trade_pnl
             send_discord_message(build_pnl_message(pos.symbol, trade_pnl, daily_pnl), channel="pnl")
 
-    def _close_out(self, pos: ManagedPosition, cancel_stop: bool, cancel_target: bool) -> None:
+    def _close_out(
+        self,
+        pos: ManagedPosition,
+        cancel_stop: bool,
+        cancel_target: bool,
+        exit_role: str | None = None,
+    ) -> None:
         """Everything bought so far has also been sold -- best-effort
         cancel whichever counterpart order(s) are still resting (a no-op
         if IBKR's own OCA link already cancelled one).
@@ -1081,7 +1119,7 @@ class PositionManager:
             for target_order in pos.target_orders:
                 self.ib.cancelOrder(target_order)
         if pos.parent_done:
-            self._record_lot_outcome(pos)
+            self._record_lot_outcome(pos, exit_role=exit_role)
             self._untrack(pos)
         else:
             logger.info(
@@ -1089,7 +1127,7 @@ class PositionManager:
                 pos.symbol,
             )
 
-    def _record_lot_outcome(self, pos: ManagedPosition) -> None:
+    def _record_lot_outcome(self, pos: ManagedPosition, exit_role: str | None = None) -> None:
         """Scores a genuinely finished lot red or green, for the
         symbol_loss_cap gate in risk_manager.py.
 
@@ -1112,3 +1150,22 @@ class PositionManager:
             realized,
             self._symbol_losses[pos.symbol],
         )
+        # Guarded, unlike journal.record_fill above: this runs inside an
+        # eventkit fillEvent handler, and an exception escaping here would
+        # abort _close_out before _untrack(pos), leaving a closed lot
+        # tracked forever. Falling back to the old in-memory-only
+        # behavior is strictly better than leaking the lot.
+        try:
+            self.journal.save_symbol_loss(
+                self._trading_date_provider().isoformat(),
+                pos.symbol,
+                self._symbol_losses[pos.symbol],
+                exit_role,
+                realized,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to persist the losing lot for %s -- the symbol_loss_cap gate is "
+                "in-memory only until the next write, so a restart would un-ban it",
+                pos.symbol,
+            )

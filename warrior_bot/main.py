@@ -122,6 +122,10 @@ class WarriorBot:
             stop_limit_offset_pct=config.execution.stop_limit_offset_pct,
             notifications_config=config.notifications,
             account_state=self.account_state,
+            # Share this object's notion of the ET trading day, so a lot
+            # closing during a rollover persists under the same date key
+            # _restore_symbol_losses will read back.
+            trading_date_provider=lambda: self._trading_day,
         )
         self.risk_manager = RiskManager(
             config.risk,
@@ -195,6 +199,7 @@ class WarriorBot:
         snapshot = self.account_state.snapshot()
         self._trading_day = to_eastern(datetime.now(timezone.utc)).date()
         self._restore_or_start_daily_risk_state()
+        self._restore_symbol_losses()
         self.journal.record_account_snapshot(snapshot)
         if self.config.news.enabled and not self._news_provider_codes:
             try:
@@ -690,6 +695,25 @@ class WarriorBot:
             snapshot = self.account_state.snapshot()
             self.risk_manager.mark_start_of_day(snapshot.net_liquidation)
             self._persist_daily_risk_state()
+
+    def _restore_symbol_losses(self) -> None:
+        """Rehydrates the symbol_loss_cap gate's per-symbol losing-lot
+        counts for today, so a crash-restart does not re-open every
+        symbol that already took money off us this session.
+
+        Kept separate from _restore_or_start_daily_risk_state above
+        because that method's restore/establish branch is specifically
+        about the first genuine start of a trading day versus a restart
+        within it. The loss counts have no such distinction -- an absent
+        row just means zero -- and nesting them under that `if` would
+        skip restoration on a day's first start.
+
+        No periodic re-persist is needed (unlike the halt flag): counts
+        are written synchronously the moment a lot closes red."""
+        counts = self.journal.load_symbol_losses(self._trading_day.isoformat())
+        self.position_manager.restore_daily_losses(counts)
+        if counts:
+            self.logger.info("Restored symbol loss state for %s: %s", self._trading_day, counts)
 
     def _persist_daily_risk_state(self) -> None:
         equity = self.risk_manager.start_of_day_equity

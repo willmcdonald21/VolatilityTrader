@@ -56,6 +56,7 @@ TABLES = (
     "bot_heartbeat",
     "kill_switch_events",
     "daily_risk_state",
+    "symbol_loss_state",
 )
 
 

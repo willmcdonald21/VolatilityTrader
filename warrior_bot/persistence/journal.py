@@ -340,3 +340,48 @@ class Journal:
         if row is None:
             return None
         return {"start_of_day_equity": row[0], "loss_limit_halted": bool(row[1])}
+
+    def save_symbol_loss(
+        self,
+        trading_date: str,
+        symbol: str,
+        losing_lots: int,
+        last_exit_role: str | None = None,
+        last_realized_pnl: float | None = None,
+    ) -> None:
+        """Upserts how many lots in `symbol` have closed red on
+        `trading_date` -- see db.py's symbol_loss_state schema comment for
+        why the symbol_loss_cap gate cannot rely on memory alone.
+
+        Writes the ABSOLUTE count rather than `losing_lots + 1`: the
+        in-memory Counter is rehydrated at startup, so it is always the
+        authoritative post-increment value, and an absolute write stays
+        idempotent if a fill callback ever double-fires. An incrementing
+        UPDATE would inflate the count and silently over-ban a symbol."""
+        self.conn.execute(
+            """INSERT INTO symbol_loss_state
+                   (trading_date, symbol, losing_lots, last_exit_role, last_realized_pnl, ts_updated)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(trading_date, symbol) DO UPDATE SET
+                   losing_lots = excluded.losing_lots,
+                   last_exit_role = excluded.last_exit_role,
+                   last_realized_pnl = excluded.last_realized_pnl,
+                   ts_updated = excluded.ts_updated""",
+            (trading_date, symbol, int(losing_lots), last_exit_role, last_realized_pnl, _now()),
+        )
+        self.conn.commit()
+
+    def load_symbol_losses(self, trading_date: str) -> dict[str, int]:
+        """Per-symbol losing-lot counts for `trading_date` (an ET date's
+        isoformat string), for rehydrating the symbol_loss_cap gate on
+        startup.
+
+        Returns an empty dict rather than None when the day has no rows:
+        unlike daily_risk_state's equity baseline, "no losses yet" and
+        "never established" are the same state here, so there is no
+        caller branch to signal."""
+        rows = self.conn.execute(
+            "SELECT symbol, losing_lots FROM symbol_loss_state WHERE trading_date = ?",
+            (trading_date,),
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}

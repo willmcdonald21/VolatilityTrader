@@ -139,6 +139,30 @@ CREATE TABLE IF NOT EXISTS daily_risk_state (
     loss_limit_halted INTEGER NOT NULL DEFAULT 0,
     ts_updated TEXT NOT NULL
 );
+
+-- One row per (ET trading date, symbol): how many lots in that symbol
+-- closed net negative that day. This is what RiskManager's
+-- symbol_loss_cap gate reads, via PositionManager.losing_lots_today.
+-- Exactly the same restart hazard daily_risk_state above exists for:
+-- the count lived only in an in-memory Counter, so every supervisor
+-- crash-restart zeroed it and re-opened every symbol that had already
+-- taken money off us that day. 2026-10-01 alone restarted four times
+-- (00:34, 04:19, 09:44, 09:46) off a scanner-timeout loop, and the
+-- gate had shipped that same afternoon -- it would have held in tests
+-- and done nothing live. last_exit_role/last_realized_pnl are
+-- diagnostic only: the gate counts any net-negative finished lot, and
+-- whether a red EOD flatten should burn a symbol the way a stop-out
+-- does is a question to answer from this data later, not a behavior
+-- change to smuggle in alongside the persistence fix.
+CREATE TABLE IF NOT EXISTS symbol_loss_state (
+    trading_date TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    losing_lots INTEGER NOT NULL,
+    last_exit_role TEXT,
+    last_realized_pnl REAL,
+    ts_updated TEXT NOT NULL,
+    PRIMARY KEY (trading_date, symbol)
+);
 """
 
 

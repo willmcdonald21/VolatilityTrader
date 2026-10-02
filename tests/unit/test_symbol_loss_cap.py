@@ -17,6 +17,7 @@ from __future__ import annotations
 import pytest
 
 import asyncio
+from datetime import date
 from types import SimpleNamespace
 
 from warrior_bot.execution import position_manager as position_manager_module
@@ -32,6 +33,8 @@ from tests.unit.test_position_manager import (
 )
 from tests.unit.test_risk_manager import default_snapshot, make_risk_manager, make_signal
 from warrior_bot.execution.position_manager import PositionManager
+from warrior_bot.persistence.db import get_connection
+from warrior_bot.persistence.journal import Journal
 
 
 @pytest.fixture(autouse=True)
@@ -249,3 +252,152 @@ def test_pyramid_addon_still_allowed_when_nothing_has_closed_red(tmp_path):
 
     assert decision.accepted
     assert decision.sized_qty > 0
+
+
+# --------------------------------------------------------------------------
+# Surviving a restart
+#
+# The gate above reads an in-memory Counter. This process is crash-restarted
+# by its supervisor mid-session -- 2026-10-01 restarted four times off a
+# scanner-timeout loop (00:34, 04:19, 09:44, 09:46) -- and without the
+# symbol_loss_state table every one of those restarts re-opened every symbol
+# that had already taken money off us that day. The gate would have passed
+# every test above and still done nothing live.
+# --------------------------------------------------------------------------
+
+
+def _closed_lot_with_journal(journal, trading_date, exit_price=9.0, quantity=100, entry=10.0):
+    """_closed_lot's path, but against a real Journal and a pinned trading
+    date, so the loss actually lands in symbol_loss_state."""
+    pm = PositionManager(
+        FakeIB(),
+        journal,
+        make_exits_config(trailing_enabled=False),
+        trading_date_provider=lambda: trading_date,
+    )
+    signal = make_pm_signal(entry=entry, stop=9.0)
+    parent_trade = FakeTrade(FakeOrder("BUY", quantity, lmtPrice=entry, orderId=1))
+    stop_trade = FakeTrade(FakeOrder("SELL", quantity, auxPrice=9.0, orderId=2, parentId=1))
+    pm.track(
+        contract=SimpleNamespace(symbol=signal.symbol),
+        signal=signal,
+        signal_id=1,
+        parent_trade=parent_trade,
+        stop_trade=stop_trade,
+        stop_row_id=1,
+        target_trades=[FakeTrade(FakeOrder("SELL", quantity, lmtPrice=12.0, orderId=3))],
+        target_roles=["target"],
+    )
+    parent_trade.fillEvent.emit(parent_trade, make_fill(quantity, price=entry))
+    flush_resize(pm._positions["TEST"][0])
+    live_stop = pm._positions["TEST"][0].stop_order
+    live_trade = next((t for t in pm.ib.trades if t.order is live_stop), stop_trade)
+    live_trade.fillEvent.emit(live_trade, make_fill(quantity, price=exit_price))
+    return pm
+
+
+def test_losing_lot_is_persisted(tmp_path):
+    journal = Journal(get_connection(tmp_path / "journal.sqlite3"))
+
+    _closed_lot_with_journal(journal, date(2026, 10, 1))
+
+    assert journal.load_symbol_losses("2026-10-01") == {"TEST": 1}
+
+
+def test_stop_out_records_its_exit_role(tmp_path):
+    """Diagnostic only -- the gate counts any net-negative lot -- but it is
+    what lets "should a red EOD flatten burn a symbol the way a stop-out
+    does?" be answered from data later instead of guessed at now."""
+    journal = Journal(get_connection(tmp_path / "journal.sqlite3"))
+
+    _closed_lot_with_journal(journal, date(2026, 10, 1))
+
+    row = journal.conn.execute(
+        "SELECT last_exit_role, last_realized_pnl FROM symbol_loss_state WHERE symbol = 'TEST'"
+    ).fetchone()
+    assert row[0] == "stop"
+    assert row[1] == pytest.approx(-100.0)
+
+
+def test_winning_lot_is_not_persisted(tmp_path):
+    journal = Journal(get_connection(tmp_path / "journal.sqlite3"))
+
+    _closed_lot_with_journal(journal, date(2026, 10, 1), exit_price=11.0)
+
+    assert journal.load_symbol_losses("2026-10-01") == {}
+
+
+def test_the_gate_survives_a_restart(tmp_path):
+    """The bug this whole change exists for. A second PositionManager over
+    the same journal -- i.e. the supervisor's relaunch -- must still know
+    TEST burnt us, and the gate must still reject it."""
+    journal = Journal(get_connection(tmp_path / "journal.sqlite3"))
+    _closed_lot_with_journal(journal, date(2026, 10, 1))
+
+    restarted = PositionManager(
+        FakeIB(),
+        journal,
+        make_exits_config(trailing_enabled=False),
+        trading_date_provider=lambda: date(2026, 10, 1),
+    )
+    assert restarted.losing_lots_today("TEST") == 0  # nothing restored yet
+    restarted.restore_daily_losses(journal.load_symbol_losses("2026-10-01"))
+
+    assert restarted.losing_lots_today("TEST") == 1
+    rm = make_risk_manager(
+        tmp_path, default_snapshot(), max_losses_per_symbol_per_day=1, losing_lots=1
+    )
+    decision = rm.evaluate(make_signal())
+    assert not decision.accepted
+    assert "symbol_loss_cap" in decision.reason
+
+
+def test_restore_is_scoped_to_the_trading_date(tmp_path):
+    """A restart on 10-02 must not inherit 10-01's bans -- that would ban
+    symbols forever rather than for the day."""
+    journal = Journal(get_connection(tmp_path / "journal.sqlite3"))
+    _closed_lot_with_journal(journal, date(2026, 10, 1))
+
+    restarted = PositionManager(
+        FakeIB(),
+        journal,
+        make_exits_config(trailing_enabled=False),
+        trading_date_provider=lambda: date(2026, 10, 2),
+    )
+    restarted.restore_daily_losses(journal.load_symbol_losses("2026-10-02"))
+
+    assert restarted.losing_lots_today("TEST") == 0
+
+
+def test_restore_replaces_rather_than_accumulates(tmp_path):
+    """Restoring twice (a double-called start, say) must not double the
+    count and over-ban the symbol."""
+    journal = Journal(get_connection(tmp_path / "journal.sqlite3"))
+    _closed_lot_with_journal(journal, date(2026, 10, 1))
+    pm = PositionManager(
+        FakeIB(),
+        journal,
+        make_exits_config(trailing_enabled=False),
+        trading_date_provider=lambda: date(2026, 10, 1),
+    )
+
+    pm.restore_daily_losses(journal.load_symbol_losses("2026-10-01"))
+    pm.restore_daily_losses(journal.load_symbol_losses("2026-10-01"))
+
+    assert pm.losing_lots_today("TEST") == 1
+
+
+def test_a_failed_persist_does_not_leak_the_closed_lot(tmp_path):
+    """The try/except in _record_lot_outcome. This runs inside an eventkit
+    fillEvent handler: an exception escaping would abort _close_out before
+    _untrack, leaving a closed lot tracked forever with no resting stop.
+    Degrading to in-memory-only is strictly better than that."""
+
+    class ExplodingJournal(FakeJournal):
+        def save_symbol_loss(self, *args, **kwargs):
+            raise RuntimeError("disk full")
+
+    pm = _closed_lot_with_journal(ExplodingJournal(), date(2026, 10, 1))
+
+    assert pm.losing_lots_today("TEST") == 1  # in-memory count still advanced
+    assert "TEST" not in pm._positions  # and the lot was still untracked

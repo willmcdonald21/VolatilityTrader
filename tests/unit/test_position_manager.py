@@ -158,7 +158,15 @@ class FakeJournal:
         self.orders_recorded = []
         self.order_statuses = []
         self.fills_recorded = []
+        self.symbol_losses_saved = []
         self._next_row_id = 100
+
+    def save_symbol_loss(
+        self, trading_date, symbol, losing_lots, last_exit_role=None, last_realized_pnl=None
+    ):
+        self.symbol_losses_saved.append(
+            (trading_date, symbol, losing_lots, last_exit_role, last_realized_pnl)
+        )
 
     def update_order_price(self, order_row_id, limit_price=None, stop_price=None, qty=None):
         self.price_updates.append((order_row_id, limit_price, stop_price, qty))
