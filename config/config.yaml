@@ -83,8 +83,19 @@ strategies:
     max_pullback_pct: 50.0         # pullback must retrace no more than this % of the spike
     stop_buffer_pct: 1.0          # stop placed this % below the pullback low
     target_r_multiple: 2.0        # profit target expressed as multiple of risk (R)
-    enable_float_filter: true      # skips symbols missing from config/float_list.csv (graceful no-op until that file exists)
-    max_float_shares: 10000000     # matches Ross Cameron's "5 Pillars" filter (<=10M, aggressive traders use 5M)
+    # OFF, and honestly so. This read `true` for the repo's first two months
+    # while rejecting exactly zero symbols: config/float_list.csv has never
+    # existed (gitignored since the initial commit, no generator anywhere),
+    # and FloatProvider.passes_filter fails OPEN on an unknown or >30-day-stale
+    # symbol, so every candidate passed the "low float" check unscreened.
+    # 0 of 2,311 signals ever carried float data. A post-mortem then read the
+    # old "matches Ross Cameron's 5 Pillars" comment here and took the low-float
+    # pillar to be live when judging 205 trades; it was not, and that filter
+    # applied to gap_and_go only even in principle -- bull_flag, abcd and
+    # vwap_reversion are constructed without a float provider at all.
+    # Re-enabling needs more than the CSV: see docs/strategy_decisions.md.
+    enable_float_filter: false
+    max_float_shares: 10000000     # inert while the filter is off; <=10M is the Ross Cameron figure it would use
     min_float_rotation: 0.0        # day's cumulative volume / float; 0 = disabled (also needs float_list.csv data)
     min_breakout_candle_strength: 0.0  # (close-open)/(high-low) of the breakout bar; 0.0 = must close net-bullish, not just above the level
     max_extension_atr_multiple: 2.5  # reject if the breakout bar already closed this many ATRs past the opening-range high -- GDC/DCOY/EDBL (2026-09-22) all chased a bar that had already run 3-40% past the level and reversed within minutes

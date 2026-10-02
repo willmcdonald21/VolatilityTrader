@@ -910,3 +910,54 @@ automated bot. The `weekly_goal = daily_goal × 3` / monthly goal cascade is
 a reporting/target-setting formula, not a live-trading gate — could be
 added to `scripts/daily_report.py` later if useful, but doesn't belong in
 the trading logic itself.
+
+## Deferred: a float filter that actually filters
+
+`strategies.gap_and_go.enable_float_filter` was set to `true` from
+2026-08-04 (`bb406ee`) until 2026-10-01 and rejected **zero symbols** in
+that entire window — `_validate_float_filter` in `main.py` counted 0 of
+2,311 signals carrying any float data at all. Three independent reasons:
+
+1. `config/float_list.csv` has never existed. It is gitignored from the
+   initial commit (`.gitignore:8`), was never tracked on any branch, and
+   no script in `scripts/` generates or downloads it.
+2. `FloatProvider.passes_filter` fails **open** — an unknown symbol, or a
+   row older than the hardcoded `max_age_days=30`, returns `True`. That is
+   deliberate and documented ("float filtering degrades gracefully to
+   off"), but it means a missing file silently disables the pillar instead
+   of announcing it.
+3. `main.py` passes the provider only to `GapAndGoStrategy`. `bull_flag`,
+   `abcd` and `vwap_reversion` are constructed without one, so even a
+   populated CSV would leave the low-float pillar unenforced for three of
+   the four strategies.
+
+This mattered beyond hygiene: a 205-trade post-mortem on 2026-10-01 read
+the old "matches Ross Cameron's 5 Pillars" comment in `config.yaml`,
+concluded the strategies had been tested on a low-float universe, and
+judged their entries structurally broken on that basis. They had never
+run on that universe. The flag is now `false` with the reasoning inline,
+and the `config.py` default flipped to `False` so an omitted key lands on
+the honest state.
+
+**Why not just populate the CSV.** A static hand-maintained file cannot
+cover a universe the scanner discovers intraday — most of any given day's
+gappers would be absent, and `passes_filter`'s fail-open would wave them
+through, leaving the filter a near-total no-op while *looking* active.
+That is the current failure mode with extra steps. Fail-**closed** is no
+better: against a 30-day-stale manual CSV it would reject nearly the whole
+tradeable universe.
+
+**What a real one needs**, in order: (a) a live float data source queried
+at symbol-onboarding time, not a static file; (b) the three float keys
+hoisted out of `GapAndGoConfig` into a top-level `FloatFilterConfig` and
+applied once centrally — the natural site is `_eligible_for_new_signals`
+in `main.py`, which already gates every strategy on scanner rank — rather
+than duplicated into four strategies; (c) an explicit
+`on_missing: pass|block` policy so the degradation is a choice the
+operator makes, not a surprise; (d) `max_age_days` (currently hardcoded at
+`float_provider.py:38`) moved into that config.
+
+`FloatProvider`, the `_validate_float_filter` alert, and the `gap_and_go`
+call sites are all left in place and unchanged. They are correct code with
+no data behind them, and `tests/unit/test_gap_and_go.py` already pins
+their behavior — deleting them would throw away the part that works.

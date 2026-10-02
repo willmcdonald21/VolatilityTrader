@@ -227,7 +227,11 @@ class GapAndGoConfig(BaseModel):
     max_pullback_pct: float = 50.0
     stop_buffer_pct: float = 1.0
     target_r_multiple: float = 2.0
-    enable_float_filter: bool = True
+    # Defaults to OFF: there is no float data source in this project, so
+    # leaving it on describes a filter that cannot run (see the config.yaml
+    # comment and FloatProvider's fail-open contract). An omitted key
+    # should land on the honest state, not the aspirational one.
+    enable_float_filter: bool = False
     max_float_shares: float = 10_000_000
     min_float_rotation: float = 0.0  # today's cumulative volume / float; 0 = disabled (needs float_list.csv data)
     min_breakout_candle_strength: float = Field(default=0.0, ge=-1.0, le=1.0)
