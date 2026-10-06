@@ -677,8 +677,8 @@ def test_onboard_symbol_skips_entirely_when_at_capacity_and_nothing_evictable(tm
 
 
 class _FakePosition:
-    def __init__(self, symbol, qty, exchange="NASDAQ"):
-        self.contract = SimpleNamespace(symbol=symbol, exchange=exchange)
+    def __init__(self, symbol, qty, exchange="NASDAQ", secType="STK"):
+        self.contract = SimpleNamespace(symbol=symbol, exchange=exchange, secType=secType)
         self.position = qty
 
 
@@ -795,6 +795,49 @@ def test_reconciliation_flattens_long_position_with_no_resting_stop(tmp_path, mo
     assert contract.symbol == "UCAR"
     assert order.action == "SELL"
     assert order.totalQuantity == 770.0
+
+
+def test_reconciliation_ignores_option_positions_from_another_bot(tmp_path, monkeypatch):
+    """ib.positions() is account-wide. Another bot shares this paper account
+    and trades options with bot-managed synthetic stops -- it rests no
+    broker-side stop, so without the secType filter every one of its
+    positions reads as uncovered here and gets flattened within 30s."""
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.positions = lambda: [_FakePosition("SPX", 5.0, exchange="CBOE", secType="OPT")]
+    bot.ib.openTrades = lambda: []  # no resting stop anywhere -- by design, it's synthetic
+    placed = []
+    bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
+
+    bot._check_position_reconciliation()
+
+    assert placed == []
+
+
+def test_reconciliation_still_flattens_stock_while_an_option_shares_the_symbol(tmp_path, monkeypatch):
+    """The live_positions dict is keyed by symbol, so a stock and an option
+    on the same ticker used to collapse into one entry and silently drop
+    whichever lost -- disabling the backstop for it."""
+    monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
+    bot = WarriorBot(make_config(tmp_path))
+    bot.ib.positions = lambda: [
+        _FakePosition("SPY", 5.0, exchange="CBOE", secType="OPT"),
+        _FakePosition("SPY", 400.0, secType="STK"),  # unprotected, must still flatten
+    ]
+    bot.ib.openTrades = lambda: []
+    placed = []
+
+    def _place(contract, order):
+        placed.append((contract, order))
+        return _fake_placed_trade(action=order.action, totalQuantity=order.totalQuantity)[0]
+
+    bot.ib.placeOrder = _place
+
+    bot._check_position_reconciliation()
+
+    assert len(placed) == 1
+    contract, order = placed[0]
+    assert (contract.symbol, order.action, order.totalQuantity) == ("SPY", "SELL", 400.0)
 
 
 def test_reconciliation_leaves_protected_long_position_alone(tmp_path, monkeypatch):

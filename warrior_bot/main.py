@@ -871,7 +871,21 @@ class WarriorBot:
         resting protective stop. See PositionReconciliationConfig for the
         full incident writeup and the "flatten now" over "reconstruct the
         right stop" reasoning."""
-        live_positions = {p.contract.symbol: p for p in self.ib.positions() if p.position != 0}
+        # Equities only, for two reasons. (1) ib.positions() is account-wide,
+        # not per-client, and another bot on this same paper account trades
+        # options with bot-managed synthetic stops -- it rests no broker-side
+        # stop at all, so every one of its positions would read as uncovered
+        # here and get flattened within one check interval. This bot is
+        # long-only equities (Signal.side is always "BUY" on stocks), so
+        # nothing it actually trades is excluded. (2) This dict is keyed by
+        # symbol, so an SPY stock position and an SPY option position would
+        # otherwise collapse into one entry and silently drop whichever lost
+        # -- disabling the NRXS backstop for it.
+        live_positions = {
+            p.contract.symbol: p
+            for p in self.ib.positions()
+            if p.position != 0 and p.contract.secType == "STK"
+        }
 
         # Stale local tracking: PositionManager thinks a symbol is still
         # open but IBKR shows it flat (e.g. a resync that couldn't resolve
