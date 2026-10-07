@@ -749,6 +749,7 @@ class WarriorBot:
             channel="limits",
             limit_offset_pct=self.config.execution.flatten_limit_offset_pct,
             on_order_placed=self._journal_flatten_fill,
+            account=self.config.trading.account,
         )
         self.position_manager.clear()
         self.journal.record_kill_switch_event(triggered_by=reason, action_taken="cancel_all+flatten_all")
@@ -989,6 +990,7 @@ class WarriorBot:
             channel="limits",
             limit_offset_pct=self.config.execution.flatten_limit_offset_pct,
             on_order_placed=self._journal_flatten_fill,
+            account=self.config.trading.account,
         )
         if not placed:
             # A flatten for this symbol is already working -- nothing new to

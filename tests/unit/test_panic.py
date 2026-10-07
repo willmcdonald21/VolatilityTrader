@@ -17,25 +17,33 @@ class FakeIB:
         self.placed = []
         self._open_trades = open_trades or []
         self._portfolio = portfolio or []
+        self.cancelled = []
 
     def openTrades(self):
         return self._open_trades
 
+    # Mirrors ib_async: a blank account means every account.
     def portfolio(self, account=""):
+        if account:
+            return [p for p in self._portfolio if getattr(p, "account", "") == account]
         return self._portfolio
 
     def positions(self, account=""):
+        if account:
+            return [p for p in self._positions if getattr(p, "account", "") == account]
         return self._positions
 
     def placeOrder(self, contract, order):
         self.placed.append((contract, order))
 
-    def reqGlobalCancel(self):
-        pass
+    def cancelOrder(self, order):
+        self.cancelled.append(order)
+        # IBKR drops it from openTrades once the cancel is confirmed.
+        self._open_trades = [t for t in self._open_trades if t.order is not order]
 
 
-def make_position(symbol: str, qty: float, exchange: str = "NASDAQ"):
-    return SimpleNamespace(contract=FakeContract(symbol, exchange), position=qty)
+def make_position(symbol: str, qty: float, exchange: str = "NASDAQ", account=""):
+    return SimpleNamespace(contract=FakeContract(symbol, exchange), position=qty, account=account)
 
 
 def test_flatten_routes_through_smart_not_direct_exchange(monkeypatch):
@@ -392,3 +400,148 @@ def test_panic_stop_flattens_anyway_and_alerts_if_the_cancel_never_clears(monkey
 
     assert any("flattening anyway" in message for message in alerts)
     assert len(ib.placed) == 1  # getting flat still wins
+
+
+# --- account scoping ------------------------------------------------------
+#
+# The panic path used to call reqGlobalCancel(), which takes no account
+# argument and cancels everything the login can see. With a second account
+# linked under the same username that reaches another bot's working orders --
+# and that bot manages its stops synthetically, so cancelling its entry limits
+# is a real intervention in a strategy this one knows nothing about.
+
+
+def _order_in(account: str, symbol="UCAR", order_type="STP LMT"):
+    """A working order belonging to `account` -- a protective stop, not a
+    flatten, so it is the kind the old reqGlobalCancel would have swept up."""
+    order = SimpleNamespace(
+        orderRef="", totalQuantity=100.0, action="SELL", orderType=order_type,
+        orderId=1, lmtPrice=1.0, account=account,
+    )
+    return SimpleNamespace(
+        contract=FakeContract(symbol),
+        order=order,
+        orderStatus=SimpleNamespace(remaining=100.0, filled=0.0, status="Submitted"),
+        log=[],
+    )
+
+
+def test_cancel_all_orders_cancels_only_our_account(monkeypatch):
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    mine = _order_in("DU111")
+    theirs = _order_in("DU999", symbol="SPX", order_type="LMT")
+    ib = FakeIB([], open_trades=[mine, theirs])
+
+    panic.cancel_all_orders(ib, account="DU111")
+
+    assert ib.cancelled == [mine.order]
+
+
+def test_cancel_all_orders_reports_what_it_left_alone(monkeypatch):
+    messages = []
+    monkeypatch.setattr(panic, "alert", lambda msg, **k: messages.append(msg))
+    ib = FakeIB([], open_trades=[_order_in("DU111"), _order_in("DU999", symbol="SPX")])
+
+    panic.cancel_all_orders(ib, account="DU111")
+
+    assert "1 order(s) in other accounts left alone" in messages[0]
+
+
+def test_with_no_account_configured_everything_visible_is_ours(monkeypatch):
+    """Today's behaviour: one account under the login, so nothing to exclude."""
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    a, b = _order_in(""), _order_in("", symbol="BIRD")
+    ib = FakeIB([], open_trades=[a, b])
+
+    panic.cancel_all_orders(ib)
+
+    assert ib.cancelled == [a.order, b.order]
+
+
+def test_an_order_with_no_account_is_treated_as_ours(monkeypatch):
+    """IBKR leaves the field blank on a single-account login, so a blank order
+    in a configured-account world is still one of ours."""
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    blank = _order_in("")
+    ib = FakeIB([], open_trades=[blank])
+
+    panic.cancel_all_orders(ib, account="DU111")
+
+    assert ib.cancelled == [blank.order]
+
+
+def test_waiting_for_cancels_ignores_another_accounts_orders(monkeypatch):
+    """Otherwise a foreign working order holds up every panic until timeout."""
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    ib = FakeIB([], open_trades=[_order_in("DU999", symbol="SPX")])
+
+    assert panic._await_global_cancel(ib, timeout=0.05, account="DU111") is True
+
+
+def test_flatten_only_touches_our_accounts_positions(monkeypatch):
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    ib = FakeIB([
+        make_position("UCAR", 770.0, account="DU111"),
+        make_position("SPX", 5.0, account="DU999"),
+    ])
+
+    panic.flatten_all_positions(ib, account="DU111")
+
+    assert [c.symbol for c, _ in ib.placed] == ["UCAR"]
+
+
+def test_a_flatten_order_names_the_account_it_is_closing(monkeypatch):
+    """Mandatory once the login manages more than one account, and taken from
+    the position itself so a flatten targets where the shares actually are."""
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    ib = FakeIB([make_position("UCAR", 770.0, account="DU111")])
+
+    panic.flatten_all_positions(ib, account="DU111")
+
+    (_, order) = ib.placed[0]
+    assert order.account == "DU111"
+
+
+def test_a_flatten_falls_back_to_the_configured_account(monkeypatch):
+    """main.py's reconciliation calls flatten_position directly with a position
+    it already holds. If that position carries no account, the order still has
+    to name one or IBKR rejects it."""
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    position = SimpleNamespace(contract=FakeContract("UCAR", "NASDAQ"), position=770.0)
+    ib = FakeIB([position])
+
+    assert panic.flatten_position(ib, position, account="DU111") is True
+
+    (_, order) = ib.placed[0]
+    assert order.account == "DU111"
+
+
+def test_panic_stop_scopes_both_halves(monkeypatch):
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+    mine = _order_in("DU111")
+    theirs = _order_in("DU999", symbol="SPX")
+    ib = FakeIB(
+        [make_position("UCAR", 770.0, account="DU111"), make_position("SPX", 5.0, account="DU999")],
+        open_trades=[mine, theirs],
+    )
+
+    panic.panic_stop(ib, account="DU111")
+
+    assert ib.cancelled == [mine.order]
+    assert [c.symbol for c, _ in ib.placed] == ["UCAR"]
+
+
+def test_reqGlobalCancel_is_never_called(monkeypatch):
+    """It takes no account argument, so it cannot be scoped and must not come
+    back. Asserted by making the call itself fail rather than by grepping the
+    source, which would also match the comment explaining the history."""
+    monkeypatch.setattr(panic, "alert", lambda *a, **k: None)
+
+    class Tripwire(FakeIB):
+        def reqGlobalCancel(self):
+            raise AssertionError("reqGlobalCancel cannot be scoped to an account")
+
+    ib = Tripwire([make_position("UCAR", 770.0, account="DU111")], open_trades=[_order_in("DU111")])
+    panic.panic_stop(ib, account="DU111")
+
+    assert ib.cancelled

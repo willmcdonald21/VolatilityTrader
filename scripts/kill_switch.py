@@ -31,7 +31,7 @@ async def main() -> None:
     await ib.connectAsync(config.trading.host, config.trading.port, clientId=config.trading.client_id + 100)
     print(f"Connected to {config.trading.host}:{config.trading.port} (mode={config.trading.mode})")
     try:
-        panic_stop(ib, flatten=not args.no_flatten)
+        panic_stop(ib, flatten=not args.no_flatten, account=config.trading.account)
         await asyncio.sleep(2)  # let cancel/flatten requests flush before disconnecting
     finally:
         ib.disconnect()
