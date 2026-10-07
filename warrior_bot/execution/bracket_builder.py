@@ -29,6 +29,7 @@ def build_bracket(
     quantity: int,
     profit_tiers: list[tuple[int, float]] | None = None,
     stop_limit_offset_pct: float = 0.5,
+    account: str = "",
 ) -> Bracket:
     """Every entry is a bracket — no naked entries.
 
@@ -118,5 +119,12 @@ def build_bracket(
     if not use_tiers:
         oca_group = f"{signal.symbol}-{parent.orderId}-OCA"
         IB.oneCancelsAll([take_profits[0], stop_loss], oca_group, ocaType=1)
+
+    # Stamped in one place rather than on each constructor, so a leg added later
+    # cannot be forgotten. Naming the account is mandatory once the login
+    # manages more than one; IBKR rejects the order otherwise. Blank means the
+    # only account, which is what IBKR assumes anyway.
+    for leg in (parent, *take_profits, stop_loss):
+        leg.account = account
 
     return Bracket(parent=parent, take_profits=take_profits, stop_loss=stop_loss, target_roles=target_roles)

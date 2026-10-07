@@ -56,6 +56,7 @@ class OrderManager:
         notifications_config: NotificationsConfig | None = None,
         account_state: AccountState | None = None,
         trading_mode: str = "paper",
+        account: str = "",
     ):
         self.ib = ib
         self.journal = journal
@@ -68,6 +69,10 @@ class OrderManager:
         # never used for any trading decision, so a bad value here means a
         # mislabeled Discord message, not a wrong trade.
         self.trading_mode = trading_mode
+        # The IBKR account every order this manager places is booked to. Blank
+        # means the only account, which is what IBKR assumes for a
+        # single-account login.
+        self.account = account
         self._order_row_ids: dict[int, int] = {}  # ib order id -> journal orders.id
         # The ONLY place real commissions can be captured. ib_async emits
         # fillEvent with an empty CommissionReport and sends the actual
@@ -92,6 +97,7 @@ class OrderManager:
             quantity,
             profit_tiers=profit_tiers,
             stop_limit_offset_pct=self.execution_config.stop_limit_offset_pct,
+            account=self.account,
         )
         role_by_order_id = {bracket.parent.orderId: "parent", bracket.stop_loss.orderId: "stop"}
         for take_profit, role in zip(bracket.take_profits, bracket.target_roles):

@@ -168,3 +168,35 @@ def test_stop_loss_limit_price_is_always_tick_conformant():
     bracket = build_bracket(FakeIB(), signal, quantity=100, stop_limit_offset_pct=0.37)
     price = bracket.stop_loss.lmtPrice
     assert round(price, 2) == price
+
+
+# --- account scoping ------------------------------------------------------
+
+
+def test_every_leg_names_the_configured_account():
+    """IBKR rejects an order that does not name an account once the login
+    manages more than one, so a single unstamped leg breaks the whole bracket."""
+    bracket = build_bracket(FakeIB(), make_signal(), 100, account="DU111")
+
+    legs = [bracket.parent, *bracket.take_profits, bracket.stop_loss]
+    assert legs, "a bracket always has legs"
+    assert all(leg.account == "DU111" for leg in legs)
+
+
+def test_every_leg_is_blank_when_no_account_is_configured():
+    """Today's behaviour, and what IBKR assumes for a single-account login."""
+    bracket = build_bracket(FakeIB(), make_signal(), 100)
+
+    legs = [bracket.parent, *bracket.take_profits, bracket.stop_loss]
+    assert all(leg.account == "" for leg in legs)
+
+
+def test_tiered_take_profit_legs_are_stamped_too():
+    """The tiered path builds several independent limit orders; each is its own
+    order at IBKR and each needs the account."""
+    bracket = build_bracket(
+        FakeIB(), make_signal(), 100, profit_tiers=[(50, 11.0), (50, 12.0)], account="DU111"
+    )
+
+    assert len(bracket.take_profits) == 2
+    assert all(leg.account == "DU111" for leg in bracket.take_profits)

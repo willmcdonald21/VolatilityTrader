@@ -919,6 +919,13 @@ class PositionManager:
                 tif="DAY",
             )
 
+        # Inherit the account from the order being replaced rather than
+        # re-deriving it from config. This is a new stop for the same position,
+        # so it belongs to the same account by definition, and inheriting
+        # removes any chance of the replacement landing somewhere else. Naming
+        # it is mandatory once the login manages more than one account.
+        new_order.account = getattr(old_order, "account", "") or ""
+
         # Re-link OCA only for the single-fallback-target case where the
         # stop was originally OCA'd with a still-resting target -- the
         # tiered profit-taking case never OCA-links the stop to begin with
