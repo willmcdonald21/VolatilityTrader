@@ -102,7 +102,47 @@ class IBClient:
         await self.ib.connectAsync(
             t.host, t.port, clientId=t.client_id, timeout=20, raiseSyncErrors=True
         )
-        logger.info("Connected. Server version=%s", self.ib.client.serverVersion())
+        self._verify_account()
+        logger.info(
+            "Connected. Server version=%s, account=%s",
+            self.ib.client.serverVersion(),
+            t.account or "(the only one)",
+        )
+
+    def _verify_account(self) -> None:
+        """Refuse to trade an ambiguous or wrong account.
+
+        Two states are worth failing the connect over rather than discovering
+        later. More than one account managed with none configured: IBKR rejects
+        every order in that state, and an unscoped position read would return
+        another bot's holdings straight into the reconciliation watchdog, which
+        flattens what it does not recognise. And a configured account the login
+        does not manage -- a typo, or an id pasted from the wrong place -- which
+        would otherwise mean silently trading the wrong account.
+
+        No managed accounts at all only warns: IB sometimes reports nothing here
+        before it settles, and refusing over that is worse than carrying on.
+        """
+        configured = (self.config.trading.account or "").strip()
+        managed = [a for a in (self.ib.managedAccounts() or []) if a]
+
+        if not managed:
+            logger.warning("IBKR reported no managed accounts; cannot verify trading.account")
+            return
+
+        if configured and configured not in managed:
+            raise RuntimeError(
+                f"trading.account {configured!r} is not managed by this login "
+                f"(it manages {', '.join(managed)}). Fix config/config.yaml."
+            )
+
+        if not configured and len(managed) > 1:
+            raise RuntimeError(
+                f"this login manages {len(managed)} accounts ({', '.join(managed)}) but "
+                "trading.account is blank. IBKR rejects orders that do not name an account "
+                "when more than one is managed, and an unscoped position read would return "
+                "the other account's holdings. Set trading.account in config/config.yaml."
+            )
 
     def start_heartbeat(self) -> None:
         """Begins actively probing the connection.
