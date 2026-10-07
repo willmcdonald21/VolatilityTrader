@@ -5,6 +5,12 @@ trading:
   host: 127.0.0.1
   port: 4002                     # IB Gateway paper=4002, TWS paper=7497 (live=4001/7496, refused unless mode=live)
   client_id: 11
+  # The IBKR account this bot trades. Blank is correct while the login manages
+  # one account. Set it once a second account is linked under the same
+  # username: IBKR then rejects orders that do not name an account, and an
+  # unscoped position or portfolio read would return the other bot's holdings,
+  # which reconciliation and the panic path both act on.
+  account: ""
   i_understand_live_trading: false
   use_rth: false                 # false = include pre-market/after-hours bars (needed for gap scanning)
 

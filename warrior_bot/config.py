@@ -16,6 +16,18 @@ class TradingConfig(BaseModel):
     host: str = "127.0.0.1"
     port: int = 4002
     client_id: int = 7
+
+    # The IBKR account this bot trades, e.g. "DU1234567". Blank means "whatever
+    # the login manages", which is correct while it manages exactly one account
+    # and is what IBKR itself assumes.
+    #
+    # It must be set once a second account is linked under the same username.
+    # IBKR rejects any order that does not name an account when more than one is
+    # managed, and an unscoped read of positions or the portfolio would return
+    # the other bot's holdings -- which this bot's reconciliation and panic path
+    # both act on.
+    account: str = ""
+
     i_understand_live_trading: bool = False
     use_rth: bool = False
 
