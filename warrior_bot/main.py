@@ -871,19 +871,27 @@ class WarriorBot:
         resting protective stop. See PositionReconciliationConfig for the
         full incident writeup and the "flatten now" over "reconstruct the
         right stop" reasoning."""
-        # Equities only, for two reasons. (1) ib.positions() is account-wide,
-        # not per-client, and another bot on this same paper account trades
-        # options with bot-managed synthetic stops -- it rests no broker-side
-        # stop at all, so every one of its positions would read as uncovered
-        # here and get flattened within one check interval. This bot is
-        # long-only equities (Signal.side is always "BUY" on stocks), so
-        # nothing it actually trades is excluded. (2) This dict is keyed by
-        # symbol, so an SPY stock position and an SPY option position would
-        # otherwise collapse into one entry and silently drop whichever lost
-        # -- disabling the NRXS backstop for it.
+        # This account, equities only. Three filters, because each covers a
+        # case the others do not.
+        #
+        # (1) account: ib.positions() is account-wide, not per-client, so once a
+        # second account is linked under this username it returns both. Blank
+        # means "the only account", which is today's behaviour.
+        #
+        # (2) secType: another bot trades options with bot-managed synthetic
+        # stops -- it rests no broker-side stop at all, so every one of its
+        # positions reads as uncovered here and would be flattened within one
+        # check interval. This bot is long-only equities, so nothing it actually
+        # trades is excluded.
+        #
+        # (3) non-zero: a closed position still reports a row.
+        #
+        # The dict is also keyed by symbol, so without the secType filter an SPY
+        # stock position and an SPY option position would collapse into one entry
+        # and silently drop whichever lost -- disabling the NRXS backstop for it.
         live_positions = {
             p.contract.symbol: p
-            for p in self.ib.positions()
+            for p in self.ib.positions(account=self.config.trading.account)
             if p.position != 0 and p.contract.secType == "STK"
         }
 

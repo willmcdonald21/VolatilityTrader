@@ -743,7 +743,7 @@ def test_reconciliation_drops_stale_local_tracking_when_broker_flat(tmp_path, mo
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
     bot.position_manager._positions["GHOST"] = [SimpleNamespace(resize_task=None, parent_done=True)]
-    bot.ib.positions = lambda: []
+    bot.ib.positions = lambda account="": []
     bot.ib.openTrades = lambda: []
 
     bot._check_position_reconciliation()
@@ -756,7 +756,7 @@ def test_reconciliation_flattens_naked_short_regardless_of_resting_orders(tmp_pa
     # flattened even if something happens to be resting on it.
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
-    bot.ib.positions = lambda: [_FakePosition("NRXS", -850.0)]
+    bot.ib.positions = lambda account="": [_FakePosition("NRXS", -850.0)]
     bot.ib.openTrades = lambda: [_FakeTrade("NRXS", "BUY", "STP LMT", 850.0)]
     placed = []
 
@@ -778,7 +778,7 @@ def test_reconciliation_flattens_naked_short_regardless_of_resting_orders(tmp_pa
 def test_reconciliation_flattens_long_position_with_no_resting_stop(tmp_path, monkeypatch):
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
-    bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
+    bot.ib.positions = lambda account="": [_FakePosition("UCAR", 770.0)]
     bot.ib.openTrades = lambda: []  # nothing resting at all
     placed = []
 
@@ -804,7 +804,7 @@ def test_reconciliation_ignores_option_positions_from_another_bot(tmp_path, monk
     positions reads as uncovered here and gets flattened within 30s."""
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
-    bot.ib.positions = lambda: [_FakePosition("SPX", 5.0, exchange="CBOE", secType="OPT")]
+    bot.ib.positions = lambda account="": [_FakePosition("SPX", 5.0, exchange="CBOE", secType="OPT")]
     bot.ib.openTrades = lambda: []  # no resting stop anywhere -- by design, it's synthetic
     placed = []
     bot.ib.placeOrder = lambda contract, order: placed.append((contract, order))
@@ -820,7 +820,7 @@ def test_reconciliation_still_flattens_stock_while_an_option_shares_the_symbol(t
     whichever lost -- disabling the backstop for it."""
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
-    bot.ib.positions = lambda: [
+    bot.ib.positions = lambda account="": [
         _FakePosition("SPY", 5.0, exchange="CBOE", secType="OPT"),
         _FakePosition("SPY", 400.0, secType="STK"),  # unprotected, must still flatten
     ]
@@ -843,7 +843,7 @@ def test_reconciliation_still_flattens_stock_while_an_option_shares_the_symbol(t
 def test_reconciliation_leaves_protected_long_position_alone(tmp_path, monkeypatch):
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
-    bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
+    bot.ib.positions = lambda account="": [_FakePosition("UCAR", 770.0)]
     bot.ib.openTrades = lambda: [_FakeTrade("UCAR", "SELL", "STP LMT", 770.0)]
     placed = []
 
@@ -863,7 +863,7 @@ def test_reconciliation_treats_take_profit_limit_order_as_no_protection(tmp_path
     # STP/STP LMT order actually protects a long position.
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
-    bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
+    bot.ib.positions = lambda account="": [_FakePosition("UCAR", 770.0)]
     bot.ib.openTrades = lambda: [_FakeTrade("UCAR", "SELL", "LMT", 770.0)]
     placed = []
 
@@ -881,7 +881,7 @@ def test_reconciliation_treats_take_profit_limit_order_as_no_protection(tmp_path
 def test_reconciliation_sums_partial_stop_coverage_across_multiple_orders(tmp_path, monkeypatch):
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
-    bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
+    bot.ib.positions = lambda account="": [_FakePosition("UCAR", 770.0)]
     bot.ib.openTrades = lambda: [
         _FakeTrade("UCAR", "SELL", "STP LMT", 400.0),
         _FakeTrade("UCAR", "SELL", "STP", 370.0),  # 400+370=770, exactly covers it
@@ -903,7 +903,7 @@ def test_reconciliation_untracks_symbol_after_emergency_flatten(tmp_path, monkey
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
     bot.position_manager._positions["UCAR"] = [_fake_lot(bot, "UCAR", remaining_qty=770.0)]
-    bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
+    bot.ib.positions = lambda account="": [_FakePosition("UCAR", 770.0)]
     bot.ib.openTrades = lambda: []
     bot.ib.placeOrder = lambda contract, order: _fake_placed_trade()[0]
 
@@ -1043,7 +1043,7 @@ def test_journal_flatten_fill_wired_through_emergency_flatten_end_to_end(tmp_pat
     bot = WarriorBot(make_config(tmp_path))
     lot = _fake_lot(bot, "UCAR", remaining_qty=770.0)
     bot.position_manager._positions["UCAR"] = [lot]
-    bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
+    bot.ib.positions = lambda account="": [_FakePosition("UCAR", 770.0)]
     bot.ib.openTrades = lambda: []
     placed_trade, _ = _fake_placed_trade(action="SELL", totalQuantity=770.0)
     bot.ib.placeOrder = lambda contract, order: placed_trade
@@ -1066,7 +1066,7 @@ def test_journal_flatten_fill_wired_through_trigger_flatten_end_to_end(tmp_path,
     bot = WarriorBot(make_config(tmp_path))
     lot = _fake_lot(bot, "UCAR", remaining_qty=770.0)
     bot.position_manager._positions["UCAR"] = [lot]
-    bot.ib.positions = lambda: [_FakePosition("UCAR", 770.0)]
+    bot.ib.positions = lambda account="": [_FakePosition("UCAR", 770.0)]
     bot.ib.openTrades = lambda: []
     placed_trade, _ = _fake_placed_trade(action="SELL", totalQuantity=770.0)
     bot.ib.placeOrder = lambda contract, order: placed_trade
@@ -1339,7 +1339,7 @@ def test_reconciliation_keeps_a_symbol_whose_entry_is_still_working(tmp_path, mo
     bot.position_manager._positions["SLOW"] = [
         SimpleNamespace(resize_task=None, parent_done=False)  # entry still working
     ]
-    bot.ib.positions = lambda: []
+    bot.ib.positions = lambda account="": []
     bot.ib.openTrades = lambda: []
 
     bot._check_position_reconciliation()
@@ -1351,7 +1351,7 @@ def test_reconciliation_still_drops_a_symbol_whose_entry_is_done(tmp_path, monke
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
     bot.position_manager._positions["DONE"] = [SimpleNamespace(resize_task=None, parent_done=True)]
-    bot.ib.positions = lambda: []
+    bot.ib.positions = lambda account="": []
     bot.ib.openTrades = lambda: []
 
     bot._check_position_reconciliation()
@@ -1374,7 +1374,7 @@ def test_triggered_but_unfilled_stop_limit_no_longer_counts_as_protection(tmp_pa
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
     bot.contexts["GAPR"] = SimpleNamespace(symbol="GAPR", last_price=8.0)  # gapped well under the 10.0 trigger
-    bot.ib.positions = lambda: [_FakePosition("GAPR", 100.0)]
+    bot.ib.positions = lambda account="": [_FakePosition("GAPR", 100.0)]
     bot.ib.openTrades = lambda: [_stranded_stop_trade()]
     placed = []
 
@@ -1394,7 +1394,7 @@ def test_stop_limit_sitting_near_its_trigger_still_counts_as_protection(tmp_path
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
     bot.contexts["CALM"] = SimpleNamespace(symbol="CALM", last_price=10.05)  # trading above its trigger
-    bot.ib.positions = lambda: [_FakePosition("CALM", 100.0)]
+    bot.ib.positions = lambda account="": [_FakePosition("CALM", 100.0)]
     bot.ib.openTrades = lambda: [_stranded_stop_trade(symbol="CALM")]
     placed = []
 
@@ -1414,7 +1414,7 @@ def test_stranded_check_is_skipped_without_a_price_reference(tmp_path, monkeypat
     # than flattening on a guess.
     monkeypatch.setattr("warrior_bot.main.alert", lambda *a, **k: None)
     bot = WarriorBot(make_config(tmp_path))
-    bot.ib.positions = lambda: [_FakePosition("NOCTX", 100.0)]
+    bot.ib.positions = lambda account="": [_FakePosition("NOCTX", 100.0)]
     bot.ib.openTrades = lambda: [_stranded_stop_trade(symbol="NOCTX")]
     placed = []
 
