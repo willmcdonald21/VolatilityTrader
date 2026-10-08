@@ -928,6 +928,14 @@ class WarriorBot:
 
         # Only a resting STP/STP LMT SELL order actually caps downside on
         # a long position -- a resting take-profit LMT order doesn't.
+        #
+        # openTrades() needs no account filter, and that is worth stating because
+        # positions() above does. ib_async's connect syncs open orders with
+        # reqOpenOrders (this client's own) and never reqAllOpenOrders, so this
+        # only ever sees orders this bot placed -- which are in this bot's
+        # account by construction. The one way that stops being true is running
+        # on clientId 0, where IBKR also feeds through manually-placed TWS
+        # orders; ops.sh doctor fails on clientId 0 for exactly that reason.
         stop_qty_by_symbol: dict[str, float] = {}
         for trade in self.ib.openTrades():
             if trade.order.action != "SELL" or trade.order.orderType not in ("STP", "STP LMT"):
