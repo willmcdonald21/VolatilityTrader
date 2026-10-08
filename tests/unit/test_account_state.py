@@ -9,7 +9,8 @@ from ib_async.util import UNSET_DOUBLE
 from warrior_bot.risk.account_state import AccountState
 
 
-def make_fill(symbol, side, shares, price, commission=0.0, minutes_ago=0, realized_pnl=0.0, at=None):
+def make_fill(symbol, side, shares, price, commission=0.0, minutes_ago=0, realized_pnl=0.0, at=None,
+              account="DU111"):
     """`realized_pnl` defaults to 0.0 to mirror what IBKR's paper simulator
     actually reports on closing fills -- the whole reason daily_realized_pnl
     can't be built out of that field.
@@ -21,7 +22,7 @@ def make_fill(symbol, side, shares, price, commission=0.0, minutes_ago=0, realiz
     return SimpleNamespace(
         time=at if at is not None else datetime.now(timezone.utc) - timedelta(minutes=minutes_ago),
         contract=SimpleNamespace(symbol=symbol),
-        execution=SimpleNamespace(side=side, shares=shares, price=price),
+        execution=SimpleNamespace(side=side, shares=shares, price=price, acctNumber=account),
         commissionReport=SimpleNamespace(commission=commission, realizedPNL=realized_pnl),
     )
 
@@ -269,3 +270,28 @@ def test_open_positions_ignore_another_account():
 
     assert snapshot.open_positions_count == 1
     assert snapshot.open_symbols == frozenset({"UCAR"})
+
+
+def test_realized_pnl_ignores_another_accounts_fills():
+    """ib.fills() is account-wide and feeds the daily loss limit, which halts
+    entries and can flatten. Another account's fills here would halt this
+    strategy over a loss it never took."""
+    ours = make_fill("UCAR", "BOT", 100, 10.0, minutes_ago=30, account="DU111")
+    ours_exit = make_fill("UCAR", "SLD", 100, 11.0, minutes_ago=20, account="DU111")
+    theirs = make_fill("SPX", "BOT", 100, 50.0, minutes_ago=30, account="DU999")
+    theirs_exit = make_fill("SPX", "SLD", 100, 1.0, minutes_ago=20, account="DU999")
+
+    state = AccountState(FakeIB([ours, ours_exit, theirs, theirs_exit]), account="DU111")
+    state._session_start = datetime.now(timezone.utc) - timedelta(minutes=60)
+
+    # Ours made +$100. Theirs lost $4,900 and must not appear.
+    assert state.daily_realized_pnl() == pytest.approx(100.0)
+
+
+def test_a_fill_with_no_account_is_treated_as_ours():
+    """IBKR leaves it blank on a single-account login."""
+    fill = make_fill("UCAR", "BOT", 100, 10.0, minutes_ago=30, account="")
+    state = AccountState(FakeIB([fill]), account="DU111")
+    state._session_start = datetime.now(timezone.utc) - timedelta(minutes=60)
+
+    assert state._todays_fills() == [fill]

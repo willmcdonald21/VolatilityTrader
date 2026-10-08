@@ -96,10 +96,21 @@ class AccountState:
         return None
 
     def _todays_fills(self) -> list:
-        """This session's fills, oldest first — average-cost accounting
-        below depends on processing them in execution order."""
+        """This account's fills for this session, oldest first — average-cost
+        accounting below depends on processing them in execution order.
+
+        ib.fills() is account-wide, like positions and account values, and it
+        feeds daily_realized_pnl -- which the daily loss limit acts on by
+        halting entries and optionally flattening. Another account's fills
+        reaching here would mean halting this strategy over a loss it never
+        took, so they are dropped on execution.acctNumber.
+        """
         todays = []
         for fill in self.ib.fills():
+            if self.account:
+                booked_to = getattr(getattr(fill, "execution", None), "acctNumber", "") or ""
+                if booked_to and booked_to != self.account:
+                    continue
             fill_time = fill.time
             if fill_time.tzinfo is None:
                 fill_time = fill_time.replace(tzinfo=timezone.utc)
