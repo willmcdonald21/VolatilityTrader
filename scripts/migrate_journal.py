@@ -57,6 +57,7 @@ TABLES = (
     "kill_switch_events",
     "daily_risk_state",
     "symbol_loss_state",
+    "entry_ineligible_symbols",
 )
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
+from collections.abc import Callable
 
 from ib_async import IB, Contract, Trade
 
@@ -36,6 +37,20 @@ _FILL_LABELS = {"parent": "BUY", "scale_out": "TRIM"}
 # the trade_activity_summary channel would get one "NEW POSITION" embed per
 # partial fill instead of one per entry.
 _ENTRY_SUMMARY_DEBOUNCE_SECONDS = 1.5
+
+# IBKR reports every order refusal as code 201, whatever the cause, so the
+# code alone is not enough to act on -- see _on_order_error.
+_PERMISSION_REJECTION_CODES = {201}
+
+# The reason fragments that mean "this account may not open this product",
+# as opposed to "not this order, not right now". Matched on the reason text
+# with <br> stripped. Both appear together in the common case, but IBKR
+# sends the permission line without the closing-only elaboration for some
+# products, so either is sufficient.
+_INELIGIBILITY_MARKERS = (
+    "No Trading Permission",
+    "closing-only status",
+)
 
 
 class OrderManager:
@@ -83,11 +98,79 @@ class OrderManager:
         # Guarded: several tests construct this with a stub (or no) IB.
         if getattr(ib, "commissionReportEvent", None) is not None:
             self.ib.commissionReportEvent += self._on_commission_report
+        # ib order id -> symbol, so a code-201 rejection (which arrives on
+        # errorEvent with contract=None, carrying only the order id) can be
+        # attributed to a symbol. Subscribed here rather than in IBClient
+        # because that class has no order registry, and the rejection reason
+        # only exists on this channel -- orderStatus just reads "Inactive",
+        # which cannot tell a regulatory refusal apart from a plain cancel.
+        self._order_symbols: dict[int, str] = {}
+        self.on_entry_ineligible: Callable[[str, str], None] | None = None
+        if getattr(ib, "errorEvent", None) is not None:
+            self.ib.errorEvent += self._on_order_error
         # signal_id -> accumulator for the trade_activity_summary embed (see
         # _accumulate_entry_fill/_send_entry_summary). Kept around (not
         # popped) after a summary is sent so a later pyramid add-on on the
         # same symbol can read this lot's finished avg_price as "prior avg".
         self._entry_fill_state: dict[int, dict] = {}
+
+    def _on_order_error(self, reqId: int, errorCode: int, errorString: str, contract) -> None:
+        """Learns, from IBKR's own refusal, that a symbol cannot be opened.
+
+        Code 201 covers several unrelated refusals -- margin shortfalls and
+        the "15 working orders per contract" cap among them (1,006 of those
+        in 2026-08/09) -- and those are transient: a smaller size or a later
+        attempt can succeed, so banning the symbol on them would be wrong.
+        Only a permission/eligibility refusal is a property of the product
+        rather than of this order, which is why the reason text is matched
+        and not just the code.
+
+        The parent leg is also released immediately rather than left for the
+        300s entry timeout. That timeout exists for a limit entry that has
+        not filled YET (RLGT filled 3h56m late, 2026-09-15); a rejected
+        order will never fill, and waiting holds a position slot and the
+        cross-strategy gate for five minutes for nothing."""
+        if errorCode not in _PERMISSION_REJECTION_CODES:
+            return
+        reason_text = (errorString or "").replace("<br>", " ")
+        if not any(marker in reason_text for marker in _INELIGIBILITY_MARKERS):
+            return
+        symbol = self._order_symbols.get(reqId)
+        if symbol is None:
+            return
+
+        reason = " ".join(reason_text.split())[:300]
+        logger.warning(
+            "IBKR refuses to open %s (order %s, code %s) -- no further entries will be "
+            "attempted for it: %s",
+            symbol,
+            reqId,
+            errorCode,
+            reason,
+        )
+        try:
+            self.journal.record_entry_ineligible(symbol, errorCode, reason)
+        except Exception:
+            logger.exception(
+                "Failed to persist %s as entry-ineligible -- the ban holds for this "
+                "process but would be forgotten on restart",
+                symbol,
+            )
+        if self.on_entry_ineligible is not None:
+            try:
+                self.on_entry_ineligible(symbol, reason)
+            except Exception:
+                logger.exception("entry-ineligible callback failed for %s", symbol)
+        # Runs inside an eventkit handler, so a failure here must not stop
+        # the ban above from taking effect.
+        try:
+            self.position_manager.release_rejected_entry(symbol)
+        except Exception:
+            logger.exception(
+                "Failed to release the rejected %s lot -- the 300s entry timeout will "
+                "still clear it",
+                symbol,
+            )
 
     def submit_signal(self, contract: Contract, signal: Signal, quantity: int, signal_id: int) -> Bracket:
         profit_tiers = self._profit_tier_specs(signal, quantity)
@@ -135,6 +218,7 @@ class OrderManager:
                 status=trade.orderStatus.status,
             )
             self._order_row_ids[order.orderId] = row_id
+            self._order_symbols[order.orderId] = signal.symbol
             self._attach_tracking(trade, row_id, role, signal.entry_price, signal_id=signal_id)
             if role == "parent":
                 parent_trade = trade

@@ -163,6 +163,38 @@ CREATE TABLE IF NOT EXISTS symbol_loss_state (
     ts_updated TEXT NOT NULL,
     PRIMARY KEY (trading_date, symbol)
 );
+
+-- Symbols IBKR refuses to let this account OPEN a position in, learned
+-- from its own code-201 rejections ("No Trading Permission, Customer
+-- Ineligible", typically a product in closing-only status: existing
+-- positions may be closed, new ones may not be opened).
+--
+-- Not keyed by trading date, unlike the two tables above. A closing-only
+-- designation is a regulatory state on the product that lasts weeks or
+-- months, not a fact about one session, so re-learning it daily means
+-- re-discovering it the same way every time: burn the strategy's one
+-- entry for that symbol on an order that cannot fill, hold a
+-- max_concurrent_positions slot and the cross-strategy gate until the
+-- 300s entry timeout releases them, and alert the operator about a
+-- missing protective order that was never needed.
+--
+-- DKI on 2026-10-08 is the worked example (gapped 1.67 -> 5.48, top
+-- scanner rank, rejected at 06:54:05 and not released until 06:59:15),
+-- but it is not rare: 94 "No Trading Permission" rejections across
+-- 2026-08-27..09-24, 72 of them naming closing-only status. The scanner
+-- selects for exactly the names this happens to -- recent listings and
+-- foreign issuers making extreme percentage moves.
+--
+-- Cleared only by deleting a row by hand, which is the intended way to
+-- retry a symbol whose restriction has since been lifted.
+CREATE TABLE IF NOT EXISTS entry_ineligible_symbols (
+    symbol TEXT PRIMARY KEY,
+    error_code INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    first_seen TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    rejections INTEGER NOT NULL DEFAULT 1
+);
 """
 
 

@@ -539,6 +539,36 @@ class PositionManager:
                     # the attached children along with their parent.
                     self._untrack(pos)
 
+    def release_rejected_entry(self, symbol: str) -> int:
+        """Releases lots whose entry IBKR refused outright.
+
+        Same cleanup the entry-fill timeout performs, minus the wait. That
+        timeout is calibrated for an entry that has not filled YET and
+        still might (RLGT, 3h56m late); an order IBKR has rejected will
+        never fill, so holding its max_concurrent_positions slot, its
+        2-lot allowance and the cross-strategy gate for the full 300s
+        costs capacity for no possible benefit.
+
+        Only lots with nothing filled are dropped. A partial fill is a
+        real position that keeps its resting stop, which is also why the
+        rejection of ONE leg of a bracket cannot be assumed to mean the
+        whole position is void. Returns how many lots were released."""
+        released = 0
+        for pos in list(self._positions.get(symbol, [])):
+            if pos.entry_filled:
+                continue
+            pos.parent_done = True
+            self._untrack(pos)
+            released += 1
+        if released:
+            logger.info(
+                "Released %d rejected %s lot(s) immediately rather than waiting for the "
+                "entry-fill timeout -- a rejected order cannot fill",
+                released,
+                symbol,
+            )
+        return released
+
     def clear(self) -> None:
         """Drops all tracked positions with no IBKR side effects — used
         after a kill-switch/auto-flatten pass that already cancelled and

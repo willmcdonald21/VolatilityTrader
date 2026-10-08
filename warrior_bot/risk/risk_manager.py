@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, time
@@ -77,6 +78,21 @@ class RiskManager:
         # of new positions -- exactly the "stop for the day" the alert
         # message already claimed but the code never enforced.
         self._loss_limit_halted_today = False
+        # Symbols IBKR has refused to let this account OPEN, as
+        # {symbol: reason} -- populated from its own code-201 rejections
+        # (OrderManager._on_order_error) and rehydrated on startup from
+        # entry_ineligible_symbols. Not per-day: see that table's schema
+        # comment in db.py.
+        self._entry_ineligible: dict[str, str] = {}
+
+    def mark_entry_ineligible(self, symbol: str, reason: str) -> None:
+        """Records that `symbol` cannot be opened, so evaluate() stops
+        spending entries on orders IBKR will reject."""
+        self._entry_ineligible[symbol] = reason
+
+    def restore_entry_ineligible(self, symbols: Mapping[str, str]) -> None:
+        """Replaces the ineligible set wholesale, from the journal."""
+        self._entry_ineligible = dict(symbols)
 
     def activate_kill_switch(self) -> None:
         self._manual_kill_switch = True
@@ -214,6 +230,21 @@ class RiskManager:
             and to_eastern(now).time() >= self.no_entry_after_et
         ):
             reason = f"entry window closed at {self.no_entry_after_et.strftime('%H:%M')} ET (EOD flatten cutoff)"
+            alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
+            return RiskDecision(False, 0, reason, snapshot)
+
+        # Checked before any capacity or sizing work: IBKR will reject the
+        # bracket outright, so "spending" this symbol's one entry on it
+        # costs a max_concurrent_positions slot and the cross-strategy gate
+        # for the 300s the entry timeout takes to release them, and fires a
+        # kill_switch alert about a protective order that was never needed.
+        # DKI, 2026-10-08: rejected 06:54:05, released 06:59:15, and the
+        # concurrent abcd signal on it was turned away in between.
+        if signal.symbol in self._entry_ineligible:
+            reason = (
+                f"entry_ineligible: IBKR will not let this account open {signal.symbol} "
+                f"({self._entry_ineligible[signal.symbol]})"
+            )
             alert(f"Signal for {signal.symbol} ({signal.strategy}) rejected: {reason}")  # routine, log only
             return RiskDecision(False, 0, reason, snapshot)
 

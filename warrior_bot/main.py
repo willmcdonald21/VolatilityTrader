@@ -148,6 +148,10 @@ class WarriorBot:
             trading_mode=config.trading.mode,
             account=config.trading.account,
         )
+        # OrderManager learns an unopenable symbol from IBKR's rejection;
+        # RiskManager is what acts on it. Wired here rather than passed in,
+        # because OrderManager is built after RiskManager.
+        self.order_manager.on_entry_ineligible = self._on_entry_ineligible
 
         float_provider = FloatProvider(config.resolve_path("config/float_list.csv"))
         self.float_provider = float_provider
@@ -204,6 +208,7 @@ class WarriorBot:
         self._trading_day = to_eastern(datetime.now(timezone.utc)).date()
         self._restore_or_start_daily_risk_state()
         self._restore_symbol_losses()
+        self._restore_entry_ineligible()
         self.journal.record_account_snapshot(snapshot)
         if self.config.news.enabled and not self._news_provider_codes:
             try:
@@ -718,6 +723,30 @@ class WarriorBot:
         self.position_manager.restore_daily_losses(counts)
         if counts:
             self.logger.info("Restored symbol loss state for %s: %s", self._trading_day, counts)
+
+    def _restore_entry_ineligible(self) -> None:
+        """Reloads the symbols IBKR will not let this account open.
+
+        Not date-scoped, unlike the two restores above -- a closing-only
+        designation outlives the session, so re-learning it each day means
+        re-paying for it each day (DKI, 2026-10-08)."""
+        symbols = self.journal.load_entry_ineligible()
+        self.risk_manager.restore_entry_ineligible(symbols)
+        if symbols:
+            self.logger.info(
+                "Entry-ineligible symbols restored (%d): %s",
+                len(symbols),
+                ", ".join(sorted(symbols)),
+            )
+
+    def _on_entry_ineligible(self, symbol: str, reason: str) -> None:
+        """OrderManager's hook for a symbol IBKR just refused to open."""
+        self.risk_manager.mark_entry_ineligible(symbol, reason)
+        alert(
+            f"{symbol} cannot be opened by this account ({reason}) -- it is now excluded "
+            "from new entries. Delete its entry_ineligible_symbols row to retry.",
+            channel="kill_switch",
+        )
 
     def _persist_daily_risk_state(self) -> None:
         equity = self.risk_manager.start_of_day_equity

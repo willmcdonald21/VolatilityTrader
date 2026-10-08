@@ -385,3 +385,31 @@ class Journal:
             (trading_date,),
         ).fetchall()
         return {row[0]: row[1] for row in rows}
+
+    def record_entry_ineligible(self, symbol: str, error_code: int, reason: str) -> None:
+        """Remembers that IBKR refused to let this account open `symbol`.
+
+        Not keyed by date -- see db.py's entry_ineligible_symbols schema
+        comment. first_seen is preserved across repeats so the row shows
+        when the restriction was first hit, while last_seen/rejections
+        record that it is still in force."""
+        self.conn.execute(
+            """INSERT INTO entry_ineligible_symbols
+                   (symbol, error_code, reason, first_seen, last_seen, rejections)
+               VALUES (?, ?, ?, ?, ?, 1)
+               ON CONFLICT(symbol) DO UPDATE SET
+                   error_code = excluded.error_code,
+                   reason = excluded.reason,
+                   last_seen = excluded.last_seen,
+                   rejections = entry_ineligible_symbols.rejections + 1""",
+            (symbol, int(error_code), reason, _now(), _now()),
+        )
+        self.conn.commit()
+
+    def load_entry_ineligible(self) -> dict[str, str]:
+        """Every symbol this account may not open, as {symbol: reason},
+        for rehydrating the entry_ineligible gate on startup."""
+        rows = self.conn.execute(
+            "SELECT symbol, reason FROM entry_ineligible_symbols"
+        ).fetchall()
+        return {row[0]: row[1] for row in rows}
