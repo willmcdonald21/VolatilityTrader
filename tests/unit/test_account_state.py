@@ -27,22 +27,35 @@ def make_fill(symbol, side, shares, price, commission=0.0, minutes_ago=0, realiz
 
 
 class FakeIB:
-    def __init__(self, fills, portfolio=None, positions=None):
-        self._fills = fills
+    def __init__(self, fills=(), portfolio=None, positions=None, account_values=None):
+        self._fills = list(fills)
         self._portfolio = portfolio or []
         self._positions = positions or []
+        self._account_values = account_values or []
 
+    # These mirror ib_async: a blank account means every account. Without the
+    # filter a fake cannot show whether the caller scoped its read.
     def portfolio(self, account=""):
-        return self._portfolio
+        return _only(self._portfolio, account)
 
     def fills(self):
         return self._fills
 
     def positions(self, account=""):
-        return self._positions
+        return _only(self._positions, account)
 
     def accountValues(self, account=""):
-        return []
+        return _only(self._account_values, account)
+
+
+def _only(rows, account):
+    if not account:
+        return list(rows)
+    return [r for r in rows if getattr(r, "account", "") == account]
+
+
+def _av(tag, value, account="DU111", currency="USD"):
+    return SimpleNamespace(tag=tag, value=value, account=account, currency=currency)
 
 
 def make_state(fills, session_started_minutes_ago=60) -> AccountState:
@@ -224,3 +237,35 @@ def test_fresh_account_state_still_sees_a_fill_from_earlier_today():
     state = AccountState(FakeIB([entry_fill, old_fill]))
 
     assert state.daily_realized_pnl() == pytest.approx(-100.0)  # (9.0 - 10.0) * 100
+
+
+# --- account scoping ------------------------------------------------------
+
+
+def test_equity_ignores_another_accounts_values():
+    """Unscoped, another bot's equity swing could trip this bot's daily-loss
+    limit -- halting a strategy over a loss it did not take."""
+    ib = FakeIB(
+        account_values=[
+            _av("NetLiquidation", "10000", account="DU111"),
+            _av("NetLiquidation", "99999", account="DU999"),
+        ]
+    )
+    state = AccountState(ib, account="DU111")
+
+    assert state.snapshot().net_liquidation == pytest.approx(10000.0)
+
+
+def test_open_positions_ignore_another_account():
+    """Unscoped, another bot's positions would consume this bot's position
+    slots via max_concurrent_positions."""
+    ib = FakeIB(
+        positions=[
+            SimpleNamespace(contract=SimpleNamespace(symbol="UCAR"), position=100.0, account="DU111"),
+            SimpleNamespace(contract=SimpleNamespace(symbol="SPX"), position=5.0, account="DU999"),
+        ]
+    )
+    snapshot = AccountState(ib, account="DU111").snapshot()
+
+    assert snapshot.open_positions_count == 1
+    assert snapshot.open_symbols == frozenset({"UCAR"})

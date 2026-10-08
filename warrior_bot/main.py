@@ -114,7 +114,10 @@ class WarriorBot:
 
         conn = get_connection(config.resolve_path(config.journal.db_path))
         self.journal = Journal(conn)
-        self.account_state = AccountState(self.ib)
+        # Scoped, or the daily-loss limit and the open-position count would be
+        # computed across every account the login manages -- so another bot's
+        # equity swing could halt this one, or fill its position slots.
+        self.account_state = AccountState(self.ib, account=config.trading.account)
         self.position_manager = PositionManager(
             self.ib,
             self.journal,
